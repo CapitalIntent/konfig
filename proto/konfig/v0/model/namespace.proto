@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package com.konfig.protos.v0.model;
+
+option go_package = "capitalintent.com/konfig/protos/v0/model";
+
+import "google/protobuf/timestamp.proto";
+
+message Namespace {
+  string name = 1;
+  google.protobuf.Timestamp createdAt = 2;
+  string createdBy = 3;
+  google.protobuf.Timestamp updatedAt = 4;
+  string updatedBy = 5;
+  string description = 6;
+}

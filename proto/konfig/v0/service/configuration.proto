@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package com.konfig.protos.v0.service;
+
+option go_package = "capitalintent.com/konfig/protos/v0/service";
+
+import "google/api/annotations.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "proto/konfig/v0/common/context.proto";
+import "proto/konfig/v0/common/permission.proto";
+
+service ConfigurationService {
+  // Unary RPCs where the client sends a single request to the server and gets a single response back
+  rpc Create(ConfigurationRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      post: "/v0/configuration/create",
+      body: "*"
+    };
+  }
+  rpc Read(ConfigurationRequest) returns (ConfigurationResponse) {
+    option (google.api.http) = {
+      post: "/v0/configuration/read",
+      body: "*"
+    };
+  }
+  rpc Update(ConfigurationRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      put: "/v0/configuration/update",
+      body: "*",
+    };
+  }
+  rpc Delete(ConfigurationRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      delete: "/v0/configuration/delete",
+      body: "*",
+    };
+  }
+  // Server streaming RPCs where the client sends a request to the server and gets a stream to read a sequence of messages back
+  rpc Subscribe(ConfigurationRequest) returns (stream ConfigurationResponse);
+}
+
+message Configuration {
+  string name = 1;
+  optional string description = 2; // description of config
+  repeated com.konfig.protos.v0.common.Context contexts = 3;
+  repeated com.konfig.protos.v0.common.Permission users = 4;
+  optional google.protobuf.Timestamp createdAt = 5;
+  optional string createdBy = 6;
+  optional google.protobuf.Timestamp updatedAt = 7;
+  optional string updatedBy = 8;
+
+}
+
+message Configurations {
+  repeated Configuration configurations = 1;
+}
+
+message ConfigurationRequest {
+  string namespace = 1;
+  repeated Configuration configurations = 2;
+  repeated com.konfig.protos.v0.common.Permission permissions = 3;
+  optional uint64 valueHistoryLimit = 4;
+  optional uint64 ruleHistoryLimit = 5;
+  optional bool listUsers = 6;
+}
+
+message ConfigurationResponse {
+  repeated Configurations configurations = 1;
+}

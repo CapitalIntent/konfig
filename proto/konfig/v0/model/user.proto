@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package com.konfig.protos.v0.model;
+
+option go_package = "capitalintent.com/konfig/protos/v0/model";
+
+import "google/protobuf/timestamp.proto";
+import "proto/konfig/v0/common/permission.proto";
+
+message User {
+  string name = 1;
+  map<string, com.konfig.protos.v0.common.Permission> permissions = 2;
+  google.protobuf.Timestamp createdAt = 3;
+  string createdBy = 4;
+  google.protobuf.Timestamp updatedAt = 5;
+  string updatedBy = 6;
+  optional string slack_handle = 7;
+}

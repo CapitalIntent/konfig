@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package com.konfig.protos.v0.service;
+
+option go_package = "capitalintent.com/konfig/protos/v0/service";
+
+import "proto/konfig/v0/common/permission.proto";
+
+enum Op {
+  CREATE = 0;
+  UPDATE = 1;
+  DELETE = 2;
+}
+
+message PermissionOp {
+  Op op = 1;
+  string user = 2;
+  repeated com.konfig.protos.v0.common.Permission permissions = 3;
+  optional string slack_handle = 4;
+}

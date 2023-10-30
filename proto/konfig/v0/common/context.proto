@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package com.konfig.protos.v0.common;
+
+option go_package = "capitalintent.com/konfig/protos/v0/common";
+
+import "proto/konfig/v0/common/rule.proto";
+import "proto/konfig/v0/common/value.proto";
+
+message Context {
+  repeated com.konfig.protos.v0.common.Rules rules = 1;
+  repeated com.konfig.protos.v0.common.Values values = 2;
+  optional int32 latestRules = 3;
+  optional int32 latestValues = 4;
+}

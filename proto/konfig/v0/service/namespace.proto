@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package com.konfig.protos.v0.service;
+
+option go_package = "capitalintent.com/konfig/protos/v0/service";
+
+import "google/api/annotations.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "proto/konfig/v0/common/permission.proto";
+import "proto/konfig/v0/service/permission.proto";
+
+service NamespaceService {
+  // Unary RPCs where the client sends a single request to the server and gets a single response back
+  rpc Create(NamespaceRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      post: "/v0/namespace/create",
+      body: "*",
+    };
+  }
+  rpc Read(NamespaceRequest) returns (NamespaceResponse) {
+    option (google.api.http) = {
+      get: "/v0/namespace/read/{name}",
+    };
+  }
+  rpc Update(NamespaceRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      put: "/v0/namespace/update",
+      body: "*",
+    };
+  }
+  rpc Delete(NamespaceRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      delete: "/v0/namespace/delete/{name}",
+    };
+  }
+}
+
+message NamespaceRequest {
+  string name = 1;
+  repeated PermissionOp permissions = 2;
+  optional string description = 3;
+}
+
+
+message NamespaceResponse {
+  string name = 1;
+  string description = 2;
+  repeated string configurations = 3;
+  repeated com.konfig.protos.v0.common.Permission users = 4;
+  google.protobuf.Timestamp createdAt = 5;
+  string createdBy = 6;
+  google.protobuf.Timestamp updatedAt = 7;
+  string updatedBy = 8;
+}

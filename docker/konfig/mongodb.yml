@@ -1,0 +1,13 @@
+net:
+  port: 27017
+  bindIpAll: true
+security:
+  authorization: enabled
+  keyFile: /data/replica.key
+storage:
+  dbPath: /data/db
+replication:
+  replSetName: rs
+systemLog:
+  verbosity: 1
+  traceAllExceptions: true

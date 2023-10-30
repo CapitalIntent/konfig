@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package com.konfig.protos.v0.model;
+
+option go_package = "capitalintent.com/konfig/protos/v0/model";
+
+import "proto/konfig/v0/common/context.proto";
+
+message Context {
+  string property = 1;
+  string namespace = 2;
+  repeated com.konfig.protos.v0.common.Context contexts = 3;
+}

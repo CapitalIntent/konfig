@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package com.konfig.protos.v0.service;
+
+option go_package = "capitalintent.com/konfig/protos/v0/service";
+
+import "google/api/annotations.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "proto/konfig/v0/common/permission.proto";
+import "proto/konfig/v0/service/permission.proto";
+
+service UserService {
+  // Unary RPCs where the client sends a single request to the server and gets a single response back
+  rpc Create(UserRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      post: "/v0/user/create",
+      body: "*"
+    };
+  }
+  rpc Read(UserRequest) returns (UserResponse) {
+    option (google.api.http) = {
+      post: "/v0/user/read",
+      body: "*"
+    };
+  }
+  rpc Update(UserRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      put: "/v0/user/update"
+      body: "*",
+    };
+  }
+  rpc Delete(UserRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      delete: "/v0/user/delete",
+      body: "*",
+    };
+  }
+}
+
+message UserRequest {
+  repeated PermissionOp permissions = 1;
+}
+
+message User {
+  string name = 1;
+  repeated com.konfig.protos.v0.common.Permission permissions = 2;
+  optional google.protobuf.Timestamp createdAt = 3;
+  optional string createdBy = 4;
+  optional google.protobuf.Timestamp updatedAt = 5;
+  optional string updatedBy = 6;
+}
+
+message UserResponse {
+  repeated User users = 1;
+}

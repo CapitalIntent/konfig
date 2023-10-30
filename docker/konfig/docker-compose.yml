@@ -1,0 +1,196 @@
+version: "3"
+services:
+  konfig-server:
+    image: "bazel/go/konfig/src/main/app:konfig"
+    platform: linux/x86_64
+    container_name: konfig-server
+    environment:
+      APP_ENV: docker
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mongodb1
+      - mongodb2
+      - mongodb3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1025M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    networks:
+      - konfig
+
+  konfig-proxy:
+    image: "bazel/go/konfig/src/main/proxy:konfig_proxy"
+    platform: linux/x86_64
+    container_name: konfig-proxy
+    environment:
+      APP_ENV: docker
+    ports:
+      - "8090:8080"
+    depends_on:
+      - mongodb1
+      - mongodb2
+      - mongodb3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1025M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    networks:
+      - konfig
+
+  mongodb1:
+    container_name: mongodb1
+    image: "bazel/docker/mongodb:6"
+    expose:
+      - 27017
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: user
+      MONGO_INITDB_ROOT_PASSWORD: pass
+    volumes:
+      - type: bind
+        source: mongodb.yml
+        target: /etc/mongod.conf
+      - type: volume
+        source: mongodb1
+        target: /data/db
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1025M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    command:
+      - --config
+      - /etc/mongod.conf
+    restart: always
+    networks:
+      - konfig
+
+  mongodb2:
+    container_name: mongodb2
+    image: "bazel/docker/mongodb:6"
+    expose:
+      - 27017
+    ports:
+      - "27018:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: user
+      MONGO_INITDB_ROOT_PASSWORD: pass
+    volumes:
+      - type: bind
+        source: mongodb.yml
+        target: /etc/mongod.conf
+      - type: volume
+        source: mongodb2
+        target: /data/db
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1025M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    command:
+      - --config
+      - /etc/mongod.conf
+    restart: always
+    networks:
+      - konfig
+
+  mongodb3:
+    container_name: mongodb3
+    image: "bazel/docker/mongodb:6"
+    expose:
+      - 27017
+    ports:
+      - "27019:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: user
+      MONGO_INITDB_ROOT_PASSWORD: pass
+    volumes:
+      - type: bind
+        source: mongodb.yml
+        target: /etc/mongod.conf
+      - type: volume
+        source: mongodb3
+        target: /data/db
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1025M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    command:
+      - --config
+      - /etc/mongod.conf
+    restart: always
+    networks:
+      - konfig
+
+  setup_replicas:
+    image: "bazel/docker/mongodb:6"
+    restart: no
+    container_name: setup_replicas
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: user
+      MONGO_INITDB_ROOT_PASSWORD: pass
+    depends_on:
+      mongodb1:
+        condition: service_started
+      mongodb2:
+        condition: service_started
+      mongodb3:
+        condition: service_started
+    volumes:
+      - type: bind
+        source: init.sh
+        target: /scripts/init.sh
+    entrypoint:
+      - /bin/bash
+      - /scripts/init.sh
+    networks:
+      - konfig
+
+  mongo-express:
+    container_name: mongo-express
+    image: mongo-express
+    restart: always
+    ports:
+      - "9081:8081"
+    environment:
+      ME_CONFIG_MONGODB_URL: mongodb://user:pass@mongodb1,mongodb2,mongodb3:27017/?replicaSet=rs
+      ME_CONFIG_MONGODB_AUTH_USERNAME: user
+      ME_CONFIG_MONGODB_AUTH_PASSWORD: pass
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: true
+    depends_on:
+      setup_replicas:
+        condition: service_completed_successfully
+    networks:
+      - konfig
+
+volumes:
+  mongodb1:
+    driver: local
+  mongodb2:
+    driver: local
+  mongodb3:
+    driver: local
+
+networks:
+  konfig:
+    driver: bridge

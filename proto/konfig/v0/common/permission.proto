@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package com.konfig.protos.v0.common;
+
+option go_package = "capitalintent.com/konfig/protos/v0/common";
+
+enum Space {
+  NAMESPACE = 0;
+  CONFIGURATION = 1;
+  RULE = 2;
+}
+
+enum PermissionType {
+  READ = 0;
+  WRITE = 1; // Read/Write
+  ADMIN = 2; // Read/Write/Delete
+}
+
+message Permission {
+  string name = 1;
+  PermissionType permission = 2;
+  Space space = 3;
+  repeated Permission subspace = 4;
+}

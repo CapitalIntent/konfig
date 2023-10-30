@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package com.konfig.protos.v0.common;
+
+option go_package = "capitalintent.com/konfig/protos/v0/common";
+
+import "proto/common/common.proto";
+
+enum Op {
+  IN = 0;
+  NOT_IN = 1;
+  EQUAL = 2;
+  NOT_EQUAL = 3;
+  GREATER = 4;
+  LESS = 5;
+  GREATER_OR_EQUAL = 6;
+  LESS_OR_EQUAL = 7;
+}
+
+message DoubleOp {
+  optional Op op = 1;
+  oneof values {
+    int64 value = 2;
+    com.protos.common.DoubleList list = 3; // check if value is in range
+  }
+}
+
+message IntegerOp {
+  optional Op op = 1;
+  oneof values {
+    double value = 2;
+    com.protos.common.IntegerList list = 3; // check if value is in range
+  }
+}
+
+message StringOp {
+  optional Op op = 1;
+  oneof values {
+    string value = 2;
+    com.protos.common.StringList list = 3;
+  }
+}
+
+message BooleanOp {
+  optional Op op = 1;
+  bool value = 2;
+}

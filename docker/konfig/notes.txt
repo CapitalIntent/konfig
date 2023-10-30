@@ -1,0 +1,10 @@
+Setup:
+    docker exec mongodb1 /scripts/init.sh
+
+Keyfile
+    https://github.com/docker-library/mongo/issues/475
+    chmod 400 replica.txt
+    chown 999:999 replica.txt
+
+Usage:
+    Will not be able to access replica set from outside of docker network. Use the mongo-express container for visibility

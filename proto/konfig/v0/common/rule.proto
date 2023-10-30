@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package com.konfig.protos.v0.common;
+
+option go_package = "capitalintent.com/konfig/protos/v0/common";
+
+import "google/protobuf/timestamp.proto";
+import "proto/konfig/v0/common/ops.proto";
+
+// rules are not versioned
+// users are notified when rules change
+message Rule {
+  string name = 1;
+  oneof op {
+    StringOp stringOp = 2;
+    IntegerOp integerOp = 3;
+    DoubleOp doubleOp = 4;
+    BooleanOp booleanOp = 5;
+  }
+  optional google.protobuf.Timestamp createdAt = 6;
+  optional string createdBy = 7;
+  optional google.protobuf.Timestamp updatedAt = 8;
+  optional string updatedBy = 9;
+}
+
+message Rules {
+  repeated Rule rules = 1;
+  optional int32 version = 2;
+}
