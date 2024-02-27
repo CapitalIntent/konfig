@@ -3,9 +3,9 @@ net:
   bindIpAll: true
 security:
   authorization: enabled
-  keyFile: /data.tf/replica.key
+  keyFile: /data/replica.key
 storage:
-  dbPath: /data.tf/db
+  dbPath: /data/db
 replication:
   replSetName: rs
 systemLog:

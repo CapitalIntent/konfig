@@ -62,7 +62,7 @@ services:
         target: /etc/mongod.conf
       - type: volume
         source: mongodb1
-        target: /data.tf/db
+        target: /data/db
     deploy:
       resources:
         limits:
@@ -94,7 +94,7 @@ services:
         target: /etc/mongod.conf
       - type: volume
         source: mongodb2
-        target: /data.tf/db
+        target: /data/db
     deploy:
       resources:
         limits:
@@ -126,7 +126,7 @@ services:
         target: /etc/mongod.conf
       - type: volume
         source: mongodb3
-        target: /data.tf/db
+        target: /data/db
     deploy:
       resources:
         limits:
