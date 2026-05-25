@@ -2,13 +2,15 @@ name: Konfig K8s Integration Tests
 # Runs ALL konfig integration tests (files matching tests/integration_*.rs) using
 # Testcontainers (K3s in Docker).  No external kind cluster or kubectl context is
 # required — each test spins up its own K3s container and tears it down.
-# Triggered on every PR that touches rust/konfig/, schema/konfig/, or this file.
+# Triggered on every PR that touches rust/konfig/, schema/konfig/,
+# tools/konfig-cli/, or this workflow file.
 on:
   pull_request:
     branches: [main]
     paths:
       - 'rust/konfig/**'
       - 'schema/konfig/**'
+      - 'tools/konfig-cli/**'
       - '.github/workflows/konfig-k8s-integration.yml'
 
 concurrency:
@@ -44,8 +46,7 @@ jobs:
       #
       # Omitting `--test <name>` causes `cargo test` to discover and run every
       # [[test]] target in Cargo.toml that has `required-features = ["integration"]`.
-      # New test files added in future phases (Phase 2A gRPC, Phase 2B watch stream,
-      # etc.) are picked up automatically — no workflow change required.
+      # New test files added in future phases are picked up automatically.
       - name: Run all konfig integration tests
         run: |
           cargo test \
@@ -54,6 +55,4 @@ jobs:
             -- --nocapture
         env:
           RUST_LOG: konfig=debug,kube=info
-          # Testcontainers respects TESTCONTAINERS_RYUK_DISABLED for environments
-          # where the Ryuk reaper container is not permitted.
           TESTCONTAINERS_RYUK_DISABLED: "false"

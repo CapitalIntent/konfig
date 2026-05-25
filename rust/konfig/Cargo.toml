@@ -26,15 +26,26 @@ name = "integration_watch_timing"
 path = "tests/integration_watch_timing.rs"
 required-features = ["integration"]
 
+[[test]]
+name = "integration_grpc"
+path = "tests/integration_grpc.rs"
+required-features = ["integration"]
+
+
 [dependencies]
 arc-swap = {workspace = true}
 bytes = {workspace = true}
 flatbuffers = {workspace = true}
 futures-util = "0.3"
+http = "1"
 kube = {version = "0.98", features = ["runtime", "client"]}
 k8s-openapi = {version = "0.24", features = ["v1_31"]}
+serde = {workspace = true}
+serde_yaml = "0.9"
 tokio = {workspace = true}
+tokio-stream = "0.1"
 tonic = {workspace = true}
+tower-service = "0.3"
 tracing = {workspace = true}
 thiserror = {workspace = true}
 

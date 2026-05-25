@@ -11,6 +11,14 @@ name = "konfig-cli"
 path = "src/main.rs"
 
 [dependencies]
-bytes = { workspace = true }
-tokio = { workspace = true }
-tonic = { workspace = true }
+bytes = {workspace = true}
+clap = {version = "4", features = ["derive"]}
+flatbuffers = {workspace = true}
+k8s-openapi = {version = "0.24", features = ["v1_31"]}
+kube = {version = "0.98", features = ["runtime", "client"]}
+konfig = {path = "../../rust/konfig"}
+serde = {workspace = true}
+serde_yaml = "0.9"
+tokio = {workspace = true}
+tracing = {workspace = true}
+tracing-subscriber = {version = "0.3", features = ["env-filter"]}
