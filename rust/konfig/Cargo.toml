@@ -11,9 +11,6 @@ name = "konfig"
 path = "lib.rs"
 
 [features]
-# Gate K8s integration tests (require a live K3s cluster via Testcontainers).
-# Run all with:  cargo test --features integration -p konfig
-# Run one with:  cargo test --test integration_watcher --features integration -p konfig
 integration = []
 
 [[test]]
@@ -31,26 +28,28 @@ name = "integration_grpc"
 path = "tests/integration_grpc.rs"
 required-features = ["integration"]
 
-
 [dependencies]
 arc-swap = {workspace = true}
+async-trait = {workspace = true}
 bytes = {workspace = true}
-flatbuffers = {workspace = true}
 futures-util = "0.3"
-http = "1"
 kube = {version = "0.98", features = ["runtime", "client"]}
 k8s-openapi = {version = "0.24", features = ["v1_31"]}
+prost = {workspace = true}
+tonic-prost = {workspace = true}
 serde = {workspace = true}
+serde_json = {workspace = true}
 serde_yaml = "0.9"
 tokio = {workspace = true}
 tokio-stream = "0.1"
 tonic = {workspace = true}
-tower-service = "0.3"
 tracing = {workspace = true}
 thiserror = {workspace = true}
 
+[build-dependencies]
+tonic-prost-build = {workspace = true}
+
 [dev-dependencies]
-# Integration test helpers.
 tokio = {workspace = true}
 kube = {version = "0.98", features = ["runtime", "client"]}
 k8s-openapi = {version = "0.24", features = ["v1_31"]}
@@ -59,7 +58,5 @@ testcontainers-modules = {version = "0.11", features = ["k3s"]}
 rustls = {version = "0.23", default-features = false}
 
 [lints.clippy]
-# std_instead_of_core and std_instead_of_alloc are only meaningful for no_std
-# crates. konfig depends on kube/tokio which require std, so these are suppressed.
 std_instead_of_core = "allow"
 std_instead_of_alloc = "allow"

@@ -1,0 +1,11 @@
+filegroup(
+    name = "crd",
+    srcs = ["crd.yaml"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "example",
+    srcs = ["example.yaml"],
+    visibility = ["//visibility:public"],
+)

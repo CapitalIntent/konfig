@@ -1,0 +1,15 @@
+apiVersion: konfig.io/v1
+kind: Config
+metadata:
+  name: my-service-config
+  namespace: default
+spec:
+  schema_version: 1
+  content:
+    log_level: info
+    feature_flags:
+      dark_mode: true
+      beta_ui: false
+    timeouts:
+      connect_ms: 500
+      request_ms: 5000

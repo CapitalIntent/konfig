@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package konfig.v1;
+
+option java_package = "io.konfig.v1";
+option go_package = "konfig.io/v1";
+
+// Generic config stored in a Config CRD.
+message Config {
+  string namespace = 1;
+  string name = 2;
+  uint32 schema_version = 3;
+  // JSON-encoded content — arbitrary structure defined by the consumer.
+  string content_json = 4;
+  string resource_version = 5;
+  // Milliseconds since the snapshot was loaded into the cache.
+  int64 age_ms = 6;
+}
+
+message GetRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+message GetAllRequest {
+  string namespace = 1;
+}
+
+message ApplyRequest {
+  string namespace = 1;
+  string name = 2;
+  // Full config as YAML. Must contain a top-level `schema_version` key.
+  string yaml_content = 3;
+}
+
+message ApplyResponse {
+  string resource_version = 1;
+}
+
+message SubscribeRequest {
+  string namespace = 1;
+  repeated string names = 2;
+  // Resume from this resourceVersion (empty = start from current).
+  string resume_resource_version = 3;
+}
+
+message ConfigEvent {
+  enum EventType {
+    ADDED = 0;
+    MODIFIED = 1;
+    DELETED = 2;
+  }
+  EventType event_type = 1;
+  Config config = 2;
+}
+
+service KonfigService {
+  // Get a single config by namespace and name.
+  rpc Get(GetRequest) returns (Config);
+  // Stream all configs in a namespace (one per cached entry).
+  rpc GetAll(GetAllRequest) returns (stream Config);
+  // Create or update a config (YAML → CRD patch with schema_version check).
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+  // Subscribe to live config change events (Phase 2B — returns Unimplemented for now).
+  rpc Subscribe(SubscribeRequest) returns (stream ConfigEvent);
+}
