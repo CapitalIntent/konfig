@@ -31,7 +31,7 @@ use tokio::time::timeout;
 
 use konfig::cache::ConfigCache;
 use konfig::types::TradingConfigSnapshot;
-use konfig::watcher::run_watcher;
+use konfig::watcher::Watcher;
 
 // ── Test constants ────────────────────────────────────────────────────────────
 
@@ -222,7 +222,8 @@ async fn watcher_applies_config_map_to_cache() {
     let watcher_cache = Arc::clone(&cache);
     let watcher_client = client.clone();
     let watcher = tokio::spawn(async move {
-        run_watcher(watcher_client, watcher_cache, NAMESPACE.to_string(), CM_APPLY.to_string())
+        Watcher::new(watcher_client)
+            .run(watcher_cache, NAMESPACE.to_string(), CM_APPLY.to_string())
             .await
             .expect("watcher exited with error");
     });
@@ -310,7 +311,8 @@ async fn watcher_retains_cache_on_config_map_delete() {
     let watcher_cache = Arc::clone(&cache);
     let watcher_client = client.clone();
     let watcher = tokio::spawn(async move {
-        run_watcher(watcher_client, watcher_cache, NAMESPACE.to_string(), CM_DELETE.to_string())
+        Watcher::new(watcher_client)
+            .run(watcher_cache, NAMESPACE.to_string(), CM_DELETE.to_string())
             .await
             .expect("watcher exited with error");
     });

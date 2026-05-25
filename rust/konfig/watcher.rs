@@ -36,44 +36,59 @@ pub enum WatcherError {
 
 // ── Watcher entry point ───────────────────────────────────────────────────────
 
-/// Run the ConfigMap watcher until the stream ends or an error occurs.
+/// Builder / runner for the K8s ConfigMap watcher.
 ///
-/// Blocks the calling task — run this inside `tokio::spawn`.
-///
-/// # Arguments
-/// * `client` — authenticated kube client to use for API requests
-/// * `cache` — shared cache to update on each `Apply`/`InitApply` event
-/// * `namespace` — K8s namespace to watch
-/// * `config_map_name` — name of the ConfigMap to watch
-pub async fn run_watcher(
+/// Construct with [`Watcher::new`], then call [`Watcher::run`] to start
+/// streaming events.  Run inside `tokio::spawn` — the method blocks until
+/// the watch stream ends or an error occurs.
+pub struct Watcher {
     client: Client,
-    cache: Arc<ConfigCache>,
-    namespace: String,
-    config_map_name: String,
-) -> Result<(), WatcherError> {
-    let cms: Api<ConfigMap> = Api::namespaced(client, &namespace);
+}
 
-    let wc = kube_watcher::Config::default()
-        .fields(&format!("metadata.name={config_map_name}"));
-
-    let mut w = kube_watch_stream(cms, wc).boxed();
-
-    info!(
-        namespace = %namespace,
-        config_map = %config_map_name,
-        "ConfigMap watcher started",
-    );
-
-    while let Some(event) = w.try_next().await? {
-        handle_watcher_event(event, &cache);
+impl Watcher {
+    /// Create a new `Watcher` bound to the given authenticated kube client.
+    pub fn new(client: Client) -> Self {
+        Watcher { client }
     }
 
-    Ok(())
+    /// Run the ConfigMap watcher until the stream ends or an error occurs.
+    ///
+    /// Blocks the calling task — run this inside `tokio::spawn`.
+    ///
+    /// # Arguments
+    /// * `cache` — shared cache to update on each `Apply`/`InitApply` event
+    /// * `namespace` — K8s namespace to watch
+    /// * `config_map_name` — name of the ConfigMap to watch
+    pub async fn run(
+        self,
+        cache: Arc<ConfigCache>,
+        namespace: String,
+        config_map_name: String,
+    ) -> Result<(), WatcherError> {
+        let cms: Api<ConfigMap> = Api::namespaced(self.client, &namespace);
+
+        let wc = kube_watcher::Config::default()
+            .fields(&format!("metadata.name={config_map_name}"));
+
+        let mut w = kube_watch_stream(cms, wc).boxed();
+
+        info!(
+            namespace = %namespace,
+            config_map = %config_map_name,
+            "ConfigMap watcher started",
+        );
+
+        while let Some(event) = w.try_next().await? {
+            handle_watcher_event(event, &cache);
+        }
+
+        Ok(())
+    }
 }
 
 /// Dispatch a single watcher event: apply/delete/init handling.
 ///
-/// Extracted to keep `run_watcher` CC low and to allow unit testing
+/// Extracted to keep `Watcher::run` CC low and to allow unit testing
 /// of event-handling logic without a live K8s cluster.
 pub(crate) fn handle_watcher_event(event: Event<ConfigMap>, cache: &Arc<ConfigCache>) {
     match event {
