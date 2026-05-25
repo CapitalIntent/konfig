@@ -1,0 +1,10 @@
+# syntax=docker/dockerfile:1
+FROM rust:1.88-slim AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p konfig --bin konfig
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /build/target/release/konfig /konfig
+EXPOSE 50051 9090
+ENTRYPOINT ["/konfig"]

@@ -1,11 +1,5 @@
 filegroup(
-    name = "crd",
-    srcs = ["crd.yaml"],
-    visibility = ["//visibility:public"],
-)
-
-filegroup(
-    name = "example",
-    srcs = ["example.yaml"],
+    name = "manifests",
+    srcs = glob(["*.yaml"]),
     visibility = ["//visibility:public"],
 )

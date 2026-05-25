@@ -1,0 +1,2 @@
+# Placeholder — full OCI image build is Phase 5+.
+# The Dockerfile is used directly by CI/CD (docker buildx) until then.

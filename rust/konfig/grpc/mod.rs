@@ -5,6 +5,9 @@
 
 pub mod apply;
 pub mod get;
+pub mod secret_apply;
+pub mod secret_get;
+pub mod subscribe;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,15 +20,24 @@ use tracing::info;
 use crate::cache::ConfigCache;
 use crate::proto::konfig_service_server::{KonfigService, KonfigServiceServer};
 use crate::proto::{
-    ApplyRequest, ApplyResponse, Config, ConfigEvent, GetAllRequest, GetRequest, SubscribeRequest,
+    ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, Config, ConfigEvent,
+    GetAllRequest, GetAllSecretsRequest, GetRequest, GetSecretRequest, SecretResponse,
+    SubscribeRequest, SubscribeSecretsRequest,
 };
+use crate::secret_cache::SecretCache;
 
 // ── Server config ─────────────────────────────────────────────────────────────
 
 pub struct ServerConfig {
     pub addr: SocketAddr,
     pub cache: Arc<ConfigCache>,
+    /// Shared secret cache populated by the secret watcher.
+    pub secret_cache: Arc<SecretCache>,
     pub kube_client: Client,
+    /// Optional tonic-health reporter.  When `Some`, a health endpoint is
+    /// registered alongside `KonfigService`.  When `None` the server starts
+    /// without a health endpoint (e.g. in unit tests).
+    pub health_reporter: Option<tonic_health::server::HealthReporter>,
 }
 
 // ── KonfigServer ──────────────────────────────────────────────────────────────
@@ -33,6 +45,7 @@ pub struct ServerConfig {
 #[derive(Clone)]
 pub struct KonfigServer {
     pub(crate) cache: Arc<ConfigCache>,
+    pub(crate) secret_cache: Arc<SecretCache>,
     pub(crate) kube_client: Client,
 }
 
@@ -62,9 +75,49 @@ impl KonfigService for KonfigServer {
 
     async fn subscribe(
         &self,
-        _request: Request<SubscribeRequest>,
+        request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        Err(Status::unimplemented("Subscribe is implemented in Phase 2B"))
+        subscribe::handle_subscribe(
+            Arc::clone(&self.cache),
+            self.kube_client.clone(),
+            request.into_inner(),
+        )
+        .await
+    }
+
+    // ── Secret RPCs ───────────────────────────────────────────────────────────
+
+    async fn get_secret(
+        &self,
+        request: Request<GetSecretRequest>,
+    ) -> Result<Response<SecretResponse>, Status> {
+        secret_get::handle_get_secret(Arc::clone(&self.secret_cache), request.into_inner()).await
+    }
+
+    type GetAllSecretsStream = ReceiverStream<Result<SecretResponse, Status>>;
+
+    async fn get_all_secrets(
+        &self,
+        request: Request<GetAllSecretsRequest>,
+    ) -> Result<Response<Self::GetAllSecretsStream>, Status> {
+        secret_get::handle_get_all_secrets(Arc::clone(&self.secret_cache), request.into_inner())
+            .await
+    }
+
+    async fn apply_secret(
+        &self,
+        request: Request<ApplySecretRequest>,
+    ) -> Result<Response<ApplySecretResponse>, Status> {
+        secret_apply::handle_apply_secret(self.kube_client.clone(), request.into_inner()).await
+    }
+
+    type SubscribeSecretsStream = ReceiverStream<Result<crate::proto::SecretEvent, Status>>;
+
+    async fn subscribe_secrets(
+        &self,
+        _request: Request<SubscribeSecretsRequest>,
+    ) -> Result<Response<Self::SubscribeSecretsStream>, Status> {
+        Err(Status::unimplemented("SubscribeSecrets not yet implemented"))
     }
 }
 
@@ -73,12 +126,23 @@ impl KonfigService for KonfigServer {
 pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
     info!(addr = %cfg.addr, "KonfigService gRPC server starting");
 
-    let server = KonfigServer { cache: cfg.cache, kube_client: cfg.kube_client };
+    let server = KonfigServer {
+        cache: cfg.cache,
+        secret_cache: cfg.secret_cache,
+        kube_client: cfg.kube_client,
+    };
+    let svc = KonfigServiceServer::new(server);
 
-    tonic::transport::Server::builder()
-        .add_service(KonfigServiceServer::new(server))
-        .serve(cfg.addr)
-        .await
+    let mut builder = tonic::transport::Server::builder();
+
+    if let Some(reporter) = cfg.health_reporter {
+        let health_svc = tonic_health::pb::health_server::HealthServer::new(
+            tonic_health::server::HealthService::from_health_reporter(reporter),
+        );
+        builder.add_service(health_svc).add_service(svc).serve(cfg.addr).await
+    } else {
+        builder.add_service(svc).serve(cfg.addr).await
+    }
 }
 
 // ── Shared helper ─────────────────────────────────────────────────────────────

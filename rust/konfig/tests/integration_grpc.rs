@@ -16,7 +16,7 @@ use tokio::time::timeout;
 use tonic::Request;
 
 use konfig::cache::ConfigCache;
-use konfig::grpc::{serve, ServerConfig};
+use konfig::grpc::{ServerConfig, serve};
 use konfig::proto::konfig_service_client::KonfigServiceClient;
 use konfig::proto::{ApplyRequest, GetAllRequest, GetRequest};
 use konfig::types::ConfigSnapshot;
@@ -31,16 +31,17 @@ const CFG_GRPC_APPLY: &str = "integ-grpc-apply";
 // ── Shared server setup ───────────────────────────────────────────────────────
 
 async fn start_server(cache: Arc<ConfigCache>, kube_client: kube::Client) -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind listener");
+    let listener =
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("failed to bind listener");
     let addr = listener.local_addr().expect("no local addr");
     drop(listener);
 
     let cfg = ServerConfig {
         addr,
         cache,
+        secret_cache: Arc::new(konfig::secret_cache::SecretCache::new()),
         kube_client,
+        health_reporter: None,
     };
 
     tokio::spawn(async move {
@@ -96,10 +97,7 @@ async fn grpc_get_returns_config() {
     let mut grpc = connect(port).await;
 
     let resp = grpc
-        .get(Request::new(GetRequest {
-            namespace: NAMESPACE.into(),
-            name: CFG_GRPC_GET.into(),
-        }))
+        .get(Request::new(GetRequest { namespace: NAMESPACE.into(), name: CFG_GRPC_GET.into() }))
         .await
         .expect("Get RPC failed");
 
@@ -123,10 +121,7 @@ async fn grpc_get_not_found_when_cache_empty() {
     let mut grpc = connect(port).await;
 
     let result = grpc
-        .get(Request::new(GetRequest {
-            namespace: NAMESPACE.into(),
-            name: "nonexistent".into(),
-        }))
+        .get(Request::new(GetRequest { namespace: NAMESPACE.into(), name: "nonexistent".into() }))
         .await;
 
     assert!(result.is_err(), "Get must return NOT_FOUND for empty cache");
@@ -233,10 +228,7 @@ async fn grpc_apply_writes_config_and_get_reflects_it() {
 
     // Get should now reflect schema_version=5.
     let get_resp = grpc
-        .get(Request::new(GetRequest {
-            namespace: NAMESPACE.into(),
-            name: CFG_GRPC_APPLY.into(),
-        }))
+        .get(Request::new(GetRequest { namespace: NAMESPACE.into(), name: CFG_GRPC_APPLY.into() }))
         .await
         .expect("Get after Apply failed");
 

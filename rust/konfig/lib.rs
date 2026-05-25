@@ -2,15 +2,21 @@
 //!
 //! # Modules
 //!
-//! - [`types`] — `ConfigSnapshot` and `ConfigSpec` (no domain-specific types)
-//! - [`cache`] — `ArcSwap`-backed lock-free snapshot cache
+//! - [`types`] — `ConfigSnapshot`, `ConfigSpec`, `SecretSnapshot`
+//! - [`cache`] — DashMap-backed multi-key lock-free config cache
+//! - [`secret_cache`] — DashMap-backed multi-key lock-free secret cache
 //! - [`watcher`] — kube-rs watcher for `Config.konfig.io/v1` CRDs
+//! - [`configmap_watcher`] — watcher for ConfigMaps (konfig.io/managed=true)
+//! - [`secret_watcher`] — watcher for Secrets (konfig.io/managed=true)
 //! - [`grpc`] — gRPC server (Protobuf, standard tonic codec)
 //! - [`import`] — CLI helper: onboard existing ConfigMaps as Config CRDs
 
 pub mod cache;
+pub mod configmap_watcher;
 pub mod grpc;
 pub mod import;
+pub mod secret_cache;
+pub mod secret_watcher;
 pub mod types;
 pub mod watcher;
 

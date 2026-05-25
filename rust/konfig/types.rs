@@ -88,6 +88,34 @@ impl ConfigSnapshot {
     }
 }
 
+// ── SecretSnapshot ────────────────────────────────────────────────────────────
+
+/// Snapshot of a managed K8s Secret (label: konfig.io/managed=true).
+#[derive(Debug, Clone)]
+pub struct SecretSnapshot {
+    pub name: String,
+    pub namespace: String,
+    pub schema_version: u32,
+    /// Base64-encoded byte values, keyed by Secret data key.
+    /// Values are NOT decoded server-side.
+    pub data: std::collections::HashMap<String, bytes::Bytes>,
+    pub resource_version: String,
+    pub loaded_at: std::time::Instant,
+}
+
+impl Default for SecretSnapshot {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            namespace: String::new(),
+            schema_version: 0,
+            data: std::collections::HashMap::new(),
+            resource_version: String::new(),
+            loaded_at: std::time::Instant::now(),
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

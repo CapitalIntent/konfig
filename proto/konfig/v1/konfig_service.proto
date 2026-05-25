@@ -54,6 +54,52 @@ message ConfigEvent {
   Config config = 2;
 }
 
+message GetSecretRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+message SecretResponse {
+  string namespace = 1;
+  string name = 2;
+  uint32 schema_version = 3;
+  // JSON map: {"key": "<base64_value>"}. Values are NOT decoded server-side.
+  string data_json = 4;
+  string resource_version = 5;
+  int64 age_ms = 6;
+}
+
+message GetAllSecretsRequest {
+  string namespace = 1;
+}
+
+message ApplySecretRequest {
+  string namespace = 1;
+  string name = 2;
+  // YAML map key→plaintext. Server base64-encodes before patching.
+  string yaml_content = 3;
+}
+
+message ApplySecretResponse {
+  string resource_version = 1;
+}
+
+message SubscribeSecretsRequest {
+  string namespace = 1;
+  repeated string names = 2;
+  string resume_resource_version = 3;
+}
+
+message SecretEvent {
+  enum EventType {
+    ADDED = 0;
+    MODIFIED = 1;
+    DELETED = 2;
+  }
+  EventType event_type = 1;
+  SecretResponse secret = 2;
+}
+
 service KonfigService {
   // Get a single config by namespace and name.
   rpc Get(GetRequest) returns (Config);
@@ -63,4 +109,12 @@ service KonfigService {
   rpc Apply(ApplyRequest) returns (ApplyResponse);
   // Subscribe to live config change events (Phase 2B — returns Unimplemented for now).
   rpc Subscribe(SubscribeRequest) returns (stream ConfigEvent);
+  // Get a single secret by namespace and name.
+  rpc GetSecret(GetSecretRequest) returns (SecretResponse);
+  // Stream all secrets in a namespace.
+  rpc GetAllSecrets(GetAllSecretsRequest) returns (stream SecretResponse);
+  // Create or update a managed secret (YAML key→plaintext, server base64-encodes).
+  rpc ApplySecret(ApplySecretRequest) returns (ApplySecretResponse);
+  // Subscribe to secret change events (returns Unimplemented for now).
+  rpc SubscribeSecrets(SubscribeSecretsRequest) returns (stream SecretEvent);
 }

@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: konfig
+  namespace: konfig-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: konfig
+  template:
+    metadata:
+      labels:
+        app: konfig
+    spec:
+      serviceAccountName: konfig
+      containers:
+        - name: konfig
+          image: ghcr.io/capitalintent/konfig:latest
+          args:
+            - --grpc-addr=0.0.0.0:50051
+            - --metrics-addr=0.0.0.0:9090
+            - --namespace=$(KONFIG_NAMESPACE)
+            - --name=$(KONFIG_NAME)
+          env:
+            - name: KONFIG_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: konfig-config
+                  key: namespace
+            - name: KONFIG_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: konfig-config
+                  key: name
+          ports:
+            - name: grpc
+              containerPort: 50051
+            - name: metrics
+              containerPort: 9090
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          readinessProbe:
+            grpc:
+              port: 50051
+              service: konfig.v1.KonfigService
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            grpc:
+              port: 50051
+              service: konfig.v1.KonfigService
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3

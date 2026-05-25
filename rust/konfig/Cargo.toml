@@ -6,6 +6,10 @@ publish = false
 homepage.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "konfig"
+path = "main.rs"
+
 [lib]
 name = "konfig"
 path = "lib.rs"
@@ -31,19 +35,26 @@ required-features = ["integration"]
 [dependencies]
 arc-swap = {workspace = true}
 async-trait = {workspace = true}
+axum = {version = "0.8", default-features = false, features = ["tokio", "http1"]}
+base64 = {workspace = true}
 bytes = {workspace = true}
+clap = {version = "4", features = ["derive", "env"]}
+dashmap = {workspace = true}
 futures-util = "0.3"
 kube = {version = "0.98", features = ["runtime", "client"]}
 k8s-openapi = {version = "0.24", features = ["v1_31"]}
+prometheus = {version = "0.14", default-features = false}
 prost = {workspace = true}
 tonic-prost = {workspace = true}
 serde = {workspace = true}
 serde_json = {workspace = true}
 serde_yaml = "0.9"
-tokio = {workspace = true}
+tokio = {workspace = true, features = ["full"]}
 tokio-stream = "0.1"
 tonic = {workspace = true}
+tonic-health = "0.14.6"
 tracing = {workspace = true}
+tracing-subscriber = {version = "0.3", features = ["env-filter"]}
 thiserror = {workspace = true}
 
 [build-dependencies]
