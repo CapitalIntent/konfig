@@ -10,6 +10,7 @@
 //! - [`secret_watcher`] — watcher for Secrets (konfig.io/managed=true)
 //! - [`grpc`] — gRPC server (Protobuf, standard tonic codec)
 //! - [`import`] — CLI helper: onboard existing ConfigMaps as Config CRDs
+//! - [`trading`] — `TradingRiskConfig` for the Coinbase trading pod
 
 pub mod cache;
 pub mod configmap_watcher;
@@ -17,6 +18,7 @@ pub mod grpc;
 pub mod import;
 pub mod secret_cache;
 pub mod secret_watcher;
+pub mod trading;
 pub mod types;
 pub mod watcher;
 

@@ -1,0 +1,24 @@
+[package]
+name = "konfig-loadtest"
+version.workspace = true
+edition.workspace = true
+publish = false
+homepage.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "konfig-loadtest"
+path = "src/main.rs"
+
+[dependencies]
+clap = {version = "4", features = ["derive"]}
+futures-util = "0.3"
+konfig = {path = "../../rust/konfig"}
+tokio = {workspace = true, features = ["full"]}
+tonic = {workspace = true}
+tracing = {workspace = true}
+tracing-subscriber = {version = "0.3", features = ["env-filter"]}
+
+[lints.clippy]
+std_instead_of_core = "allow"
+std_instead_of_alloc = "allow"
