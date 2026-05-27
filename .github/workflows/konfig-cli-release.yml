@@ -133,6 +133,25 @@ jobs:
       - name: Show artifacts
         run: ls -lh dist/
 
+      - name: Write release notes
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          cat > release-notes.md << EOF
+          ## Installation
+
+          \`\`\`bash
+          # macOS ARM64
+          curl -sSL https://github.com/jayakasadev/konfig/releases/download/${TAG}/konfig-cli-darwin-arm64.tar.gz | tar -xz
+          sudo mv konfig-cli /usr/local/bin/
+
+          # Linux x86_64
+          curl -sSL https://github.com/jayakasadev/konfig/releases/download/${TAG}/konfig-cli-linux-amd64.tar.gz | tar -xz
+          sudo mv konfig-cli /usr/local/bin/
+          \`\`\`
+
+          Built from [CapitalIntent/capitalintent](https://github.com/CapitalIntent/capitalintent) at \`${{ github.sha }}\`.
+          EOF
+
       - name: Create release in jayakasadev/konfig
         env:
           GH_TOKEN: ${{ secrets.KONFIG_RELEASE_TOKEN }}
@@ -141,19 +160,7 @@ jobs:
           gh release create "$TAG" \
             --repo jayakasadev/konfig \
             --title "konfig-cli $TAG" \
-            --notes "## Installation
-
-\`\`\`bash
-# macOS ARM64
-curl -sSL https://github.com/jayakasadev/konfig/releases/download/${TAG}/konfig-cli-darwin-arm64.tar.gz | tar -xz
-sudo mv konfig-cli /usr/local/bin/
-
-# Linux x86_64
-curl -sSL https://github.com/jayakasadev/konfig/releases/download/${TAG}/konfig-cli-linux-amd64.tar.gz | tar -xz
-sudo mv konfig-cli /usr/local/bin/
-\`\`\`
-
-Built from [CapitalIntent/capitalintent](https://github.com/CapitalIntent/capitalintent) \`tools/konfig-cli\` at \`${{ github.sha }}\`." \
+            --notes-file release-notes.md \
             dist/konfig-cli-linux-amd64.tar.gz \
             dist/konfig-cli-linux-amd64.tar.gz.sha256 \
             dist/konfig-cli-darwin-arm64.tar.gz \
