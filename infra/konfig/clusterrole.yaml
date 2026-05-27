@@ -3,6 +3,9 @@ kind: ClusterRole
 metadata:
   name: konfig-config-access
 rules:
+  - apiGroups: ["konfig.io"]
+    resources: ["configs"]
+    verbs: ["get", "list", "watch", "patch"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch"]
