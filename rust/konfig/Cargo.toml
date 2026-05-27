@@ -32,6 +32,11 @@ name = "integration_grpc"
 path = "tests/integration_grpc.rs"
 required-features = ["integration"]
 
+[[test]]
+name = "cp_integration"
+path = "tests/cp_integration.rs"
+required-features = ["integration"]
+
 [dependencies]
 arc-swap = {workspace = true}
 async-trait = {workspace = true}

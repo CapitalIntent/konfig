@@ -50,6 +50,10 @@ pub struct ConfigSnapshot {
     pub content: Value,
     pub resource_version: String,
     pub loaded_at: Instant,
+    /// Set when the watcher loses its K8s connection; cleared on reconnect.
+    /// All snapshots in the cache share the same stale instant (set by
+    /// `ConfigCache::mark_all_stale` when the watcher disconnects).
+    pub stale_since: Option<Instant>,
 }
 
 impl Default for ConfigSnapshot {
@@ -61,6 +65,7 @@ impl Default for ConfigSnapshot {
             content: Value::Null,
             resource_version: String::new(),
             loaded_at: Instant::now(),
+            stale_since: None,
         }
     }
 }
@@ -79,6 +84,7 @@ impl ConfigSnapshot {
             content: spec.content,
             resource_version,
             loaded_at: Instant::now(),
+            stale_since: None,
         }
     }
 

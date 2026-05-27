@@ -23,6 +23,20 @@ pub const VERSION: &str = "v1";
 pub const KIND: &str = "Config";
 pub const PLURAL: &str = "configs";
 
+/// Reconnect backoff schedule in seconds: 1, 2, 4, 8, 16, 30, 30, ...
+/// Used by the watcher loop; exported for unit tests.
+pub const BACKOFF_STEPS_SECS: &[u64] = &[1, 2, 4, 8, 16, 30];
+
+/// Compute the next reconnect delay given the attempt index (0-based).
+/// Caps at the last element in `BACKOFF_STEPS_SECS`.
+pub fn backoff_delay(attempt: usize) -> std::time::Duration {
+    let secs = BACKOFF_STEPS_SECS
+        .get(attempt)
+        .copied()
+        .unwrap_or(*BACKOFF_STEPS_SECS.last().unwrap());
+    std::time::Duration::from_secs(secs)
+}
+
 pub fn config_api_resource() -> ApiResource {
     ApiResource {
         group: GROUP.to_string(),
@@ -54,7 +68,10 @@ impl Watcher {
         Watcher { client }
     }
 
-    /// Run the watcher until the stream ends or errors. Call inside `tokio::spawn`.
+    /// Run the watcher with exponential-backoff reconnect.
+    ///
+    /// On stream error: marks cache stale, waits `backoff_delay(attempt)`, retries.
+    /// On clean stream end: returns Ok(()).
     pub async fn run(
         self,
         cache: Arc<ConfigCache>,
@@ -62,19 +79,43 @@ impl Watcher {
         config_name: String,
     ) -> Result<(), WatcherError> {
         let ar = config_api_resource();
-        let api: Api<DynamicObject> = Api::namespaced_with(self.client, &namespace, &ar);
+        let mut attempt: usize = 0;
 
-        let wc = kube_watcher::Config::default().fields(&format!("metadata.name={config_name}"));
+        loop {
+            let api: Api<DynamicObject> =
+                Api::namespaced_with(self.client.clone(), &namespace, &ar);
+            let wc = kube_watcher::Config::default()
+                .fields(&format!("metadata.name={config_name}"));
+            let mut stream = kube_watch_stream(api, wc).boxed();
 
-        let mut stream = kube_watch_stream(api, wc).boxed();
+            info!(
+                namespace = %namespace,
+                name = %config_name,
+                attempt,
+                "Config watcher started"
+            );
 
-        info!(namespace = %namespace, name = %config_name, "Config watcher started");
-
-        while let Some(event) = stream.try_next().await? {
-            handle_event(event, &cache);
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(event)) => {
+                        handle_event(event, &cache);
+                        attempt = 0;
+                    }
+                    Ok(None) => {
+                        info!("Config watcher stream ended cleanly");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(attempt, "Config watcher error: {e} — marking cache stale");
+                        cache.mark_all_stale();
+                        let delay = backoff_delay(attempt);
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        break;
+                    }
+                }
+            }
         }
-
-        Ok(())
     }
 }
 
@@ -174,5 +215,18 @@ mod tests {
         assert_eq!(cache.load().schema_version, 3);
         handle_event(Event::Delete(obj), &cache);
         assert_eq!(cache.load().schema_version, 3);
+    }
+
+    #[test]
+    fn backoff_delay_schedule() {
+        let expected = &[1u64, 2, 4, 8, 16, 30, 30, 30];
+        for (attempt, &want_secs) in expected.iter().enumerate() {
+            let got = backoff_delay(attempt);
+            assert_eq!(
+                got,
+                std::time::Duration::from_secs(want_secs),
+                "attempt {attempt}: expected {want_secs}s got {got:?}"
+            );
+        }
     }
 }

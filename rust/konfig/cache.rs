@@ -69,6 +69,24 @@ impl ConfigCache {
         !self.inner.is_empty()
     }
 
+    /// Mark all cached snapshots as stale (watcher lost K8s connection).
+    ///
+    /// Called by the watcher on stream error.  Each snapshot gets
+    /// `stale_since = Some(now)`.  Next `cache.update(snap)` for a fresh
+    /// Apply event will insert a snapshot with `stale_since = None`.
+    pub fn mark_all_stale(&self) {
+        let now = std::time::Instant::now();
+        let keys: Vec<(String, String)> = self.inner.iter().map(|e| e.key().clone()).collect();
+        for key in keys {
+            if let Some(arc) = self.inner.get(&key) {
+                let mut snap = (**arc).clone();
+                snap.stale_since = Some(now);
+                drop(arc);
+                self.inner.insert(key, Arc::new(snap));
+            }
+        }
+    }
+
     /// Return any one snapshot — useful for health-gate checks.
     pub fn load_any(&self) -> Option<Arc<ConfigSnapshot>> {
         self.inner.iter().next().map(|e| Arc::clone(e.value()))
@@ -163,6 +181,33 @@ mod tests {
         cache.update(snap("ns", "cfg", 42));
         let loaded = cache.load();
         assert_eq!(loaded.schema_version, 42);
+    }
+
+    #[test]
+    fn mark_all_stale_sets_stale_since_on_all_entries() {
+        let cache = ConfigCache::new(ConfigSnapshot::default());
+        cache.update(snap("ns", "cfg-a", 1));
+        cache.update(snap("ns", "cfg-b", 2));
+
+        assert!(cache.get("ns", "cfg-a").unwrap().stale_since.is_none());
+        assert!(cache.get("ns", "cfg-b").unwrap().stale_since.is_none());
+
+        cache.mark_all_stale();
+
+        assert!(cache.get("ns", "cfg-a").unwrap().stale_since.is_some());
+        assert!(cache.get("ns", "cfg-b").unwrap().stale_since.is_some());
+    }
+
+    #[test]
+    fn update_after_stale_clears_stale_since() {
+        let cache = ConfigCache::new(ConfigSnapshot::default());
+        cache.update(snap("ns", "cfg", 1));
+        cache.mark_all_stale();
+        assert!(cache.get("ns", "cfg").unwrap().stale_since.is_some());
+
+        // A fresh Apply clears stale_since (new snapshot, stale_since = None).
+        cache.update(snap("ns", "cfg", 2));
+        assert!(cache.get("ns", "cfg").unwrap().stale_since.is_none());
     }
 
     // old_guard_survives_update is dropped since DashMap doesn't give ArcSwap

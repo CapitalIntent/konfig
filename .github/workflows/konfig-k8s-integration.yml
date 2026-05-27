@@ -45,7 +45,7 @@ jobs:
           cargo test \
             --features integration \
             -p konfig \
-            -- --nocapture
+            -- --nocapture --test-threads=1
         env:
           RUST_LOG: konfig=debug,kube=info
           TESTCONTAINERS_RYUK_DISABLED: "false"

@@ -156,5 +156,9 @@ pub(crate) fn snapshot_to_proto(snap: &crate::types::ConfigSnapshot) -> Config {
         content_json: snap.content_json(),
         resource_version: snap.resource_version.clone(),
         age_ms: snap.loaded_at.elapsed().as_millis() as i64,
+        stale_since_ms: snap
+            .stale_since
+            .map(|t| t.elapsed().as_millis() as i64)
+            .unwrap_or(-1),
     }
 }
