@@ -5,7 +5,7 @@ metadata:
 rules:
   - apiGroups: ["konfig.io"]
     resources: ["configs"]
-    verbs: ["get", "list", "watch", "patch"]
+    verbs: ["get", "list", "watch", "patch", "create"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch"]
