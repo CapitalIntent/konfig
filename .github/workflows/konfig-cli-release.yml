@@ -1,0 +1,160 @@
+name: konfig-cli release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v0.1.0)"
+        required: true
+        type: string
+  push:
+    tags:
+      - "konfig-cli/v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Linux x86_64 ────────────────────────────────────────────────────────────
+  build-linux-amd64:
+    name: Build linux/amd64
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            ~/.cache/bazel-repo-cache
+          key: bazel-konfig-cli-linux-amd64-${{ hashFiles('Cargo.lock', 'MODULE.bazel.lock') }}
+          restore-keys: bazel-konfig-cli-linux-amd64-
+
+      - name: Build
+        run: |
+          bazel build //tools/konfig-cli:konfig_cli \
+            --platforms=//bazel/platforms:x86_64_linux
+
+      - name: Package
+        run: |
+          BIN=$(bazel cquery //tools/konfig-cli:konfig_cli \
+            --platforms=//bazel/platforms:x86_64_linux \
+            --output=files 2>/dev/null | head -1)
+          mkdir -p dist
+          cp "$BIN" dist/konfig-cli
+          tar -C dist -czf dist/konfig-cli-linux-amd64.tar.gz konfig-cli
+          sha256sum dist/konfig-cli-linux-amd64.tar.gz > dist/konfig-cli-linux-amd64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: konfig-cli-linux-amd64
+          path: dist/konfig-cli-linux-amd64.tar.gz*
+          retention-days: 1
+
+  # ── macOS ARM64 ─────────────────────────────────────────────────────────────
+  build-macos-arm64:
+    name: Build darwin/arm64
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Install protoc
+        run: brew install protobuf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+          key: bazel-konfig-cli-macos-arm64-${{ hashFiles('Cargo.lock', 'MODULE.bazel.lock') }}
+          restore-keys: bazel-konfig-cli-macos-arm64-
+
+      - name: Build
+        run: |
+          bazel build //tools/konfig-cli:konfig_cli \
+            --platforms=//bazel/platforms:aarch64_macos
+
+      - name: Package
+        run: |
+          BIN=$(bazel cquery //tools/konfig-cli:konfig_cli \
+            --platforms=//bazel/platforms:aarch64_macos \
+            --output=files 2>/dev/null | head -1)
+          mkdir -p dist
+          cp "$BIN" dist/konfig-cli
+          tar -C dist -czf dist/konfig-cli-darwin-arm64.tar.gz konfig-cli
+          shasum -a 256 dist/konfig-cli-darwin-arm64.tar.gz > dist/konfig-cli-darwin-arm64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: konfig-cli-darwin-arm64
+          path: dist/konfig-cli-darwin-arm64.tar.gz*
+          retention-days: 1
+
+  # ── GitHub Release ───────────────────────────────────────────────────────────
+  release:
+    name: Publish release to jayakasadev/konfig
+    needs: [build-linux-amd64, build-macos-arm64]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: konfig-cli-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            # Strip "konfig-cli/" prefix from the tag ref
+            echo "tag=${GITHUB_REF_NAME#konfig-cli/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Show artifacts
+        run: ls -lh dist/
+
+      - name: Create release in jayakasadev/konfig
+        env:
+          GH_TOKEN: ${{ secrets.KONFIG_RELEASE_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          gh release create "$TAG" \
+            --repo jayakasadev/konfig \
+            --title "konfig-cli $TAG" \
+            --notes "## Installation
+
+\`\`\`bash
+# macOS ARM64
+curl -sSL https://github.com/jayakasadev/konfig/releases/download/${TAG}/konfig-cli-darwin-arm64.tar.gz | tar -xz
+sudo mv konfig-cli /usr/local/bin/
+
+# Linux x86_64
+curl -sSL https://github.com/jayakasadev/konfig/releases/download/${TAG}/konfig-cli-linux-amd64.tar.gz | tar -xz
+sudo mv konfig-cli /usr/local/bin/
+\`\`\`
+
+Built from [CapitalIntent/capitalintent](https://github.com/CapitalIntent/capitalintent) \`tools/konfig-cli\` at \`${{ github.sha }}\`." \
+            dist/konfig-cli-linux-amd64.tar.gz \
+            dist/konfig-cli-linux-amd64.tar.gz.sha256 \
+            dist/konfig-cli-darwin-arm64.tar.gz \
+            dist/konfig-cli-darwin-arm64.tar.gz.sha256
