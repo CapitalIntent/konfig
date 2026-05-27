@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "konfig.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "konfig.labels" . | nindent 4 }}
+data:
+  namespace: {{ .Values.konfig.watchNamespace | quote }}
+  name: {{ .Values.konfig.watchName | quote }}

@@ -1,0 +1,33 @@
+{{- if .Values.argocd.createApplication }}
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ include "konfig.fullname" . }}
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "konfig.labels" . | nindent 4 }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.argocd.repoURL | required "argocd.repoURL is required when argocd.createApplication=true" }}
+    targetRevision: {{ .Values.argocd.targetRevision }}
+    path: chart
+    helm:
+      releaseName: {{ .Release.Name }}
+      valueFiles:
+        - values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ .Release.Namespace }}
+  syncPolicy:
+    {{- if .Values.argocd.automated.enabled }}
+    automated:
+      prune: {{ .Values.argocd.automated.prune }}
+      selfHeal: {{ .Values.argocd.automated.selfHeal }}
+    {{- end }}
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+{{- end }}

@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "konfig.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "konfig.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "konfig.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+    {{- if .Values.telemetry.tokioConsole.enabled }}
+    - name: tokio-console
+      port: {{ .Values.telemetry.tokioConsole.port }}
+      targetPort: tokio-console
+      protocol: TCP
+    {{- end }}

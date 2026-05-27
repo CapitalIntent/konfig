@@ -1,0 +1,150 @@
+# Default values for konfig.
+# See README.md for full documentation.
+
+# -- Number of konfig server replicas.
+# 1 is sufficient for most workloads; 2+ for HA (requires PDB).
+replicaCount: 1
+
+image:
+  repository: kasa288/konfig
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag. Defaults to chart appVersion.
+  tag: ""
+
+# -- Image pull secrets for private registries.
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create a ServiceAccount for the konfig pod.
+  create: true
+  # -- Additional annotations on the ServiceAccount (e.g. IRSA, Workload Identity).
+  annotations: {}
+  # -- Override the ServiceAccount name. Defaults to the release fullname.
+  name: ""
+
+# -- Additional pod annotations (e.g. Prometheus scrape config).
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"
+  prometheus.io/path: "/metrics"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  # -- gRPC service port.
+  grpcPort: 50051
+  # -- Prometheus metrics port.
+  metricsPort: 9090
+  type: ClusterIP
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# -- Liveness and readiness probes via gRPC health protocol.
+# Readiness blocks traffic until the cache is populated (first Config CRD watch established).
+livenessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+# -- Node selector for scheduling.
+nodeSelector: {}
+
+# -- Tolerations for tainted nodes.
+tolerations: []
+
+# -- Pod affinity/anti-affinity rules.
+affinity: {}
+
+# -- PodDisruptionBudget settings.
+pdb:
+  enabled: true
+  # -- maxUnavailable=0 ensures zero downtime during node drains.
+  maxUnavailable: 0
+
+# ── Konfig-specific settings ──────────────────────────────────────────────────
+
+konfig:
+  # -- Kubernetes namespace to watch for Config CRDs.
+  # The konfig pod watches this namespace for a Config CRD with the given name.
+  watchNamespace: "default"
+
+  # -- Name of the Config CRD to watch.
+  watchName: "trading"
+
+  # -- Enable ConfigMap watching (opt-in via label konfig.io/managed=true).
+  # When true, labeled ConfigMaps are merged into ConfigCache alongside CRDs.
+  watchConfigMaps: false
+
+  # -- Namespaces to watch for Secrets (comma-separated).
+  # Secrets require label konfig.io/managed=true and RBAC is namespace-scoped.
+  # Leave empty to disable Secret watching (default).
+  secretNamespaces: ""
+
+# ── RBAC ──────────────────────────────────────────────────────────────────────
+
+rbac:
+  # -- Create ClusterRole + ClusterRoleBinding for Config CRD access.
+  createConfigRole: true
+
+  # -- Create ClusterRole + ClusterRoleBinding for ConfigMap access.
+  # Only relevant when konfig.watchConfigMaps=true.
+  createConfigMapRole: true
+
+  # -- Create Role + RoleBinding per namespace for Secret access.
+  # Only created when konfig.secretNamespaces is non-empty.
+  createSecretRole: true
+
+# ── ArgoCD GitOps ─────────────────────────────────────────────────────────────
+
+argocd:
+  # -- Create an ArgoCD Application resource for GitOps management.
+  createApplication: false
+  namespace: argocd
+  project: default
+  # repoURL and targetRevision must be set when createApplication=true
+  repoURL: ""
+  targetRevision: HEAD
+  # -- Manual sync for production; automated for staging.
+  automated:
+    enabled: false
+    prune: false
+    selfHeal: false
+
+# ── Telemetry ─────────────────────────────────────────────────────────────────
+
+telemetry:
+  # -- Enable dial9-tokio-telemetry trace recording.
+  dial9:
+    enabled: false
+    traceDir: /tmp/dial9-traces
+    maxDiskUsageMb: 512
+    rotationSecs: 60
+
+  # -- Enable tokio-console on port 4242 (development only).
+  tokioConsole:
+    enabled: false
+    port: 4242
