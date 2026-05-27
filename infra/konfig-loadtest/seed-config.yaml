@@ -1,0 +1,8 @@
+apiVersion: konfig.io/v1
+kind: Config
+metadata:
+  name: konfig-loadtest
+  namespace: konfig-system
+spec:
+  schema_version: 0
+  content: {}

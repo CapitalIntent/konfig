@@ -16,7 +16,7 @@ spec:
       serviceAccountName: konfig
       containers:
         - name: konfig
-          image: ghcr.io/capitalintent/konfig:latest
+          image: kasa288/konfig:latest
           args:
             - --grpc-addr=0.0.0.0:50051
             - --metrics-addr=0.0.0.0:9090
