@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.88-slim AS builder
+FROM rust:1.89-slim AS builder
 WORKDIR /build
 RUN apt-get update -q && apt-get install -y -q protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY . .
