@@ -1,5 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_clippy", "rustfmt_test")
-load("//bazel/rust:defs.bzl", "rust_binary")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy", "rustfmt_test")
 
 rust_binary(
     name = "konfig_loadtest",

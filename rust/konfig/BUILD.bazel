@@ -38,7 +38,6 @@ rust_library(
     deps = [
         ":konfig_bs",
         "@crates//:arc-swap",
-        "@crates//:async-trait",
         "@crates//:axum",
         "@crates//:base64",
         "@crates//:bytes",

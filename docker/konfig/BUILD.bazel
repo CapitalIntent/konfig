@@ -1,41 +1,18 @@
-load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
-load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+# Multistage Docker build: rust:1.88-slim compiles, distroless/cc-debian12:nonroot packages.
+#
+# Usage:
+#   bazel run //docker/konfig:push                 # build + push linux/arm64 (Docker Desktop default)
+#   bazel run //docker/konfig:push -- linux/amd64  # build + push linux/amd64 (EKS)
+#   bazel run //docker/konfig:load                 # build + load into local Docker daemon
 
-# Pack the server binary into a single-file layer at /.
-pkg_tar(
-    name = "konfig_layer",
-    srcs = ["//rust/konfig:konfig_bin"],
-    package_dir = "/",
-    mode = "0755",
-    # Strip Bazel output path prefix so the binary lands at /konfig_bin.
-    strip_prefix = "/",
-)
-
-# Assemble the OCI image: distroless/cc-debian12:nonroot + binary layer.
-# Cross-platform: --platforms=//bazel/platforms:aarch64_linux  → arm64 base + arm64 binary
-#                 --platforms=//bazel/platforms:x86_64_linux   → amd64 base + amd64 binary
-oci_image(
-    name = "image",
-    base = "@distroless_cc",
-    tars = [":konfig_layer"],
-    entrypoint = ["/konfig_bin"],
-    exposed_ports = [
-        "50051/tcp",
-        "9090/tcp",
-    ],
-)
-
-# Load into local docker daemon:  bazel run //docker/konfig:load
-oci_load(
-    name = "load",
-    image = ":image",
-    repo_tags = ["kasa288/konfig:latest"],
-)
-
-# Push to Docker Hub:  bazel run //docker/konfig:push --platforms=//bazel/platforms:aarch64_linux
-oci_push(
+sh_binary(
     name = "push",
-    image = ":image",
-    repository = "index.docker.io/kasa288/konfig",
-    remote_tags = ["latest"],
+    srcs = ["push.sh"],
+    data = ["Dockerfile"],
+)
+
+sh_binary(
+    name = "load",
+    srcs = ["load.sh"],
+    data = ["Dockerfile"],
 )
