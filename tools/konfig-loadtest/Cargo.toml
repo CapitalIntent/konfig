@@ -12,12 +12,14 @@ path = "src/main.rs"
 
 [dependencies]
 clap = {version = "4", features = ["derive"]}
+console-subscriber = "0.4"
+dial9-tokio-telemetry = {version = "0.3", features = ["tracing-layer"]}
 futures-util = "0.3"
 konfig = {path = "../../rust/konfig"}
 tokio = {workspace = true, features = ["full"]}
 tonic = {workspace = true}
 tracing = {workspace = true}
-tracing-subscriber = {version = "0.3", features = ["env-filter"]}
+tracing-subscriber = {version = "0.3", features = ["env-filter", "registry"]}
 
 [lints.clippy]
 std_instead_of_core = "allow"
