@@ -1,21 +1,22 @@
 //! `Subscribe` handler for `KonfigService`.
 //!
-//! Streams `ConfigEvent` proto messages as Config CRD changes occur in K8s.
-//! Each subscriber gets its own mpsc channel (capacity 256); slow subscribers
-//! are disconnected with RESOURCE_EXHAUSTED.
+//! Architecture: one kube watch stream per namespace, shared via
+//! `tokio::sync::broadcast`.  Each subscriber gets a `Receiver` clone — O(1)
+//! fan-out instead of O(N) sequential `try_send` per event.
 //!
-//! `resume_resource_version`: when set, the watch starts from that K8s
-//! resourceVersion via the raw watch API, ensuring zero duplicates and zero
-//! missed events across reconnects.
+//! `resume_resource_version`: keeps the existing raw kube watch path (resume
+//! semantics require per-subscriber starting points incompatible with a shared
+//! broadcast).
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use futures_util::{StreamExt, TryStreamExt};
 use kube::api::{WatchEvent, WatchParams};
 use kube::core::DynamicObject;
 use kube::runtime::watcher::{self as kube_watcher, Event, watcher as kube_watch_stream};
 use kube::{Api, Client};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
@@ -26,43 +27,99 @@ use crate::grpc::snapshot_to_proto;
 use crate::proto::{ConfigEvent, SubscribeRequest, config_event::EventType};
 use crate::watcher::config_api_resource;
 
+/// Per-subscriber mpsc capacity — back-pressure for slow readers.
 const CHANNEL_CAPACITY: usize = 256;
+
+/// Broadcast ring-buffer capacity per namespace.
+/// Sized so that even the slowest subscriber can drain before the ring wraps.
+const BROADCAST_CAPACITY: usize = 1_024;
 
 pub async fn handle_subscribe(
     cache: Arc<ConfigCache>,
     kube_client: Client,
+    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<ConfigEvent>>>,
     req: SubscribeRequest,
 ) -> Result<Response<ReceiverStream<Result<ConfigEvent, Status>>>, Status> {
     debug!(namespace = %req.namespace, resume_rv = %req.resume_resource_version, "Subscribe RPC");
 
-    // Refuse if cache not yet populated.
     if !cache.is_populated() {
         return Err(Status::unavailable("cache not yet populated"));
     }
 
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-    let ar = config_api_resource();
     let namespace = req.namespace.clone();
     let resume_rv = req.resume_resource_version.clone();
 
-    tokio::spawn(async move {
-        if resume_rv.is_empty() {
-            run_high_level_watch(kube_client, namespace, ar, tx).await;
-        } else {
-            run_raw_watch(kube_client, namespace, ar, resume_rv, tx).await;
-        }
-    });
+    if !resume_rv.is_empty() {
+        // Resume path: per-subscriber raw watch (broadcast can't share resume points).
+        tokio::spawn(run_raw_watch(
+            kube_client,
+            namespace,
+            config_api_resource(),
+            resume_rv,
+            tx,
+        ));
+        return Ok(Response::new(ReceiverStream::new(rx)));
+    }
+
+    // Broadcast path: get or create the shared sender for this namespace.
+    let bcast_rx = get_or_create_broadcast(
+        namespace.clone(),
+        kube_client,
+        namespace_broadcasts,
+    );
+
+    // Bridge: broadcast::Receiver → mpsc::Sender (this subscriber's gRPC stream).
+    tokio::spawn(bridge_broadcast(bcast_rx, tx));
 
     Ok(Response::new(ReceiverStream::new(rx)))
 }
 
-/// High-level kube-rs watcher combinator (no resume RV needed).
-async fn run_high_level_watch(
-    kube_client: Client,
+/// Return a broadcast `Receiver` for `namespace`, spinning up a kube watcher
+/// if one isn't already running for that namespace.
+fn get_or_create_broadcast(
     namespace: String,
-    ar: kube::api::ApiResource,
-    tx: mpsc::Sender<Result<ConfigEvent, Status>>,
+    kube_client: Client,
+    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<ConfigEvent>>>,
+) -> broadcast::Receiver<ConfigEvent> {
+    // Fast path: namespace already has a running watcher.
+    if let Some(sender) = namespace_broadcasts.get(&namespace) {
+        return sender.subscribe();
+    }
+
+    // Slow path: first subscriber for this namespace — create broadcast + watcher.
+    match namespace_broadcasts.entry(namespace.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(e) => {
+            // Another task beat us while we were acquiring the entry lock.
+            e.get().subscribe()
+        }
+        dashmap::mapref::entry::Entry::Vacant(e) => {
+            let (bcast_tx, bcast_rx) = broadcast::channel(BROADCAST_CAPACITY);
+            e.insert(bcast_tx.clone());
+
+            // The watcher runs until the kube stream ends, then removes itself
+            // from the map so the next Subscribe creates a new one.
+            tokio::spawn(run_namespace_watcher(
+                namespace,
+                kube_client,
+                bcast_tx,
+                namespace_broadcasts.clone(),
+            ));
+
+            bcast_rx
+        }
+    }
+}
+
+/// Single kube watch stream per namespace — broadcasts every event to all
+/// current subscribers.  Removes itself from `namespace_broadcasts` on exit.
+async fn run_namespace_watcher(
+    namespace: String,
+    kube_client: Client,
+    tx: broadcast::Sender<ConfigEvent>,
+    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<ConfigEvent>>>,
 ) {
+    let ar = config_api_resource();
     let api: Api<DynamicObject> = Api::namespaced_with(kube_client, &namespace, &ar);
     let wc = kube_watcher::Config::default();
     let mut stream = kube_watch_stream(api, wc).boxed();
@@ -73,16 +130,56 @@ async fn run_high_level_watch(
             Event::Delete(obj) => (EventType::Deleted as i32, obj),
             Event::Init | Event::InitDone => continue,
         };
-        if !emit_event(&tx, event_type, obj).await {
-            break;
+        let Some(snap) = crate::watcher::parse_config_object(&obj) else {
+            continue;
+        };
+        let config_event = ConfigEvent {
+            event_type,
+            config: Some(snapshot_to_proto(&snap)),
+        };
+        // `send` returns Err only when there are zero receivers — drop the event.
+        let _ = tx.send(config_event);
+    }
+
+    // Watcher stream ended — remove from map so next Subscribe creates a new one.
+    namespace_broadcasts.remove(&namespace);
+    info!(namespace = %namespace, "Namespace watcher ended — removed from broadcast map");
+}
+
+/// Forward events from the namespace broadcast to a single subscriber's mpsc.
+///
+/// Disconnects the subscriber with RESOURCE_EXHAUSTED if:
+/// - the mpsc channel is full (subscriber too slow to drain), or
+/// - the broadcast ring wrapped before this receiver drained (lagged).
+async fn bridge_broadcast(
+    mut bcast_rx: broadcast::Receiver<ConfigEvent>,
+    tx: mpsc::Sender<Result<ConfigEvent, Status>>,
+) {
+    loop {
+        match bcast_rx.recv().await {
+            Ok(event) => match tx.try_send(Ok(event)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    warn!("Subscriber too slow — disconnecting with RESOURCE_EXHAUSTED");
+                    let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
+                    break;
+                }
+                Err(TrySendError::Closed(_)) => {
+                    info!("Subscriber disconnected");
+                    break;
+                }
+            },
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(missed = n, "Subscriber lagged — disconnecting");
+                let _ = tx.try_send(Err(Status::resource_exhausted("subscriber lagged")));
+                break;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 }
 
 /// Raw kube watch from a specific `resource_version` (resume path).
-///
-/// Uses `Api::watch` to start from exactly the given RV, guaranteeing no
-/// duplicates and no missed events.  BOOKMARK events update the cursor only.
 async fn run_raw_watch(
     kube_client: Client,
     namespace: String,
@@ -107,17 +204,16 @@ async fn run_raw_watch(
     while let Some(result) = stream.next().await {
         match result {
             Ok(WatchEvent::Added(obj)) | Ok(WatchEvent::Modified(obj)) => {
-                if !emit_event(&tx, EventType::Modified as i32, obj).await {
+                if !emit_to_mpsc(&tx, EventType::Modified as i32, obj).await {
                     break;
                 }
             }
             Ok(WatchEvent::Deleted(obj)) => {
-                if !emit_event(&tx, EventType::Deleted as i32, obj).await {
+                if !emit_to_mpsc(&tx, EventType::Deleted as i32, obj).await {
                     break;
                 }
             }
             Ok(WatchEvent::Bookmark(_)) => {
-                // Bookmark events advance the K8s watch cursor — do not emit.
                 debug!("Subscribe: BOOKMARK received — cursor advanced");
             }
             Ok(WatchEvent::Error(e)) => {
@@ -133,7 +229,7 @@ async fn run_raw_watch(
     }
 }
 
-async fn emit_event(
+async fn emit_to_mpsc(
     tx: &mpsc::Sender<Result<ConfigEvent, Status>>,
     event_type: i32,
     obj: DynamicObject,
@@ -165,7 +261,7 @@ mod tests {
     #[test]
     fn empty_cache_fails_gate() {
         let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
-        assert!(!cache.is_populated(), "empty cache must not be populated");
+        assert!(!cache.is_populated());
     }
 
     #[test]

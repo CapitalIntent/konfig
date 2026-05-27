@@ -12,17 +12,19 @@ pub mod subscribe;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use kube::Client;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::cache::ConfigCache;
-use crate::proto::konfig_service_server::{KonfigService, KonfigServiceServer};
 use crate::proto::{
     ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, Config, ConfigEvent,
     GetAllRequest, GetAllSecretsRequest, GetRequest, GetSecretRequest, SecretResponse,
     SubscribeRequest, SubscribeSecretsRequest,
+    konfig_service_server::{KonfigService, KonfigServiceServer},
 };
 use crate::secret_cache::SecretCache;
 
@@ -47,6 +49,10 @@ pub struct KonfigServer {
     pub(crate) cache: Arc<ConfigCache>,
     pub(crate) secret_cache: Arc<SecretCache>,
     pub(crate) kube_client: Client,
+    /// One broadcast sender per namespace — shared across all subscribers for
+    /// that namespace.  A single kube watcher drives the sender; each
+    /// subscriber gets a `Receiver` clone (O(1) fan-out).
+    pub(crate) namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<ConfigEvent>>>,
 }
 
 #[tonic::async_trait]
@@ -80,6 +86,7 @@ impl KonfigService for KonfigServer {
         subscribe::handle_subscribe(
             Arc::clone(&self.cache),
             self.kube_client.clone(),
+            Arc::clone(&self.namespace_broadcasts),
             request.into_inner(),
         )
         .await
@@ -130,6 +137,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         cache: cfg.cache,
         secret_cache: cfg.secret_cache,
         kube_client: cfg.kube_client,
+        namespace_broadcasts: Arc::new(DashMap::new()),
     };
     let svc = KonfigServiceServer::new(server);
 

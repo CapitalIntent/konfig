@@ -114,7 +114,7 @@ async fn resource_version_resume_no_missed_events() {
             names: vec![],
             resume_resource_version: String::new(),
         };
-        let resp = handle_subscribe(Arc::clone(&cache), client.clone(), req)
+        let resp = handle_subscribe(Arc::clone(&cache), client.clone(), Arc::new(dashmap::DashMap::new()), req)
             .await
             .expect("Subscribe must succeed");
 
@@ -163,7 +163,7 @@ async fn resource_version_resume_no_missed_events() {
             names: vec![],
             resume_resource_version: last_rv,
         };
-        let resp = handle_subscribe(Arc::clone(&cache), client.clone(), req)
+        let resp = handle_subscribe(Arc::clone(&cache), client.clone(), Arc::new(dashmap::DashMap::new()), req)
             .await
             .expect("Subscribe (resume) must succeed");
 
@@ -327,7 +327,7 @@ async fn bookmark_events_not_emitted_to_subscribers() {
         resume_resource_version: String::new(),
     };
     let resp =
-        handle_subscribe(cache, client.clone(), req).await.expect("Subscribe must succeed");
+        handle_subscribe(cache, client.clone(), Arc::new(dashmap::DashMap::new()), req).await.expect("Subscribe must succeed");
     let mut stream = resp.into_inner();
 
     let apply_client = client.clone();
