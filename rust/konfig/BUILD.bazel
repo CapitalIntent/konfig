@@ -1,6 +1,5 @@
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
-load("@rules_rust//rust:defs.bzl", "rust_clippy", "rust_library", "rustfmt_test")
-load("//bazel/rust:defs.bzl", "rust_binary", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy", "rust_library", "rust_test", "rustfmt_test")
 
 # Run build.rs to generate protobuf/tonic bindings into OUT_DIR.
 # The proto file is available in the sandbox at
