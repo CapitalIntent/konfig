@@ -149,7 +149,7 @@ jobs:
           sudo mv konfig-cli /usr/local/bin/
           \`\`\`
 
-          Built from [CapitalIntent/capitalintent](https://github.com/CapitalIntent/capitalintent) at \`${{ github.sha }}\`.
+          Built from commit \`${{ github.sha }}\`.
           EOF
 
       - name: Create release in jayakasadev/konfig
