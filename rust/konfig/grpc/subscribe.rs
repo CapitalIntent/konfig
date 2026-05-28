@@ -271,12 +271,16 @@ async fn resume_from_buffer(
             snapshot_count = snapshots.len(),
             "Resume: RV not in buffer — sending full cache snapshot"
         );
+        let mut snapshot_events: Vec<ConfigEvent> = Vec::with_capacity(snapshots.len());
         for snap in &snapshots {
             let event = ConfigEvent {
                 event_type: EventType::Modified as i32,
                 config: Some(snapshot_to_proto(snap)),
             };
-            match tx.try_send(Ok(event)) {
+            snapshot_events.push(event);
+        }
+        for event in &snapshot_events {
+            match tx.try_send(Ok(event.clone())) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     warn!("Subscriber too slow during snapshot — disconnecting");
@@ -287,6 +291,39 @@ async fn resume_from_buffer(
                     info!("Subscriber disconnected during snapshot");
                     return;
                 }
+            }
+        }
+
+        // Close the race window: replay buffer events that arrived after the
+        // snapshot was taken but before this subscriber joins the broadcast.
+        // K8s resource versions are u64 decimal strings — parse as u64 for
+        // correct numeric comparison (string comparison is wrong for large values).
+        let max_snapshot_rv: u64 = snapshot_events
+            .iter()
+            .filter_map(|e| e.config.as_ref())
+            .map(|c| c.resource_version.parse::<u64>().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+
+        // Collect under the lock, then release before any await.
+        let post_snapshot_events: Vec<ConfigEvent> = {
+            let guard = replay_buf.lock().expect("replay buffer poisoned");
+            guard
+                .iter()
+                .filter(|e| e.resource_version.parse::<u64>().unwrap_or(0) > max_snapshot_rv)
+                .map(|e| e.event.clone())
+                .collect()
+        }; // mutex released here
+
+        debug!(
+            namespace = %namespace,
+            post_snapshot_count = post_snapshot_events.len(),
+            "Resume: sending post-snapshot buffer events to close race window"
+        );
+
+        for event in post_snapshot_events {
+            if tx.send(Ok(event)).await.is_err() {
+                return; // subscriber disconnected
             }
         }
     } else {
@@ -605,6 +642,61 @@ mod tests {
             received,
             vec![6],
             "resuming at latest rv should yield only new live events"
+        );
+    }
+
+    // ── Async: miss-path closes race window — post-snapshot buffer events sent ─
+
+    #[tokio::test]
+    async fn resume_miss_path_closes_race_window() {
+        // Buffer has rv-1..rv-5. Cache has rv-5.
+        // 3 post-snapshot events (rv-6, rv-7, rv-8) are in the buffer,
+        // simulating events that fired between the snapshot being taken and the
+        // subscriber joining the broadcast.
+        // Client reconnects with a stale rv (miss) → must receive:
+        //   snapshot (rv-5, schema_version=5) + rv-6, rv-7, rv-8.
+        let replay_buf = make_replay_buf(&[
+            ("1", 1),
+            ("2", 2),
+            ("3", 3),
+            ("4", 4),
+            ("5", 5),
+            ("6", 6),
+            ("7", 7),
+            ("8", 8),
+        ]);
+        // Cache reflects the state at the snapshot: only rv-5.
+        let cache = make_cache("default", &[("cfg", "5", 5)]);
+
+        let (bcast_tx, bcast_rx) = broadcast::channel::<ConfigEvent>(64);
+        let (tx, mut rx) = mpsc::channel(128);
+
+        // Close the broadcast sender so bridge_broadcast exits cleanly after
+        // the post-snapshot replay — no live events needed for this test.
+        drop(bcast_tx);
+
+        tokio::spawn(resume_from_buffer(
+            "old-rv".into(), // stale — not in buffer (miss path)
+            replay_buf,
+            cache,
+            "default".into(),
+            bcast_rx,
+            tx,
+        ));
+
+        let mut received_schema_versions: Vec<u32> = Vec::new();
+        while let Some(Ok(ev)) = rx.recv().await {
+            received_schema_versions.push(ev.config.unwrap().schema_version);
+        }
+
+        // Must receive the snapshot entry (rv-5, sv=5) plus the three
+        // post-snapshot buffer events (rv-6, rv-7, rv-8 → sv=6, 7, 8).
+        // The snapshot event order is unspecified (cache is a map), so sort.
+        received_schema_versions.sort_unstable();
+        assert_eq!(
+            received_schema_versions,
+            vec![5, 6, 7, 8],
+            "miss-path must include snapshot + post-snapshot buffer events to close race window"
         );
     }
 }
