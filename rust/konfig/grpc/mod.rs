@@ -20,6 +20,7 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::cache::ConfigCache;
+use crate::grpc::subscribe::ReplayBuffer;
 use crate::proto::{
     ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, Config, ConfigEvent,
     GetAllRequest, GetAllSecretsRequest, GetRequest, GetSecretRequest, SecretResponse,
@@ -49,10 +50,14 @@ pub struct KonfigServer {
     pub(crate) cache: Arc<ConfigCache>,
     pub(crate) secret_cache: Arc<SecretCache>,
     pub(crate) kube_client: Client,
-    /// One broadcast sender per namespace — shared across all subscribers for
-    /// that namespace.  A single kube watcher drives the sender; each
+    /// One broadcast sender per namespace — shared across all Config subscribers
+    /// for that namespace.  A single kube watcher drives the sender; each
     /// subscriber gets a `Receiver` clone (O(1) fan-out).
     pub(crate) namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<ConfigEvent>>>,
+    /// Per-namespace replay buffer for the `resume_resource_version` reconnect
+    /// path.  Holds the last `REPLAY_BUFFER_SIZE` events so reconnecting clients
+    /// can catch up without opening a new kube watch.
+    pub(crate) namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
 }
 
 #[tonic::async_trait]
@@ -87,6 +92,7 @@ impl KonfigService for KonfigServer {
             Arc::clone(&self.cache),
             self.kube_client.clone(),
             Arc::clone(&self.namespace_broadcasts),
+            Arc::clone(&self.namespace_replay_buffers),
             request.into_inner(),
         )
         .await
@@ -140,6 +146,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         secret_cache: cfg.secret_cache,
         kube_client: cfg.kube_client,
         namespace_broadcasts: Arc::new(DashMap::new()),
+        namespace_replay_buffers: Arc::new(DashMap::new()),
     };
     let svc = KonfigServiceServer::new(server);
 

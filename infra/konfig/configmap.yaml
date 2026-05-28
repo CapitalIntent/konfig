@@ -5,4 +5,4 @@ metadata:
   namespace: konfig-system
 data:
   namespace: default
-  name: trading
+  name: app-config

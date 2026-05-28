@@ -76,7 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .expect("valid URI")
         .connect()
         .await
-        .map_err(|e| { error!("Failed to connect: {e}"); e })?;
+        .map_err(|e| {
+            error!("Failed to connect: {e}");
+            e
+        })?;
 
     let mut driver = KonfigServiceClient::new(channel.clone());
 
@@ -89,7 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await
     {
         Ok(resp) => resp.into_inner().schema_version,
-        Err(e) => { warn!("Get failed ({e}) — assuming schema_version = 0"); 0 }
+        Err(e) => {
+            warn!("Get failed ({e}) — assuming schema_version = 0");
+            0
+        }
     };
     let start_seq = current_version + 1;
     let end_seq = start_seq + APPLY_COUNT - 1;
@@ -136,14 +142,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     barrier.wait().await;
-    info!("All {} subscribers connected — starting Apply loop", N_SUBSCRIBERS);
+    info!(
+        "All {} subscribers connected — starting Apply loop",
+        N_SUBSCRIBERS
+    );
 
     // ── Apply loop ────────────────────────────────────────────────────────────
 
     for seq in start_seq..=end_seq {
-        let yaml = format!(
-            "schema_version: {seq}\ncontent:\n  iteration: {seq}\n  load_test: true\n"
-        );
+        let yaml =
+            format!("schema_version: {seq}\ncontent:\n  iteration: {seq}\n  load_test: true\n");
         let req = ApplyRequest {
             namespace: args.namespace.clone(),
             name: args.config_name.clone(),
@@ -187,7 +195,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(DRAIN_TIMEOUT_SECS);
     loop {
         let received: u32 = event_counts.lock().await.iter().sum();
-        if received >= total_expected { info!("All {total_expected} events drained"); break; }
+        if received >= total_expected {
+            info!("All {total_expected} events drained");
+            break;
+        }
         if tokio::time::Instant::now() >= drain_deadline {
             warn!(received, total_expected, "Drain timeout");
             break;
@@ -195,7 +206,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tokio::time::sleep(Duration::from_millis(DRAIN_POLL_MS)).await;
     }
 
-    for h in sub_handles { h.abort(); }
+    for h in sub_handles {
+        h.abort();
+    }
 
     // ── Report ────────────────────────────────────────────────────────────────
 
@@ -242,7 +255,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("PASS: zero missed events");
     }
 
-    if !pass { std::process::exit(1); }
+    if !pass {
+        std::process::exit(1);
+    }
     info!("konfig-loadtest PASSED");
     Ok(())
 }
@@ -316,7 +331,9 @@ async fn run_subscriber(
                     }
 
                     // Only measure/count events from our apply loop.
-                    if version < start_seq { continue; }
+                    if version < start_seq {
+                        continue;
+                    }
 
                     // Fix 1: precise latency — look up the exact Apply return time.
                     let idx = (version - start_seq) as usize;
@@ -341,12 +358,18 @@ async fn run_subscriber(
         // Fix 2: reconnect with exponential backoff.
         reconnect_attempt += 1;
         if reconnect_attempt > MAX_RECONNECT_ATTEMPTS {
-            warn!(sub_id, reconnect_attempt, "Max reconnects exceeded — subscriber stopping");
+            warn!(
+                sub_id,
+                reconnect_attempt, "Max reconnects exceeded — subscriber stopping"
+            );
             break;
         }
 
         let delay_ms = (RECONNECT_BASE_MS << reconnect_attempt.min(4)).min(2_000);
-        warn!(sub_id, reconnect_attempt, delay_ms, "Reconnecting after stream error");
+        warn!(
+            sub_id,
+            reconnect_attempt, delay_ms, "Reconnecting after stream error"
+        );
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
         let resume_req = SubscribeRequest {

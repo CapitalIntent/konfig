@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: konfig
+  namespace: konfig-system
+spec:
+  podSelector:
+    matchLabels:
+      app: konfig
+  policyTypes:
+    - Ingress
+    # Egress is not restricted — konfig needs to reach the K8s API server.
+  ingress:
+    # Allow gRPC (port 50051) from any namespace whose pods carry konfig-consumer: "true".
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              konfig-consumer: "true"
+      ports:
+        - protocol: TCP
+          port: 50051
+    # Allow Prometheus scraping (port 9090) from any namespace.
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 9090
