@@ -1,3 +1,6 @@
+# Local overrides (BuildBuddy key, personal flags) — not committed.
+try-import %workspace%/.bazelrc.user
+
 # Disk cache — populated by GHA actions/cache; speeds up incremental CI builds.
 build --disk_cache=~/.cache/bazel-disk-cache
 
