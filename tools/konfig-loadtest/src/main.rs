@@ -23,7 +23,8 @@ use tracing_subscriber::prelude::*;
 
 use konfig::proto::konfig_service_client::KonfigServiceClient;
 use konfig::proto::{
-    ApplyRequest, ApplySecretRequest, GetRequest, SubscribeRequest, SubscribeSecretsRequest,
+    ApplyRequest, ApplySecretRequest, GetRequest, GetSecretRequest, SubscribeRequest,
+    SubscribeSecretsRequest,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -885,20 +886,16 @@ async fn scenario_secrets_flood(addr: &str, namespace: &str, secret_name: &str) 
         }
     };
     let mut driver = KonfigServiceClient::new(ch);
-    // We can't easily get current secret version without get_secret — start at 1
-    // and rely on the server rejecting any lower version (non-fatal).
-    let start_seq: u32 = {
-        // Try to read the secret; if it fails, start at 1.
-        match driver
-            .get_secret(tonic::Request::new(konfig::proto::GetSecretRequest {
-                namespace: namespace.to_owned(),
-                name: secret_name.to_owned(),
-            }))
-            .await
-        {
-            Ok(r) => r.into_inner().schema_version + 1,
-            Err(_) => 1,
-        }
+    // Seed: read current schema_version so applies start above it (mirrors S1 pattern).
+    let start_seq: u32 = match driver
+        .get_secret(tonic::Request::new(GetSecretRequest {
+            namespace: namespace.to_owned(),
+            name: secret_name.to_owned(),
+        }))
+        .await
+    {
+        Ok(r) => r.into_inner().schema_version + 1,
+        Err(_) => 1, // NotFound or any error — start from 1
     };
     let end_seq = start_seq + S4_APPLIES - 1;
 
