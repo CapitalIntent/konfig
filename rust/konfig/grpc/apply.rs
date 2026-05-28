@@ -42,6 +42,20 @@ pub async fn apply_inner(
     let spec: ConfigSpec = serde_yaml::from_str(yaml_content)
         .map_err(|e| Status::invalid_argument(format!("invalid YAML: {e}")))?;
 
+    apply_spec(namespace, name, spec, kube_client).await
+}
+
+/// Apply a parsed `ConfigSpec` to the cluster via server-side apply.
+///
+/// Enforces `schema_version` monotonicity, patches with retry, and increments
+/// the same `APPLY_TOTAL` counters as the public `Apply` RPC path so Revert is
+/// observable as a normal apply.
+pub async fn apply_spec(
+    namespace: &str,
+    name: &str,
+    spec: ConfigSpec,
+    kube_client: Client,
+) -> Result<Response<ApplyResponse>, Status> {
     let incoming = spec.schema_version;
 
     let ar = config_api_resource();
@@ -94,7 +108,14 @@ pub async fn apply_inner(
     }
 }
 
-async fn fetch_current_schema_version(api: &Api<DynamicObject>, name: &str) -> Result<u32, Status> {
+/// Fetch the current schema_version of a Config CRD, or 0 if it does not exist.
+///
+/// Used by both Apply (to enforce monotonicity) and Revert (to compute the
+/// new schema_version when replaying historical content).
+pub(crate) async fn fetch_current_schema_version(
+    api: &Api<DynamicObject>,
+    name: &str,
+) -> Result<u32, Status> {
     match api.get(name).await {
         Ok(obj) => {
             let v = obj

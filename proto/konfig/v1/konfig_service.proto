@@ -39,6 +39,18 @@ message ApplyResponse {
   string resource_version = 1;
 }
 
+message RevertRequest {
+  string namespace = 1;
+  string name = 2;
+  // The resourceVersion of the historical Config to roll back to.
+  string to_resource_version = 3;
+}
+
+message RevertResponse {
+  string resource_version = 1;
+  uint32 schema_version = 2;
+}
+
 message SubscribeRequest {
   string namespace = 1;
   repeated string names = 2;
@@ -109,6 +121,11 @@ service KonfigService {
   rpc GetAll(GetAllRequest) returns (stream Config);
   // Create or update a config (YAML → CRD patch with schema_version check).
   rpc Apply(ApplyRequest) returns (ApplyResponse);
+  // Roll back a Config to a historical resourceVersion.  Looks up the historical
+  // content via a K8s list with resourceVersionMatch=Exact, bumps the
+  // schema_version above the current value to preserve monotonicity, and
+  // re-applies through the standard Apply code path.
+  rpc Revert(RevertRequest) returns (RevertResponse);
   // Live config change stream. Pass resume_resource_version to replay missed
   // events on reconnect. Returns RESOURCE_EXHAUSTED if subscriber falls behind
   // the broadcast ring buffer.
