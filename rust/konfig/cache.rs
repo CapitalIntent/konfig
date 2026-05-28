@@ -1,7 +1,9 @@
 //! Lock-free multi-key config cache backed by [`DashMap`].
 //!
-//! Keyed by `(namespace, name)`.  Phase 2D upgrade from the single-entry
-//! `ArcSwap<ConfigSnapshot>` to support multi-namespace, multi-config deployments.
+//! Keyed by `"namespace\x00name"` (null-byte separator).  Using a flat
+//! `String` key instead of `(String, String)` lets `DashMap::get` /
+//! `DashMap::remove` accept a borrowed `&str` via the `Borrow<str>` impl on
+//! `String` — zero heap allocation per lookup.
 //!
 //! [`DashMap`]: dashmap::DashMap
 
@@ -11,14 +13,62 @@ use dashmap::DashMap;
 
 use crate::types::ConfigSnapshot;
 
+// ── Cache key helper ──────────────────────────────────────────────────────────
+
+/// Build the internal flat key from `(namespace, name)`.
+///
+/// Uses `\x00` as separator.  ConfigMap namespaces and names follow RFC 1123
+/// subdomain / label rules — neither can contain a null byte — so the
+/// separator is unambiguous and no escaping is needed.
+#[inline]
+fn cache_key(namespace: &str, name: &str) -> String {
+    let mut key = String::with_capacity(namespace.len() + 1 + name.len());
+    key.push_str(namespace);
+    key.push('\x00');
+    key.push_str(name);
+    key
+}
+
+/// Build the lookup key as a stack-allocated array so `DashMap::get` /
+/// `DashMap::remove` can borrow a `&str` without a heap allocation.
+///
+/// Returns `(buf, len)` where `&buf[..len]` is the key string.  Callers that
+/// need a longer key than `STACK_CAP` fall back to `cache_key`.
+const STACK_CAP: usize = 256;
+
+struct StackKey {
+    buf: [u8; STACK_CAP],
+    len: usize,
+}
+
+impl StackKey {
+    fn new(namespace: &str, name: &str) -> Option<Self> {
+        let total = namespace.len() + 1 + name.len();
+        if total > STACK_CAP {
+            return None;
+        }
+        let mut buf = [0u8; STACK_CAP];
+        buf[..namespace.len()].copy_from_slice(namespace.as_bytes());
+        buf[namespace.len()] = 0;
+        buf[namespace.len() + 1..total].copy_from_slice(name.as_bytes());
+        Some(Self { buf, len: total })
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        // SAFETY: composed from valid UTF-8 slices + one ASCII byte.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len]) }
+    }
+}
+
 // ── ConfigCache ───────────────────────────────────────────────────────────────
 
 /// Shared, lock-free multi-key cache for [`ConfigSnapshot`].
 ///
-/// Keyed by `(namespace, name)`.  Sharded by DashMap — concurrent reads and
-/// writes do not block across different keys.
+/// Keyed by `"namespace\x00name"`.  Sharded by DashMap — concurrent reads
+/// and writes do not block across different keys.
 pub struct ConfigCache {
-    inner: DashMap<(String, String), Arc<ConfigSnapshot>>,
+    inner: DashMap<String, Arc<ConfigSnapshot>>,
 }
 
 impl ConfigCache {
@@ -31,7 +81,7 @@ impl ConfigCache {
     pub fn new(initial: ConfigSnapshot) -> Self {
         let map = DashMap::new();
         if !initial.namespace.is_empty() && !initial.name.is_empty() {
-            let key = (initial.namespace.clone(), initial.name.clone());
+            let key = cache_key(&initial.namespace, &initial.name);
             map.insert(key, Arc::new(initial));
         }
         Self { inner: map }
@@ -40,29 +90,48 @@ impl ConfigCache {
     /// Look up a snapshot by `(namespace, name)`.
     ///
     /// Returns `None` when no entry has been inserted for this key yet.
+    ///
+    /// Zero heap allocation: uses a stack-allocated key buffer when
+    /// `namespace.len() + 1 + name.len() <= 256`; heap-allocates only for
+    /// unusually long names (rare in practice for K8s resources).
     pub fn get(&self, namespace: &str, name: &str) -> Option<Arc<ConfigSnapshot>> {
-        self.inner
-            .get(&(namespace.to_string(), name.to_string()))
-            .map(|v| Arc::clone(&v))
+        if let Some(k) = StackKey::new(namespace, name) {
+            self.inner.get(k.as_str()).map(|v| Arc::clone(&v))
+        } else {
+            self.inner
+                .get(cache_key(namespace, name).as_str())
+                .map(|v| Arc::clone(&v))
+        }
     }
 
     /// Insert or replace the entry for `snap.namespace` / `snap.name`.
     pub fn update(&self, snap: ConfigSnapshot) {
-        let key = (snap.namespace.clone(), snap.name.clone());
+        let key = cache_key(&snap.namespace, &snap.name);
         self.inner.insert(key, Arc::new(snap));
     }
 
     /// Remove the entry for `(namespace, name)` if present.
+    ///
+    /// Zero heap allocation: same stack-key optimisation as `get`.
     pub fn remove(&self, namespace: &str, name: &str) {
-        self.inner
-            .remove(&(namespace.to_string(), name.to_string()));
+        if let Some(k) = StackKey::new(namespace, name) {
+            self.inner.remove(k.as_str());
+        } else {
+            self.inner.remove(cache_key(namespace, name).as_str());
+        }
     }
 
     /// Return all snapshots whose namespace matches `namespace`.
     pub fn all_in_namespace(&self, namespace: &str) -> Vec<Arc<ConfigSnapshot>> {
         self.inner
             .iter()
-            .filter(|entry| entry.key().0 == namespace)
+            .filter(|entry| {
+                // Key is "namespace\x00name"; split at the first null byte.
+                entry
+                    .key()
+                    .split_once('\x00')
+                    .map_or(false, |(ns, _)| ns == namespace)
+            })
             .map(|entry| Arc::clone(entry.value()))
             .collect()
     }
@@ -79,9 +148,9 @@ impl ConfigCache {
     /// Apply event will insert a snapshot with `stale_since = None`.
     pub fn mark_all_stale(&self) {
         let now = std::time::Instant::now();
-        let keys: Vec<(String, String)> = self.inner.iter().map(|e| e.key().clone()).collect();
+        let keys: Vec<String> = self.inner.iter().map(|e| e.key().clone()).collect();
         for key in keys {
-            if let Some(arc) = self.inner.get(&key) {
+            if let Some(arc) = self.inner.get(key.as_str()) {
                 let mut snap = (**arc).clone();
                 snap.stale_since = Some(now);
                 drop(arc);
@@ -144,7 +213,11 @@ mod tests {
         cache.update(snap("ns-a", "cfg-1", 1));
         cache.update(snap("ns-a", "cfg-2", 2));
         cache.update(snap("ns-b", "cfg-3", 3));
-        assert_eq!(cache.all_in_namespace("ns-a").len(), 2);
+        let mut ns_a = cache.all_in_namespace("ns-a");
+        ns_a.sort_by_key(|s| s.schema_version);
+        assert_eq!(ns_a.len(), 2);
+        assert_eq!(ns_a[0].schema_version, 1);
+        assert_eq!(ns_a[1].schema_version, 2);
         assert_eq!(cache.all_in_namespace("ns-b").len(), 1);
     }
 
