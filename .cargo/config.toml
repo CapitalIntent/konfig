@@ -1,0 +1,7 @@
+[build]
+# Required for tokio-console (console-subscriber) and dial9-tokio-telemetry.
+# force-frame-pointers enables CPU profiling via perf on Linux.
+rustflags = [
+    "--cfg", "tokio_unstable",
+    "-C", "force-frame-pointers=yes",
+]

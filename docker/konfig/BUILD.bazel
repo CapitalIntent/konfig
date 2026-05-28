@@ -1,0 +1,18 @@
+# Multistage Docker build: rust:1.88-slim compiles, distroless/cc-debian12:nonroot packages.
+#
+# Usage:
+#   bazel run //docker/konfig:push                 # build + push linux/arm64 (Docker Desktop default)
+#   bazel run //docker/konfig:push -- linux/amd64  # build + push linux/amd64 (EKS)
+#   bazel run //docker/konfig:load                 # build + load into local Docker daemon
+
+sh_binary(
+    name = "push",
+    srcs = ["push.sh"],
+    data = ["Dockerfile"],
+)
+
+sh_binary(
+    name = "load",
+    srcs = ["load.sh"],
+    data = ["Dockerfile"],
+)

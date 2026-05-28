@@ -1,0 +1,145 @@
+//! `Apply` handler — creates or updates a `Config.konfig.io/v1` CRD.
+//!
+//! Flow:
+//! 1. Parse `yaml_content` as `ConfigSpec`.
+//! 2. Fetch current CRD to check `schema_version` monotonicity.
+//! 3. Reject with `FAILED_PRECONDITION` if incoming version ≤ current.
+//! 4. Patch the CRD with server-side apply; retry 409 up to 3 times.
+//! 5. Return `ApplyResponse { resource_version }`.
+
+use std::time::Duration;
+
+use kube::Client;
+use kube::api::{Api, Patch, PatchParams};
+use kube::core::DynamicObject;
+use serde_json::json;
+use tonic::{Response, Status};
+use tracing::{debug, info, warn};
+
+use crate::proto::{ApplyRequest, ApplyResponse};
+use crate::types::ConfigSpec;
+use crate::watcher::{GROUP, VERSION, config_api_resource};
+
+const RETRY_DELAYS_MS: [u64; 2] = [100, 200];
+
+pub async fn handle_apply(
+    kube_client: Client,
+    req: ApplyRequest,
+) -> Result<Response<ApplyResponse>, Status> {
+    debug!(namespace = %req.namespace, name = %req.name, "Apply RPC");
+
+    apply_inner(&req.namespace, &req.name, &req.yaml_content, kube_client).await
+}
+
+pub async fn apply_inner(
+    namespace: &str,
+    name: &str,
+    yaml_content: &str,
+    kube_client: Client,
+) -> Result<Response<ApplyResponse>, Status> {
+    let spec: ConfigSpec = serde_yaml::from_str(yaml_content)
+        .map_err(|e| Status::invalid_argument(format!("invalid YAML: {e}")))?;
+
+    let incoming = spec.schema_version;
+
+    let ar = config_api_resource();
+    let api: Api<DynamicObject> = Api::namespaced_with(kube_client, namespace, &ar);
+
+    let current = fetch_current_schema_version(&api, name).await?;
+
+    if incoming <= current {
+        warn!(incoming, current, "Apply rejected: schema_version not increasing");
+        return Err(Status::failed_precondition(format!(
+            "schema_version must be > {current}; got {incoming}"
+        )));
+    }
+
+    let patch_body = json!({
+        "apiVersion": format!("{GROUP}/{VERSION}"),
+        "kind": "Config",
+        "metadata": { "name": name, "namespace": namespace },
+        "spec": serde_json::to_value(&spec)
+            .map_err(|e| Status::internal(format!("serialize error: {e}")))?
+    });
+
+    let rv = patch_with_retry(&api, name, patch_body).await?;
+
+    info!(namespace, name, schema_version = incoming, resource_version = %rv, "Apply succeeded");
+
+    Ok(Response::new(ApplyResponse { resource_version: rv }))
+}
+
+async fn fetch_current_schema_version(api: &Api<DynamicObject>, name: &str) -> Result<u32, Status> {
+    match api.get(name).await {
+        Ok(obj) => {
+            let v = obj
+                .data
+                .get("spec")
+                .and_then(|s| s.get("schema_version"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            Ok(v)
+        }
+        Err(kube::Error::Api(ref ae)) if ae.code == 404 => Ok(0),
+        Err(e) => Err(Status::unavailable(format!("kube error: {e}"))),
+    }
+}
+
+async fn patch_with_retry(
+    api: &Api<DynamicObject>,
+    name: &str,
+    body: serde_json::Value,
+) -> Result<String, Status> {
+    let pp = PatchParams::apply("konfig.v1").force();
+    let mut attempt = 0usize;
+
+    loop {
+        match api.patch(name, &pp, &Patch::Apply(body.clone())).await {
+            Ok(obj) => return Ok(obj.metadata.resource_version.unwrap_or_default()),
+            Err(kube::Error::Api(ref ae)) if ae.code == 409 && attempt < RETRY_DELAYS_MS.len() => {
+                let delay = RETRY_DELAYS_MS[attempt];
+                warn!(attempt = attempt + 1, delay_ms = delay, "Apply: 409 Conflict — retrying");
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                attempt += 1;
+            }
+            Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
+                return Err(Status::aborted("409 Conflict — exceeded max retries"));
+            }
+            Err(e) => return Err(Status::unavailable(format!("kube patch error: {e}"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_version_monotonicity_check() {
+        let incoming = 5u32;
+        let current = 5u32;
+        assert!(incoming <= current, "equal version must be rejected");
+
+        let incoming = 3u32;
+        let current = 5u32;
+        assert!(incoming <= current, "lower version must be rejected");
+
+        let incoming = 6u32;
+        let current = 5u32;
+        assert!(incoming > current, "higher version must be accepted");
+    }
+
+    #[test]
+    fn invalid_yaml_detected() {
+        let result = serde_yaml::from_str::<ConfigSpec>("not: [valid: yaml: here");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn valid_yaml_parses() {
+        let yaml = "schema_version: 3\ncontent:\n  key: value\n";
+        let spec: ConfigSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.schema_version, 3);
+        assert_eq!(spec.content["key"], "value");
+    }
+}

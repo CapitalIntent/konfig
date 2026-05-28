@@ -1,0 +1,23 @@
+[package]
+name = "konfig-cli"
+version.workspace = true
+edition.workspace = true
+publish = false
+homepage.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "konfig-cli"
+path = "src/main.rs"
+
+[dependencies]
+base64 = {workspace = true}
+clap = {version = "4", features = ["derive"]}
+k8s-openapi = {version = "0.24", features = ["v1_31"]}
+kube = {version = "0.98", features = ["runtime", "client"]}
+konfig = {path = "../../rust/konfig"}
+serde_json = {workspace = true}
+serde_yaml = "0.9"
+tokio = {workspace = true}
+tracing = {workspace = true}
+tracing-subscriber = {version = "0.3", features = ["env-filter"]}

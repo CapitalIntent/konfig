@@ -1,0 +1,94 @@
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_clippy", "rust_library", "rustfmt_test")
+load("//bazel/rust:defs.bzl", "rust_binary", "rust_test")
+
+# Run build.rs to generate protobuf/tonic bindings into OUT_DIR.
+# The proto file is available in the sandbox at
+#   proto/konfig/v1/konfig_service.proto
+# which matches the relative path "../../proto/konfig/v1/..." used in build.rs
+# when CARGO_MANIFEST_DIR = <execroot>/rust/konfig.
+cargo_build_script(
+    name = "konfig_bs",
+    srcs = ["build.rs"],
+    build_script_env = {
+        "PROTOC": "$(execpath @protobuf//:protoc)",
+    },
+    data = ["//proto/konfig/v1:konfig_service.proto"],
+    tools = ["@protobuf//:protoc"],
+    deps = ["@crates//:tonic-prost-build"],
+)
+
+# Library — all sources except main.rs (binary entry point).
+rust_library(
+    name = "konfig",
+    srcs = glob(
+        ["**/*.rs"],
+        exclude = [
+            "main.rs",
+            "build.rs",
+            "tests/**",
+        ],
+    ),
+    tags = ["konfig", "rust"],
+    visibility = [
+        "//rust/coinbase:__subpackages__",
+        "//rust/kraken:__subpackages__",
+        "//tools:__subpackages__",
+    ],
+    deps = [
+        ":konfig_bs",
+        "@crates//:arc-swap",
+        "@crates//:axum",
+        "@crates//:base64",
+        "@crates//:bytes",
+        "@crates//:clap",
+        "@crates//:dashmap",
+        "@crates//:futures-util",
+        "@crates//:k8s-openapi",
+        "@crates//:kube",
+        "@crates//:prometheus",
+        "@crates//:prost",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:serde_yaml",
+        "@crates//:thiserror",
+        "@crates//:tokio",
+        "@crates//:tokio-stream",
+        "@crates//:tonic",
+        "@crates//:tonic-health",
+        "@crates//:tonic-prost",
+        "@crates//:tracing",
+        "@crates//:tracing-subscriber",
+    ],
+    proc_macro_deps = ["@crates//:async-trait"],
+)
+
+# Server binary — built by docker/konfig:image via //rust/konfig:konfig_bin.
+rust_binary(
+    name = "konfig_bin",
+    srcs = ["main.rs"],
+    tags = ["konfig", "rust"],
+    visibility = ["//docker/konfig:__pkg__"],
+    deps = [":konfig"],
+)
+
+rust_test(
+    name = "test",
+    size = "small",
+    crate = ":konfig",
+    tags = ["konfig", "rust", "unit"],
+)
+
+rustfmt_test(
+    name = "fmt_test",
+    size = "small",
+    tags = ["konfig", "rust", "unit"],
+    targets = [":konfig"],
+)
+
+rust_clippy(
+    name = "clippy_test",
+    testonly = True,
+    tags = ["konfig", "rust", "unit"],
+    deps = [":konfig"],
+)

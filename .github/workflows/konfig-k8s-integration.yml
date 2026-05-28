@@ -1,0 +1,51 @@
+name: Konfig K8s Integration Tests
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/konfig/**'
+      - 'proto/konfig/**'
+      - 'infra/konfig/**'
+      - 'tools/konfig-cli/**'
+      - '.github/workflows/konfig-k8s-integration.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  k8s-integration:
+    name: All integration tests (Testcontainers K3s)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            target
+          key: cargo-konfig-k8s-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-konfig-k8s-
+
+      - name: Run all konfig integration tests
+        run: |
+          cargo test \
+            --features integration \
+            -p konfig \
+            -- --nocapture --test-threads=1
+        env:
+          RUST_LOG: konfig=debug,kube=info
+          TESTCONTAINERS_RYUK_DISABLED: "false"

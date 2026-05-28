@@ -1,0 +1,78 @@
+[package]
+name = "konfig"
+version.workspace = true
+edition.workspace = true
+publish = false
+homepage.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "konfig"
+path = "main.rs"
+
+[lib]
+name = "konfig"
+path = "lib.rs"
+
+[features]
+integration = []
+
+[[test]]
+name = "integration_watcher"
+path = "tests/integration_watcher.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "integration_watch_timing"
+path = "tests/integration_watch_timing.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "integration_grpc"
+path = "tests/integration_grpc.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "cp_integration"
+path = "tests/cp_integration.rs"
+required-features = ["integration"]
+
+[dependencies]
+arc-swap = {workspace = true}
+async-trait = {workspace = true}
+axum = {version = "0.8", default-features = false, features = ["tokio", "http1"]}
+base64 = {workspace = true}
+bytes = {workspace = true}
+clap = {version = "4", features = ["derive", "env"]}
+dashmap = {workspace = true}
+futures-util = "0.3"
+kube = {version = "0.98", features = ["runtime", "client"]}
+k8s-openapi = {version = "0.24", features = ["v1_31"]}
+prometheus = {version = "0.14", default-features = false}
+prost = {workspace = true}
+tonic-prost = {workspace = true}
+serde = {workspace = true}
+serde_json = {workspace = true}
+serde_yaml = "0.9"
+tokio = {workspace = true, features = ["full"]}
+tokio-stream = "0.1"
+tonic = {workspace = true}
+tonic-health = "0.14.6"
+tracing = {workspace = true}
+tracing-subscriber = {version = "0.3", features = ["env-filter"]}
+thiserror = {workspace = true}
+
+[build-dependencies]
+tonic-prost-build = {workspace = true}
+
+[dev-dependencies]
+tokio = {workspace = true}
+kube = {version = "0.98", features = ["runtime", "client"]}
+k8s-openapi = {version = "0.24", features = ["v1_31"]}
+testcontainers = "0.23"
+testcontainers-modules = {version = "0.11", features = ["k3s"]}
+rustls = {version = "0.23", default-features = false}
+
+[lints.clippy]
+std_instead_of_core = "allow"
+std_instead_of_alloc = "allow"

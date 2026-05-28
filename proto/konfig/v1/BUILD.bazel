@@ -1,0 +1,9 @@
+load("@protobuf//bazel:proto_library.bzl", "proto_library")
+
+exports_files(["konfig_service.proto"])
+
+proto_library(
+    name = "konfig_service_proto",
+    srcs = ["konfig_service.proto"],
+    visibility = ["//rust/konfig:__pkg__"],
+)

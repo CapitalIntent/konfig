@@ -1,0 +1,36 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy", "rustfmt_test")
+
+# Use @rules_rust//rust:defs.bzl directly (not //bazel/rust:defs.bzl) —
+# the custom macro adds //rust/util/malloc which isn't visible to //tools.
+rust_binary(
+    name = "konfig_cli",
+    srcs = glob(["src/**/*.rs"]),
+    tags = ["konfig", "cli", "rust"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//rust/konfig",
+        "@crates//:base64",
+        "@crates//:clap",
+        "@crates//:k8s-openapi",
+        "@crates//:kube",
+        "@crates//:serde_json",
+        "@crates//:serde_yaml",
+        "@crates//:tokio",
+        "@crates//:tracing",
+        "@crates//:tracing-subscriber",
+    ],
+)
+
+rustfmt_test(
+    name = "fmt_test",
+    size = "small",
+    tags = ["konfig", "cli", "rust", "unit"],
+    targets = [":konfig_cli"],
+)
+
+rust_clippy(
+    name = "clippy_test",
+    testonly = True,
+    tags = ["konfig", "cli", "rust", "unit"],
+    deps = [":konfig_cli"],
+)

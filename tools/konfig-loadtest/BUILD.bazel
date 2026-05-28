@@ -1,0 +1,31 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy", "rustfmt_test")
+
+rust_binary(
+    name = "konfig_loadtest",
+    srcs = ["src/main.rs"],
+    tags = ["konfig", "loadtest", "rust"],
+    visibility = ["//docker/konfig-loadtest:__pkg__"],
+    deps = [
+        "//rust/konfig",
+        "@crates//:clap",
+        "@crates//:futures-util",
+        "@crates//:tokio",
+        "@crates//:tonic",
+        "@crates//:tracing",
+        "@crates//:tracing-subscriber",
+    ],
+)
+
+rustfmt_test(
+    name = "fmt_test",
+    size = "small",
+    tags = ["konfig", "loadtest", "rust", "unit"],
+    targets = [":konfig_loadtest"],
+)
+
+rust_clippy(
+    name = "clippy_test",
+    testonly = True,
+    tags = ["konfig", "loadtest", "rust", "unit"],
+    deps = [":konfig_loadtest"],
+)
