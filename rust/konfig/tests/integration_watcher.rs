@@ -11,6 +11,7 @@ use serde_json::json;
 use tokio::time::timeout;
 
 use konfig::cache::ConfigCache;
+use konfig::metrics::LastEventAt;
 use konfig::types::ConfigSnapshot;
 use konfig::watcher::Watcher;
 
@@ -29,9 +30,15 @@ async fn watcher_applies_config_to_cache() {
     let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
     let watcher_cache = Arc::clone(&cache);
     let watcher_client = client.clone();
+    let last_event_at = Arc::new(LastEventAt::new());
     tokio::spawn(async move {
         Watcher::new(watcher_client)
-            .run(watcher_cache, NAMESPACE.to_string(), CFG_APPLY.to_string())
+            .run(
+                watcher_cache,
+                NAMESPACE.to_string(),
+                CFG_APPLY.to_string(),
+                last_event_at,
+            )
             .await
             .expect("watcher error");
     });
@@ -82,9 +89,15 @@ async fn watcher_retains_cache_on_config_delete() {
     let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
     let watcher_cache = Arc::clone(&cache);
     let watcher_client = client.clone();
+    let last_event_at = Arc::new(LastEventAt::new());
     let watcher = tokio::spawn(async move {
         Watcher::new(watcher_client)
-            .run(watcher_cache, NAMESPACE.to_string(), CFG_DELETE.to_string())
+            .run(
+                watcher_cache,
+                NAMESPACE.to_string(),
+                CFG_DELETE.to_string(),
+                last_event_at,
+            )
             .await
             .expect("watcher error");
     });

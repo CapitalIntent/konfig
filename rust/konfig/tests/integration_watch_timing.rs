@@ -14,6 +14,7 @@ use serde_json::json;
 use tokio::time::timeout;
 
 use konfig::cache::ConfigCache;
+use konfig::metrics::LastEventAt;
 use konfig::types::ConfigSnapshot;
 use konfig::watcher::Watcher;
 
@@ -32,9 +33,15 @@ async fn watch_stream_update_propagates_within_500ms() {
     let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
     let watcher_cache = Arc::clone(&cache);
     let watcher_client = client.clone();
+    let last_event_at = Arc::new(LastEventAt::new());
     let watcher = tokio::spawn(async move {
         Watcher::new(watcher_client)
-            .run(watcher_cache, NAMESPACE.to_string(), CFG_TIMING.to_string())
+            .run(
+                watcher_cache,
+                NAMESPACE.to_string(),
+                CFG_TIMING.to_string(),
+                last_event_at,
+            )
             .await
             .expect("watcher error");
     });

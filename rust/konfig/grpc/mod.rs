@@ -24,7 +24,7 @@ use tracing::info;
 
 use crate::cache::ConfigCache;
 use crate::grpc::subscribe::{ReplayBuffer, gc_task};
-use crate::metrics::REPLAY_BUFFER_DEPTH;
+use crate::metrics::{LastEventAtMap, REPLAY_BUFFER_DEPTH, STALE_SECONDS};
 use crate::proto::{
     ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, Config, ConfigEvent,
     GetAllRequest, GetAllSecretsRequest, GetRequest, GetSecretRequest, SecretEvent, SecretResponse,
@@ -49,6 +49,10 @@ pub struct ServerConfig {
     /// Populated by `SecretWatcher::spawn_all` before `serve` is called so
     /// that `SubscribeSecrets` subscribers can attach at server startup.
     pub secret_namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>>,
+    /// Per-namespace freshness tracker.  Watchers touch the entry for their
+    /// namespace on every event; the background sampler in `serve` reads it
+    /// every 5 s and updates the `konfig_stale_seconds` gauge.
+    pub last_event_at_map: LastEventAtMap,
 }
 
 // ── KonfigServer ──────────────────────────────────────────────────────────────
@@ -177,10 +181,12 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         Arc::clone(&idle_since),
     ));
 
-    // Spawn background metric sampler — samples replay buffer depth every 5 s.
-    // Runs off the hot path to avoid lock contention during event delivery.
+    // Spawn background metric sampler — samples replay buffer depth and
+    // watcher freshness every 5 s.  Runs off the hot path to avoid lock
+    // contention during event delivery.
     {
         let replay_buffers_for_sampler = Arc::clone(&namespace_replay_buffers);
+        let last_event_at_for_sampler = Arc::clone(&cfg.last_event_at_map);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
@@ -190,6 +196,12 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
                     REPLAY_BUFFER_DEPTH
                         .with_label_values(&[entry.key()])
                         .set(depth as f64);
+                }
+                // konfig_stale_seconds: seconds since last event per namespace.
+                // None = cold start (no event received yet) → publish 0 (fresh).
+                for entry in last_event_at_for_sampler.iter() {
+                    let secs = entry.value().elapsed_secs().unwrap_or(0.0);
+                    STALE_SECONDS.with_label_values(&[entry.key()]).set(secs);
                 }
             }
         });

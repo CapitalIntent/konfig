@@ -22,6 +22,7 @@ use tracing::info;
 
 use konfig::cache::ConfigCache;
 use konfig::grpc::{ServerConfig, serve};
+use konfig::metrics::{LastEventAtMap, last_event_at_for};
 use konfig::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
 use konfig::secret_cache::SecretCache;
 use konfig::secret_watcher::SecretWatcher;
@@ -74,14 +75,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
     let secret_cache = Arc::new(SecretCache::new());
 
+    // Per-namespace freshness map shared by all watchers and the konfig_stale_seconds sampler.
+    let last_event_at_map: LastEventAtMap = Arc::new(DashMap::new());
+
     // Spawn Config CRD watcher.
     let watcher_cache = Arc::clone(&cache);
     let watcher_client = kube_client.clone();
     let namespace = args.namespace.clone();
     let name = args.name.clone();
+    let watcher_last_event_at = last_event_at_for(&last_event_at_map, &namespace);
     tokio::spawn(async move {
         Watcher::new(watcher_client)
-            .run(watcher_cache, namespace, name)
+            .run(watcher_cache, namespace, name, watcher_last_event_at)
             .await
             .expect("watcher exited with error");
     });
@@ -102,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&secret_cache),
             secret_namespaces,
             Arc::clone(&secret_namespace_broadcasts),
+            Arc::clone(&last_event_at_map),
         );
     }
 
@@ -144,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kube_client,
         health_reporter: Some(health_reporter),
         secret_namespace_broadcasts,
+        last_event_at_map,
     })
     .await?;
 

@@ -15,7 +15,7 @@ curl -s localhost:9090/metrics | grep konfig_
 
 | Metric | Alert threshold | Description |
 |--------|----------------|-------------|
-| `konfig_stale_seconds` | > 300 s | Watcher disconnected from K8s API server |
+| `konfig_stale_seconds{namespace}` | > 300 s | Seconds since the watcher last received an event from the K8s API server. `0` means fresh; cold start (before the first event) also reports `0`. Sampled every 5 s. |
 
 ## Pod not ready (UNAVAILABLE)
 

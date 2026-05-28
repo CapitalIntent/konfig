@@ -109,7 +109,9 @@ service KonfigService {
   rpc GetAll(GetAllRequest) returns (stream Config);
   // Create or update a config (YAML → CRD patch with schema_version check).
   rpc Apply(ApplyRequest) returns (ApplyResponse);
-  // Subscribe to live config change events (Phase 2B — returns Unimplemented for now).
+  // Live config change stream. Pass resume_resource_version to replay missed
+  // events on reconnect. Returns RESOURCE_EXHAUSTED if subscriber falls behind
+  // the broadcast ring buffer.
   rpc Subscribe(SubscribeRequest) returns (stream ConfigEvent);
   // Get a single secret by namespace and name.
   rpc GetSecret(GetSecretRequest) returns (SecretResponse);
@@ -117,6 +119,7 @@ service KonfigService {
   rpc GetAllSecrets(GetAllSecretsRequest) returns (stream SecretResponse);
   // Create or update a managed secret (YAML key→plaintext, server base64-encodes).
   rpc ApplySecret(ApplySecretRequest) returns (ApplySecretResponse);
-  // Subscribe to secret change events (returns Unimplemented for now).
+  // Live secret change stream for a managed namespace. Same semantics as
+  // Subscribe.
   rpc SubscribeSecrets(SubscribeSecretsRequest) returns (stream SecretEvent);
 }

@@ -18,6 +18,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::grpc::secret_get::secret_snapshot_to_proto;
+use crate::metrics::{LastEventAt, LastEventAtMap, last_event_at_for};
 use crate::proto::{SecretEvent, secret_event::EventType};
 use crate::secret_cache::SecretCache;
 use crate::types::SecretSnapshot;
@@ -42,19 +43,28 @@ impl SecretWatcher {
     /// For each namespace a `broadcast::Sender<SecretEvent>` is inserted into
     /// `broadcasts` before the task starts, so `SubscribeSecrets` callers can
     /// subscribe immediately at server startup.
+    ///
+    /// Each namespace also gets a `LastEventAt` entry inserted into
+    /// `last_event_at_map` — touched on every event so the
+    /// `konfig_stale_seconds` sampler in `grpc::serve` can observe per-namespace
+    /// freshness.
     pub fn spawn_all(
         self,
         cache: Arc<SecretCache>,
         namespaces: Vec<String>,
         broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>>,
+        last_event_at_map: LastEventAtMap,
     ) {
         for namespace in namespaces {
             let client = self.client.clone();
             let cache = Arc::clone(&cache);
             let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
             broadcasts.insert(namespace.clone(), tx.clone());
+            let last_event_at = last_event_at_for(&last_event_at_map, &namespace);
             tokio::spawn(async move {
-                if let Err(e) = run_namespace_watcher(client, cache, namespace.clone(), tx).await {
+                if let Err(e) =
+                    run_namespace_watcher(client, cache, namespace.clone(), tx, last_event_at).await
+                {
                     warn!(namespace = %namespace, "Secret watcher error: {e}");
                 }
             });
@@ -67,6 +77,7 @@ async fn run_namespace_watcher(
     cache: Arc<SecretCache>,
     namespace: String,
     broadcast_tx: broadcast::Sender<SecretEvent>,
+    last_event_at: Arc<LastEventAt>,
 ) -> Result<(), kube_watcher::Error> {
     let api: Api<Secret> = Api::namespaced(client, &namespace);
     let wc = kube_watcher::Config::default().labels(&format!("{MANAGED_LABEL}=true"));
@@ -75,6 +86,9 @@ async fn run_namespace_watcher(
     info!(namespace = %namespace, "Secret watcher started");
 
     while let Some(event) = stream.try_next().await? {
+        // Touch freshness on every event — including Init/InitDone — so the
+        // konfig_stale_seconds gauge reflects "still connected to the API".
+        last_event_at.touch();
         match event {
             Event::Apply(secret) | Event::InitApply(secret) => {
                 if let Some(snap) = parse_secret(&secret, &namespace) {

@@ -15,8 +15,11 @@ use serde_json::json;
 use tokio::time::timeout;
 use tonic::Request;
 
+use dashmap::DashMap;
+
 use konfig::cache::ConfigCache;
 use konfig::grpc::{ServerConfig, serve};
+use konfig::metrics::{LastEventAt, LastEventAtMap};
 use konfig::proto::konfig_service_client::KonfigServiceClient;
 use konfig::proto::{ApplyRequest, GetAllRequest, GetRequest};
 use konfig::types::ConfigSnapshot;
@@ -43,6 +46,8 @@ async fn start_server(cache: Arc<ConfigCache>, kube_client: kube::Client) -> u16
         secret_cache: Arc::new(konfig::secret_cache::SecretCache::new()),
         kube_client,
         health_reporter: None,
+        secret_namespace_broadcasts: Arc::new(DashMap::new()),
+        last_event_at_map: Arc::new(DashMap::new()) as LastEventAtMap,
     };
 
     tokio::spawn(async move {
@@ -73,12 +78,14 @@ async fn grpc_get_returns_config() {
     let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
     let watcher_cache = Arc::clone(&cache);
     let watcher_client = client.clone();
+    let last_event_at = Arc::new(LastEventAt::new());
     let watcher_handle = tokio::spawn(async move {
         Watcher::new(watcher_client)
             .run(
                 watcher_cache,
                 NAMESPACE.to_string(),
                 CFG_GRPC_GET.to_string(),
+                last_event_at,
             )
             .await
             .expect("watcher error");
@@ -153,9 +160,15 @@ async fn grpc_get_all_streams_one_entry() {
     let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
     let watcher_cache = Arc::clone(&cache);
     let watcher_client = client.clone();
+    let last_event_at = Arc::new(LastEventAt::new());
     let watcher_handle = tokio::spawn(async move {
         Watcher::new(watcher_client)
-            .run(watcher_cache, NAMESPACE.to_string(), CFG.to_string())
+            .run(
+                watcher_cache,
+                NAMESPACE.to_string(),
+                CFG.to_string(),
+                last_event_at,
+            )
             .await
             .expect("watcher error");
     });
@@ -211,12 +224,14 @@ async fn grpc_apply_writes_config_and_get_reflects_it() {
     let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
     let watcher_cache = Arc::clone(&cache);
     let watcher_client = client.clone();
+    let last_event_at = Arc::new(LastEventAt::new());
     let watcher_handle = tokio::spawn(async move {
         Watcher::new(watcher_client)
             .run(
                 watcher_cache,
                 NAMESPACE.to_string(),
                 CFG_GRPC_APPLY.to_string(),
+                last_event_at,
             )
             .await
             .expect("watcher error");

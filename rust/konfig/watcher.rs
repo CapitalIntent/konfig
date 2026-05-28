@@ -14,6 +14,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::cache::ConfigCache;
+use crate::metrics::LastEventAt;
 use crate::types::{ConfigSnapshot, ConfigSpec};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -72,11 +73,17 @@ impl Watcher {
     ///
     /// On stream error: marks cache stale, waits `backoff_delay(attempt)`, retries.
     /// On clean stream end: returns Ok(()).
+    ///
+    /// `last_event_at` is touched on every successfully-received event so the
+    /// `konfig_stale_seconds` gauge sampler in `grpc::serve` can observe the
+    /// freshness of this watcher.  Cold start (no event yet) leaves it `None`,
+    /// which the sampler interprets as "fresh" (gauge stays at 0).
     pub async fn run(
         self,
         cache: Arc<ConfigCache>,
         namespace: String,
         config_name: String,
+        last_event_at: Arc<LastEventAt>,
     ) -> Result<(), WatcherError> {
         let ar = config_api_resource();
         let mut attempt: usize = 0;
@@ -98,6 +105,9 @@ impl Watcher {
             loop {
                 match stream.try_next().await {
                     Ok(Some(event)) => {
+                        // Touch BEFORE handle_event so the freshness signal is
+                        // updated even for events that fail to parse downstream.
+                        last_event_at.touch();
                         handle_event(event, &cache);
                         attempt = 0;
                     }
