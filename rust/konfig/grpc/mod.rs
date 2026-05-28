@@ -20,6 +20,7 @@
 
 pub mod apply;
 pub mod get;
+pub mod revert;
 pub mod secret_apply;
 pub mod secret_get;
 pub mod subscribe;
@@ -44,8 +45,8 @@ use crate::grpc::subscribe::{BroadcastFrame, ReplayBuffer, gc_task};
 use crate::metrics::{LastEventAtMap, REPLAY_BUFFER_DEPTH, STALE_SECONDS};
 use crate::proto::{
     ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, Config, ConfigEvent,
-    GetAllRequest, GetAllSecretsRequest, GetRequest, GetSecretRequest, SecretEvent, SecretResponse,
-    SubscribeRequest, SubscribeSecretsRequest,
+    GetAllRequest, GetAllSecretsRequest, GetRequest, GetSecretRequest, RevertRequest,
+    RevertResponse, SecretEvent, SecretResponse, SubscribeRequest, SubscribeSecretsRequest,
     konfig_service_server::{KonfigService, KonfigServiceServer},
 };
 use crate::secret_cache::SecretCache;
@@ -179,6 +180,13 @@ impl KonfigService for KonfigServer {
     ) -> Result<Response<ApplyResponse>, Status> {
         check_drain(&self.draining)?;
         apply::handle_apply(self.kube_client.clone(), request.into_inner()).await
+    }
+
+    async fn revert(
+        &self,
+        request: Request<RevertRequest>,
+    ) -> Result<Response<RevertResponse>, Status> {
+        revert::handle_revert(self.kube_client.clone(), request.into_inner()).await
     }
 
     type SubscribeStream = ReceiverStream<Result<ConfigEvent, Status>>;

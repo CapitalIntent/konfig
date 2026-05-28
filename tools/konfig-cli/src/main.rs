@@ -7,6 +7,7 @@
 //!
 //! - `apply <namespace> <name> <yaml-file>` — create/update a Config CRD
 //! - `get <namespace> <name>` — print a Config CRD spec as YAML
+//! - `revert <namespace> <name> <resource-version>` — roll back to a historical RV
 //! - `import configmap <namespace> <name> [--target <name>]` — import an existing ConfigMap
 //! - `get-secret <namespace> <name> [--reveal]` — print secret keys (values redacted)
 //! - `apply-secret <namespace> <name> <yaml-file>` — patch a managed Secret
@@ -38,6 +39,18 @@ enum Commands {
     },
     /// Print a Config CRD spec as YAML.
     Get { namespace: String, name: String },
+    /// Roll back a Config to a historical resourceVersion.
+    ///
+    /// Looks up the historical content directly via the K8s API (server-side,
+    /// resourceVersionMatch=Exact), bumps the schema_version above the current
+    /// value to preserve monotonicity, and patches the CRD with the historical
+    /// content under the new version.
+    Revert {
+        namespace: String,
+        name: String,
+        /// The historical resourceVersion to roll back to.
+        resource_version: String,
+    },
     /// Onboard existing K8s objects as Config CRDs.
     Import {
         #[command(subcommand)]
@@ -98,6 +111,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Get { namespace, name } => {
             cmd_get(client, &namespace, &name).await?;
         }
+        Commands::Revert {
+            namespace,
+            name,
+            resource_version,
+        } => {
+            cmd_revert(client, &namespace, &name, &resource_version).await?;
+        }
         Commands::Import {
             source:
                 ImportSource::Configmap {
@@ -142,6 +162,31 @@ async fn cmd_apply(
         .map_err(|s| format!("Apply failed: {s}"))?;
     let rv = result.into_inner().resource_version;
     println!("Applied {namespace}/{name} (resource_version: {rv})");
+    Ok(())
+}
+
+async fn cmd_revert(
+    client: Client,
+    namespace: &str,
+    name: &str,
+    resource_version: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use konfig::proto::RevertRequest;
+
+    let req = RevertRequest {
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        to_resource_version: resource_version.to_string(),
+    };
+    let result = konfig::grpc::revert::handle_revert(client, req)
+        .await
+        .map_err(|s| format!("Revert failed: {s}"))?;
+    let resp = result.into_inner();
+    println!(
+        "Reverted {namespace}/{name} to resource_version={resource_version} \
+         (new schema_version: {}, new resource_version: {})",
+        resp.schema_version, resp.resource_version
+    );
     Ok(())
 }
 

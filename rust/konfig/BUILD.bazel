@@ -115,14 +115,18 @@ rust_test(
         "@konfig_crates//:kube",
         "@konfig_crates//:rustls",
         "@konfig_crates//:serde_json",
+        "@konfig_crates//:serde_yaml",
         "@konfig_crates//:testcontainers",
         "@konfig_crates//:testcontainers-modules",
         "@konfig_crates//:tokio",
+        "@konfig_crates//:tokio-stream",
+        "@konfig_crates//:tonic",
     ],
 ) for name in [
     "integration_watcher",
     "integration_watch_timing",
     "integration_grpc",
+    "integration_revert",
     "cp_integration",
 ]]
 
