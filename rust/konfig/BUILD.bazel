@@ -89,6 +89,44 @@ rust_test(
     tags = ["konfig", "rust", "unit"],
 )
 
+# Integration tests — each requires K3s via Testcontainers (needs Docker daemon).
+# Run with: bazel test //rust/konfig:integration_watcher_test --test_output=streamed
+# Or all at once: bazel test //rust/konfig:all --test_tag_filters=integration
+[rust_test(
+    name = "%s_test" % name,
+    size = "large",
+    srcs = [
+        "tests/%s.rs" % name,
+        "tests/common/mod.rs",
+    ],
+    crate = ":konfig",
+    crate_features = ["integration"],
+    env = {
+        "RUST_LOG": "konfig=debug,kube=info",
+        "TESTCONTAINERS_RYUK_DISABLED": "false",
+    },
+    tags = [
+        "integration",
+        "konfig",
+        "local",
+        "rust",
+    ],
+    deps = [
+        "@konfig_crates//:k8s-openapi",
+        "@konfig_crates//:kube",
+        "@konfig_crates//:rustls",
+        "@konfig_crates//:serde_json",
+        "@konfig_crates//:testcontainers",
+        "@konfig_crates//:testcontainers-modules",
+        "@konfig_crates//:tokio",
+    ],
+) for name in [
+    "integration_watcher",
+    "integration_watch_timing",
+    "integration_grpc",
+    "cp_integration",
+]]
+
 rustfmt_test(
     name = "fmt_test",
     size = "small",

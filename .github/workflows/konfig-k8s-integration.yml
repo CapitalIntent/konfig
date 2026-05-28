@@ -1,6 +1,6 @@
 name: Konfig K8s Integration Tests
 on:
-  pull_request:
+  push:
     branches: [main]
     paths:
       - 'rust/konfig/**'
@@ -10,7 +10,7 @@ on:
       - '.github/workflows/konfig-k8s-integration.yml'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -19,33 +19,34 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: bazelbuild/setup-bazelisk@v3
 
       - name: Install protoc
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q protobuf-compiler
 
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git
-            target
-          key: cargo-konfig-k8s-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-konfig-k8s-
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
 
       - name: Run all konfig integration tests
         run: |
-          cargo test \
-            --features integration \
-            -p konfig \
-            -- --nocapture --test-threads=1
-        env:
-          RUST_LOG: konfig=debug,kube=info
-          TESTCONTAINERS_RYUK_DISABLED: "false"
+          bazel test //rust/konfig:all \
+            --test_tag_filters=integration \
+            --test_output=streamed \
+            --test_env=RUST_LOG=konfig=debug,kube=info \
+            --test_env=TESTCONTAINERS_RYUK_DISABLED=false
