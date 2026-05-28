@@ -8,6 +8,7 @@ pub mod get;
 pub mod secret_apply;
 pub mod secret_get;
 pub mod subscribe;
+pub mod subscribe_secrets;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use crate::cache::ConfigCache;
 use crate::grpc::subscribe::ReplayBuffer;
 use crate::proto::{
     ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, Config, ConfigEvent,
-    GetAllRequest, GetAllSecretsRequest, GetRequest, GetSecretRequest, SecretResponse,
+    GetAllRequest, GetAllSecretsRequest, GetRequest, GetSecretRequest, SecretEvent, SecretResponse,
     SubscribeRequest, SubscribeSecretsRequest,
     konfig_service_server::{KonfigService, KonfigServiceServer},
 };
@@ -58,6 +59,10 @@ pub struct KonfigServer {
     /// path.  Holds the last `REPLAY_BUFFER_SIZE` events so reconnecting clients
     /// can catch up without opening a new kube watch.
     pub(crate) namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
+    /// Separate broadcast map for secret events — keyed by namespace.
+    /// Intentionally distinct from `namespace_broadcasts` so Config and Secret
+    /// streams do not interfere.
+    pub(crate) secret_namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>>,
 }
 
 #[tonic::async_trait]
@@ -124,15 +129,18 @@ impl KonfigService for KonfigServer {
         secret_apply::handle_apply_secret(self.kube_client.clone(), request.into_inner()).await
     }
 
-    type SubscribeSecretsStream = ReceiverStream<Result<crate::proto::SecretEvent, Status>>;
+    type SubscribeSecretsStream = ReceiverStream<Result<SecretEvent, Status>>;
 
     async fn subscribe_secrets(
         &self,
-        _request: Request<SubscribeSecretsRequest>,
+        request: Request<SubscribeSecretsRequest>,
     ) -> Result<Response<Self::SubscribeSecretsStream>, Status> {
-        Err(Status::unimplemented(
-            "SubscribeSecrets not yet implemented",
-        ))
+        subscribe_secrets::handle_subscribe_secrets(
+            self.kube_client.clone(),
+            Arc::clone(&self.secret_namespace_broadcasts),
+            request.into_inner(),
+        )
+        .await
     }
 }
 
@@ -147,6 +155,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         kube_client: cfg.kube_client,
         namespace_broadcasts: Arc::new(DashMap::new()),
         namespace_replay_buffers: Arc::new(DashMap::new()),
+        secret_namespace_broadcasts: Arc::new(DashMap::new()),
     };
     let svc = KonfigServiceServer::new(server);
 
