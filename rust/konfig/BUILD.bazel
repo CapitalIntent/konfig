@@ -69,6 +69,7 @@ rust_binary(
         ":konfig",
         "@konfig_crates//:axum",
         "@konfig_crates//:clap",
+        "@konfig_crates//:dashmap",
         "@konfig_crates//:kube",
         "@konfig_crates//:prometheus",
         "@konfig_crates//:tokio",
