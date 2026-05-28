@@ -31,15 +31,22 @@ bazel_dep(name = "platforms", version = "0.0.11")
 bazel_dep(name = "bazel_skylib", version = "1.8.1")
 bazel_dep(name = "aspect_bazel_lib", version = "2.14.0")
 
-# NOTE: archive_override is root-module-only.
-# When konfig is used as a dep, the root workspace provides this override.
-# For standalone development, add to your .bazelrc or MODULE.bazel:
-#   archive_override(
-#       module_name = "rules_rust",
-#       integrity = "sha256-M0pWfqFlvnFwxMqJ2t56Yu7HveOtEZhup5qxHQTh2ig=",
-#       strip_prefix = "rules_rust-19beae81b7b97b2bf4135f9f2f1a6f63477adde2",
-#       urls = ["https://github.com/bazelbuild/rules_rust/archive/19beae81b7b97b2bf4135f9f2f1a6f63477adde2.tar.gz"],
-#   )
+# archive_override applies when konfig is the root module (standalone CI/dev).
+# When konfig is used as a dep, the root workspace's override takes precedence
+# and this one is silently ignored per bzlmod semantics.
+archive_override(
+    module_name = "rules_rust",
+    integrity = "sha256-M0pWfqFlvnFwxMqJ2t56Yu7HveOtEZhup5qxHQTh2ig=",
+    strip_prefix = "rules_rust-19beae81b7b97b2bf4135f9f2f1a6f63477adde2",
+    urls = ["https://github.com/bazelbuild/rules_rust/archive/19beae81b7b97b2bf4135f9f2f1a6f63477adde2.tar.gz"],
+)
+
+archive_override(
+    module_name = "toolchains_llvm",
+    integrity = "sha256-rnk2El123pJdGmd3czxchUP2DOVe7caJtfeTqzKhgkM=",
+    strip_prefix = "toolchains_llvm-3aad06c2d166cd89a09236694ecd9bf0f1c1b37d",
+    urls = ["https://github.com/bazel-contrib/toolchains_llvm/archive/3aad06c2d166cd89a09236694ecd9bf0f1c1b37d.tar.gz"],
+)
 
 ##################################
 # Rust toolchain (dev only — root workspace provides when used as dep)
