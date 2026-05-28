@@ -31,7 +31,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Create or update a Config CRD from a YAML file.
-    Apply { namespace: String, name: String, yaml_file: PathBuf },
+    Apply {
+        namespace: String,
+        name: String,
+        yaml_file: PathBuf,
+    },
     /// Print a Config CRD spec as YAML.
     Get { namespace: String, name: String },
     /// Onboard existing K8s objects as Config CRDs.
@@ -51,7 +55,11 @@ enum Commands {
     ///
     /// The YAML file must contain a `schema_version` key plus data keys.
     /// Values are base64-encoded before patching.
-    ApplySecret { namespace: String, name: String, yaml_file: PathBuf },
+    ApplySecret {
+        namespace: String,
+        name: String,
+        yaml_file: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -80,20 +88,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::try_default().await?;
 
     match cli.command {
-        Commands::Apply { namespace, name, yaml_file } => {
+        Commands::Apply {
+            namespace,
+            name,
+            yaml_file,
+        } => {
             cmd_apply(client, &namespace, &name, &yaml_file).await?;
         }
         Commands::Get { namespace, name } => {
             cmd_get(client, &namespace, &name).await?;
         }
-        Commands::Import { source: ImportSource::Configmap { namespace, name, target } } => {
+        Commands::Import {
+            source:
+                ImportSource::Configmap {
+                    namespace,
+                    name,
+                    target,
+                },
+        } => {
             let target_name = target.as_deref().unwrap_or(&name);
             cmd_import_configmap(client, &namespace, &name, target_name).await?;
         }
-        Commands::GetSecret { namespace, name, reveal } => {
+        Commands::GetSecret {
+            namespace,
+            name,
+            reveal,
+        } => {
             cmd_get_secret(client, &namespace, &name, reveal).await?;
         }
-        Commands::ApplySecret { namespace, name, yaml_file } => {
+        Commands::ApplySecret {
+            namespace,
+            name,
+            yaml_file,
+        } => {
             let yaml_content = std::fs::read_to_string(&yaml_file)
                 .map_err(|e| format!("cannot read {}: {e}", yaml_file.display()))?;
             cmd_apply_secret(client, &namespace, &name, &yaml_content).await?;
@@ -132,7 +159,11 @@ async fn cmd_get(
 
     match api.get(name).await {
         Ok(obj) => {
-            let spec = obj.data.get("spec").cloned().unwrap_or(serde_json::Value::Null);
+            let spec = obj
+                .data
+                .get("spec")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             let yaml = serde_yaml::to_string(&spec)?;
             println!("{yaml}");
         }
@@ -168,7 +199,10 @@ async fn cmd_get_secret(
     reveal: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let secrets: Api<Secret> = Api::namespaced(client, namespace);
-    let secret = secrets.get(name).await.map_err(|e| format!("kube get error: {e}"))?;
+    let secret = secrets
+        .get(name)
+        .await
+        .map_err(|e| format!("kube get error: {e}"))?;
 
     let schema_version: u32 = secret
         .metadata
@@ -209,8 +243,10 @@ async fn cmd_apply_secret(
     let plaintext_map: BTreeMap<String, String> =
         serde_yaml::from_str(yaml_content).map_err(|e| format!("invalid YAML: {e}"))?;
 
-    let incoming_version: u32 =
-        plaintext_map.get("schema_version").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let incoming_version: u32 = plaintext_map
+        .get("schema_version")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     // Check monotonicity.
     let secrets: Api<Secret> = Api::namespaced(client, namespace);
@@ -253,12 +289,19 @@ async fn cmd_apply_secret(
             }),
             annotations: Some({
                 let mut a = BTreeMap::new();
-                a.insert("konfig.io/schema-version".to_string(), incoming_version.to_string());
+                a.insert(
+                    "konfig.io/schema-version".to_string(),
+                    incoming_version.to_string(),
+                );
                 a
             }),
             ..Default::default()
         },
-        data: if encoded_data.is_empty() { None } else { Some(encoded_data) },
+        data: if encoded_data.is_empty() {
+            None
+        } else {
+            Some(encoded_data)
+        },
         ..Default::default()
     };
 
