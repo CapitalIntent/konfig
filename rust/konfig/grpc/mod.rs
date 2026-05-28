@@ -159,7 +159,9 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
     };
     let svc = KonfigServiceServer::new(server);
 
-    let mut builder = tonic::transport::Server::builder();
+    let mut builder = tonic::transport::Server::builder()
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)));
 
     if let Some(reporter) = cfg.health_reporter {
         let health_svc = tonic_health::pb::health_server::HealthServer::new(

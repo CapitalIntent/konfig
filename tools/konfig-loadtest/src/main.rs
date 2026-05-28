@@ -126,6 +126,9 @@ impl ScenarioResult {
 async fn connect(addr: &str) -> Result<Channel, tonic::transport::Error> {
     Channel::from_shared(addr.to_owned())
         .expect("valid URI")
+        .http2_keep_alive_interval(std::time::Duration::from_secs(20))
+        .keep_alive_timeout(std::time::Duration::from_secs(10))
+        .keep_alive_while_idle(true)
         .connect()
         .await
 }
