@@ -4,23 +4,27 @@
 //! 1. Parse CLI args / env vars
 //! 2. Init kube::Client
 //! 3. Spawn Config CRD watcher task
-//! 4. Register gRPC health as NOT_SERVING for KonfigService
-//! 5. Wait until cache has at least one populated entry
-//! 6. Register gRPC health as SERVING
-//! 7. Start /metrics HTTP server (port 9090) in background
-//! 8. Start gRPC server (port 50051) — blocks until SIGTERM/shutdown
+//! 4. Spawn Secret namespace watchers (feed both cache + broadcast channel)
+//! 5. Register gRPC health as NOT_SERVING for KonfigService
+//! 6. Wait until cache has at least one populated entry
+//! 7. Register gRPC health as SERVING
+//! 8. Start /metrics HTTP server (port 9090) in background
+//! 9. Start gRPC server (port 50051) — blocks until SIGTERM/shutdown
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
+use dashmap::DashMap;
 use kube::Client;
+use tokio::sync::broadcast;
 use tracing::info;
 
 use konfig::cache::ConfigCache;
 use konfig::grpc::{ServerConfig, serve};
-use konfig::proto::konfig_service_server::KonfigServiceServer;
+use konfig::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
 use konfig::secret_cache::SecretCache;
+use konfig::secret_watcher::SecretWatcher;
 use konfig::types::ConfigSnapshot;
 use konfig::watcher::Watcher;
 
@@ -43,6 +47,16 @@ struct Args {
     /// KONFIG_NAME must be set — no default config name; konfig is domain-agnostic.
     #[arg(long, env = "KONFIG_NAME")]
     name: String,
+
+    /// K8s namespaces to watch for managed Secrets (konfig.io/managed=true).
+    /// Comma-separated or repeated flag, e.g. --secret-namespaces trading,risk
+    #[arg(
+        long,
+        env = "KONFIG_SECRET_NAMESPACES",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    secret_namespaces: Vec<String>,
 }
 
 #[tokio::main]
@@ -71,6 +85,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .expect("watcher exited with error");
     });
+
+    // Spawn Secret namespace watchers.  Each watcher feeds both the SecretCache
+    // and a shared broadcast::Sender so SubscribeSecrets uses a single kube
+    // watch stream per namespace instead of one per subscriber.
+    let secret_namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>> =
+        Arc::new(DashMap::new());
+    let secret_namespaces: Vec<String> = args
+        .secret_namespaces
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !secret_namespaces.is_empty() {
+        info!(namespaces = ?secret_namespaces, "Starting secret namespace watchers");
+        SecretWatcher::new(kube_client.clone()).spawn_all(
+            Arc::clone(&secret_cache),
+            secret_namespaces,
+            Arc::clone(&secret_namespace_broadcasts),
+        );
+    }
 
     // Health reporter: NOT_SERVING until cache is populated.
     let (health_reporter, _health_server) = tonic_health::server::health_reporter();
@@ -110,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secret_cache,
         kube_client,
         health_reporter: Some(health_reporter),
+        secret_namespace_broadcasts,
     })
     .await?;
 

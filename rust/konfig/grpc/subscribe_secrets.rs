@@ -1,14 +1,11 @@
 //! `SubscribeSecrets` handler for `KonfigService`.
 //!
-//! Architecture mirrors `subscribe.rs`: one kube watch stream per namespace,
-//! shared via `tokio::sync::broadcast`.  Each subscriber gets a `Receiver`
-//! clone — O(1) fan-out instead of O(N) sequential `try_send` per event.
+//! Architecture: `secret_watcher.rs` runs one kube watch stream per namespace
+//! and feeds both `SecretCache` (for Get RPCs) and a shared
+//! `broadcast::Sender<SecretEvent>` (for Subscribe RPCs).  This module
+//! subscribes to that shared broadcast — no second kube watch stream is opened.
 //!
-//! The secret_watcher task (which populates `SecretCache`) does NOT broadcast.
-//! This handler owns a separate namespace-keyed broadcast map and drives its own
-//! kube watch stream per namespace.  Both paths observe the same K8s secret
-//! events; the cache path keeps the DashMap current, this path fans out live
-//! `SecretEvent` protos to subscribers.
+//! Each subscriber gets a `Receiver` clone — O(1) fan-out.
 //!
 //! `resume_resource_version`: keeps a per-subscriber raw kube watch (resume
 //! semantics require per-subscriber starting points that are incompatible with
@@ -17,10 +14,9 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{WatchEvent, WatchParams};
-use kube::runtime::watcher::{self as kube_watcher, Event, watcher as kube_watch_stream};
 use kube::{Api, Client};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
@@ -36,8 +32,9 @@ use crate::types::SecretSnapshot;
 /// Per-subscriber mpsc capacity — back-pressure for slow readers.
 const CHANNEL_CAPACITY: usize = 256;
 
-/// Broadcast ring-buffer capacity per namespace.
-/// Sized so that even the slowest subscriber can drain before the ring wraps.
+/// Broadcast ring-buffer capacity — used in tests; kept in sync with
+/// `secret_watcher::BROADCAST_CAPACITY`.
+#[cfg(test)]
 const BROADCAST_CAPACITY: usize = 1_024;
 
 pub async fn handle_subscribe_secrets(
@@ -57,8 +54,12 @@ pub async fn handle_subscribe_secrets(
         return Ok(Response::new(ReceiverStream::new(rx)));
     }
 
-    // Broadcast path: get or create the shared sender for this namespace.
-    let bcast_rx = get_or_create_broadcast(namespace.clone(), kube_client, namespace_broadcasts);
+    // Broadcast path: subscribe to the shared sender populated by secret_watcher.
+    let bcast_rx = get_broadcast_rx(&namespace, &namespace_broadcasts).ok_or_else(|| {
+        Status::unavailable(format!(
+            "no secret watcher running for namespace {namespace}"
+        ))
+    })?;
 
     // Bridge: broadcast::Receiver → mpsc::Sender (this subscriber's gRPC stream).
     tokio::spawn(bridge_broadcast(bcast_rx, tx));
@@ -66,74 +67,15 @@ pub async fn handle_subscribe_secrets(
     Ok(Response::new(ReceiverStream::new(rx)))
 }
 
-/// Return a broadcast `Receiver` for `namespace`, spinning up a kube watcher
-/// if one isn't already running for that namespace.
-fn get_or_create_broadcast(
-    namespace: String,
-    kube_client: Client,
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>>,
-) -> broadcast::Receiver<SecretEvent> {
-    // Fast path: namespace already has a running watcher.
-    if let Some(sender) = namespace_broadcasts.get(&namespace) {
-        return sender.subscribe();
-    }
-
-    // Slow path: first subscriber for this namespace — create broadcast + watcher.
-    match namespace_broadcasts.entry(namespace.clone()) {
-        dashmap::mapref::entry::Entry::Occupied(e) => {
-            // Another task beat us while we were acquiring the entry lock.
-            e.get().subscribe()
-        }
-        dashmap::mapref::entry::Entry::Vacant(e) => {
-            let (bcast_tx, bcast_rx) = broadcast::channel(BROADCAST_CAPACITY);
-            e.insert(bcast_tx.clone());
-
-            // The watcher runs until the kube stream ends, then removes itself
-            // from the map so the next SubscribeSecrets creates a new one.
-            tokio::spawn(run_namespace_watcher(
-                namespace,
-                kube_client,
-                bcast_tx,
-                namespace_broadcasts.clone(),
-            ));
-
-            bcast_rx
-        }
-    }
-}
-
-/// Single kube watch stream per namespace — broadcasts every event to all
-/// current subscribers.  Removes itself from `namespace_broadcasts` on exit.
-async fn run_namespace_watcher(
-    namespace: String,
-    kube_client: Client,
-    tx: broadcast::Sender<SecretEvent>,
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>>,
-) {
-    let api: Api<Secret> = Api::namespaced(kube_client, &namespace);
-    let wc = kube_watcher::Config::default().labels(&format!("{MANAGED_LABEL}=true"));
-    let mut stream = kube_watch_stream(api, wc).boxed();
-
-    while let Some(event) = stream.try_next().await.unwrap_or(None) {
-        let (event_type, secret) = match event {
-            Event::Apply(s) | Event::InitApply(s) => (EventType::Modified as i32, s),
-            Event::Delete(s) => (EventType::Deleted as i32, s),
-            Event::Init | Event::InitDone => continue,
-        };
-        let Some(snap) = parse_secret_object(&secret, &namespace) else {
-            continue;
-        };
-        let secret_event = SecretEvent {
-            event_type,
-            secret: Some(secret_snapshot_to_proto(&snap)),
-        };
-        // `send` returns Err only when there are zero receivers — drop the event.
-        let _ = tx.send(secret_event);
-    }
-
-    // Watcher stream ended — remove from map so next SubscribeSecrets creates a new one.
-    namespace_broadcasts.remove(&namespace);
-    info!(namespace = %namespace, "Secret namespace watcher ended — removed from broadcast map");
+/// Return a broadcast `Receiver` for `namespace` by subscribing to the shared
+/// sender that `SecretWatcher::spawn_all` inserted at server startup.
+///
+/// Returns `None` if the namespace has no running watcher (not configured).
+fn get_broadcast_rx(
+    namespace: &str,
+    namespace_broadcasts: &Arc<DashMap<String, broadcast::Sender<SecretEvent>>>,
+) -> Option<broadcast::Receiver<SecretEvent>> {
+    namespace_broadcasts.get(namespace).map(|tx| tx.subscribe())
 }
 
 /// Forward events from the namespace broadcast to a single subscriber's mpsc.
@@ -437,6 +379,25 @@ mod tests {
             got_exhausted,
             "expected RESOURCE_EXHAUSTED disconnect for lagged subscriber"
         );
+    }
+
+    /// get_broadcast_rx returns Some when a sender exists in the map.
+    #[test]
+    fn get_broadcast_rx_returns_some_when_sender_exists() {
+        let broadcasts = Arc::new(DashMap::new());
+        let (tx, _rx) = broadcast::channel::<SecretEvent>(BROADCAST_CAPACITY);
+        broadcasts.insert("trading".to_string(), tx);
+
+        let result = get_broadcast_rx("trading", &broadcasts);
+        assert!(result.is_some());
+    }
+
+    /// get_broadcast_rx returns None when no sender exists.
+    #[test]
+    fn get_broadcast_rx_returns_none_when_no_sender() {
+        let broadcasts = Arc::new(DashMap::<String, broadcast::Sender<SecretEvent>>::new());
+        let result = get_broadcast_rx("missing-ns", &broadcasts);
+        assert!(result.is_none());
     }
 
     /// parse_secret_object rejects secrets without the managed label.

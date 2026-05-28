@@ -42,6 +42,10 @@ pub struct ServerConfig {
     /// registered alongside `KonfigService`.  When `None` the server starts
     /// without a health endpoint (e.g. in unit tests).
     pub health_reporter: Option<tonic_health::server::HealthReporter>,
+    /// Shared broadcast senders for secret events, keyed by namespace.
+    /// Populated by `SecretWatcher::spawn_all` before `serve` is called so
+    /// that `SubscribeSecrets` subscribers can attach at server startup.
+    pub secret_namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>>,
 }
 
 // ── KonfigServer ──────────────────────────────────────────────────────────────
@@ -155,7 +159,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         kube_client: cfg.kube_client,
         namespace_broadcasts: Arc::new(DashMap::new()),
         namespace_replay_buffers: Arc::new(DashMap::new()),
-        secret_namespace_broadcasts: Arc::new(DashMap::new()),
+        secret_namespace_broadcasts: cfg.secret_namespace_broadcasts,
     };
     let svc = KonfigServiceServer::new(server);
 

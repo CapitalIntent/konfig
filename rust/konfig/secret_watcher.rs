@@ -2,20 +2,31 @@
 //!
 //! Spawns one watcher task per namespace.
 //! Schema version is read from annotation `konfig.io/schema-version`.
+//!
+//! Each namespace watcher feeds both the [`SecretCache`] and a shared
+//! `broadcast::Sender<SecretEvent>` so that `SubscribeSecrets` subscribers
+//! receive live events without a second kube watch stream.
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use futures_util::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::watcher::{self as kube_watcher, Event, watcher as kube_watch_stream};
 use kube::{Api, Client};
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+use crate::grpc::secret_get::secret_snapshot_to_proto;
+use crate::proto::{SecretEvent, secret_event::EventType};
 use crate::secret_cache::SecretCache;
 use crate::types::SecretSnapshot;
 
 pub const MANAGED_LABEL: &str = "konfig.io/managed";
 pub const SCHEMA_VERSION_ANNOTATION: &str = "konfig.io/schema-version";
+
+/// Broadcast ring-buffer capacity — must match `subscribe_secrets::BROADCAST_CAPACITY`.
+const BROADCAST_CAPACITY: usize = 1_024;
 
 pub struct SecretWatcher {
     client: Client,
@@ -27,12 +38,23 @@ impl SecretWatcher {
     }
 
     /// Spawn one watcher task per namespace.  Each runs as a [`tokio::spawn`] task.
-    pub fn spawn_all(self, cache: Arc<SecretCache>, namespaces: Vec<String>) {
+    ///
+    /// For each namespace a `broadcast::Sender<SecretEvent>` is inserted into
+    /// `broadcasts` before the task starts, so `SubscribeSecrets` callers can
+    /// subscribe immediately at server startup.
+    pub fn spawn_all(
+        self,
+        cache: Arc<SecretCache>,
+        namespaces: Vec<String>,
+        broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>>,
+    ) {
         for namespace in namespaces {
             let client = self.client.clone();
             let cache = Arc::clone(&cache);
+            let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+            broadcasts.insert(namespace.clone(), tx.clone());
             tokio::spawn(async move {
-                if let Err(e) = run_namespace_watcher(client, cache, namespace.clone()).await {
+                if let Err(e) = run_namespace_watcher(client, cache, namespace.clone(), tx).await {
                     warn!(namespace = %namespace, "Secret watcher error: {e}");
                 }
             });
@@ -44,6 +66,7 @@ async fn run_namespace_watcher(
     client: Client,
     cache: Arc<SecretCache>,
     namespace: String,
+    broadcast_tx: broadcast::Sender<SecretEvent>,
 ) -> Result<(), kube_watcher::Error> {
     let api: Api<Secret> = Api::namespaced(client, &namespace);
     let wc = kube_watcher::Config::default().labels(&format!("{MANAGED_LABEL}=true"));
@@ -60,7 +83,13 @@ async fn run_namespace_watcher(
                         schema_version = snap.schema_version,
                         "Secret applied",
                     );
-                    cache.update(snap);
+                    cache.update(snap.clone());
+                    let secret_event = SecretEvent {
+                        event_type: EventType::Modified as i32,
+                        secret: Some(secret_snapshot_to_proto(&snap)),
+                    };
+                    // Ignore Err — means zero receivers at the moment.
+                    let _ = broadcast_tx.send(secret_event);
                 }
             }
             Event::Delete(secret) => {
@@ -69,6 +98,13 @@ async fn run_namespace_watcher(
                 // serve stale secret rather than returning NotFound during a partition.
                 // Tracked in W4 (86ahpgaw3).
                 warn!(name, "Secret deleted — cache retains last-known-good");
+                if let Some(snap) = parse_secret(&secret, &namespace) {
+                    let secret_event = SecretEvent {
+                        event_type: EventType::Deleted as i32,
+                        secret: Some(secret_snapshot_to_proto(&snap)),
+                    };
+                    let _ = broadcast_tx.send(secret_event);
+                }
             }
             Event::Init | Event::InitDone => debug!("Secret watch stream: init"),
         }
