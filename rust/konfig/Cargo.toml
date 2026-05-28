@@ -48,6 +48,7 @@ dashmap = {workspace = true}
 futures-util = "0.3"
 kube = {version = "0.98", features = ["runtime", "client"]}
 k8s-openapi = {version = "0.24", features = ["v1_31"]}
+lazy_static = "1"
 prometheus = {version = "0.14", default-features = false}
 prost = {workspace = true}
 tonic-prost = {workspace = true}
@@ -66,7 +67,7 @@ thiserror = {workspace = true}
 tonic-prost-build = {workspace = true}
 
 [dev-dependencies]
-tokio = {workspace = true}
+tokio = {version = "1.52.3", features = ["test-util"]}
 kube = {version = "0.98", features = ["runtime", "client"]}
 k8s-openapi = {version = "0.24", features = ["v1_31"]}
 testcontainers = "0.23"

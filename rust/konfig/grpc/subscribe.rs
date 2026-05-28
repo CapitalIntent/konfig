@@ -17,6 +17,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures_util::{StreamExt, TryStreamExt};
@@ -25,12 +26,14 @@ use kube::runtime::watcher::{self as kube_watcher, Event, watcher as kube_watch_
 use kube::{Api, Client};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 use tracing::{debug, info, warn};
 
 use crate::cache::ConfigCache;
 use crate::grpc::snapshot_to_proto;
+use crate::metrics::{ACTIVE_SUBSCRIBERS, BROADCAST_LAG, EVENTS_BROADCAST, SubGauge};
 use crate::proto::{ConfigEvent, SubscribeRequest, config_event::EventType};
 
 /// Per-subscriber mpsc capacity — back-pressure for slow readers.
@@ -73,6 +76,7 @@ pub async fn handle_subscribe(
     kube_client: Client,
     namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
+    watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
     req: SubscribeRequest,
 ) -> Result<Response<ReceiverStream<Result<ConfigEvent, Status>>>, Status> {
     debug!(namespace = %req.namespace, resume_rv = %req.resume_resource_version, "Subscribe RPC");
@@ -91,6 +95,7 @@ pub async fn handle_subscribe(
         kube_client,
         Arc::clone(&namespace_broadcasts),
         Arc::clone(&namespace_replay_buffers),
+        Arc::clone(&watcher_handles),
     );
 
     if !resume_rv.is_empty() {
@@ -110,7 +115,7 @@ pub async fn handle_subscribe(
     }
 
     // Fresh subscribe (no resume_resource_version) — join live broadcast directly.
-    tokio::spawn(bridge_broadcast(bcast_rx, tx));
+    tokio::spawn(bridge_broadcast(bcast_rx, tx, namespace));
 
     Ok(Response::new(ReceiverStream::new(rx)))
 }
@@ -122,6 +127,7 @@ fn get_or_create_broadcast(
     kube_client: Client,
     namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
+    watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
 ) -> (broadcast::Receiver<Arc<ConfigEvent>>, ReplayBuffer) {
     // Fast path: namespace already has a running watcher.
     if let Some(sender) = namespace_broadcasts.get(&namespace) {
@@ -137,6 +143,7 @@ fn get_or_create_broadcast(
     // conflicting with the DashMap entry borrow held by the match.
     let broadcasts_for_spawn = Arc::clone(&namespace_broadcasts);
     let replay_buffers_for_spawn = Arc::clone(&namespace_replay_buffers);
+    let handles_for_spawn = Arc::clone(&watcher_handles);
 
     match namespace_broadcasts.entry(namespace.clone()) {
         dashmap::mapref::entry::Entry::Occupied(e) => {
@@ -156,16 +163,17 @@ fn get_or_create_broadcast(
                 .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
                 .clone();
 
-            // The watcher runs until the kube stream ends, then removes itself
-            // from the map so the next Subscribe creates a new one.
-            tokio::spawn(run_namespace_watcher(
-                namespace,
+            // The watcher runs until the kube stream ends (or is aborted by GC),
+            // then removes itself from the maps so the next Subscribe recreates them.
+            let handle = tokio::spawn(run_namespace_watcher(
+                namespace.clone(),
                 kube_client,
                 bcast_tx,
                 Arc::clone(&buf),
                 broadcasts_for_spawn,
                 replay_buffers_for_spawn,
             ));
+            handles_for_spawn.insert(namespace, handle);
 
             (bcast_rx, buf)
         }
@@ -174,7 +182,7 @@ fn get_or_create_broadcast(
 
 /// Single kube watch stream per namespace — broadcasts every event to all
 /// current subscribers AND appends it to the replay buffer.
-/// Removes itself from `namespace_broadcasts` on exit.
+/// Removes itself from `namespace_broadcasts` on exit (either naturally or after GC abort).
 async fn run_namespace_watcher(
     namespace: String,
     kube_client: Client,
@@ -210,13 +218,103 @@ async fn run_namespace_watcher(
         push_replay(&replay_buf, rv, Arc::clone(&config_event));
 
         // `send` returns Err only when there are zero receivers — drop the event.
-        let _ = tx.send(config_event);
+        if tx.send(config_event).is_ok() {
+            EVENTS_BROADCAST.with_label_values(&[&namespace]).inc();
+        }
     }
 
     // Watcher stream ended — remove from maps so next Subscribe recreates them.
     namespace_broadcasts.remove(&namespace);
     namespace_replay_buffers.remove(&namespace);
     info!(namespace = %namespace, "Namespace watcher ended — removed from broadcast map");
+}
+
+/// Grace period before an idle namespace watcher is collected.
+const GC_GRACE: Duration = Duration::from_secs(30);
+
+/// One synchronous GC sweep at a given wall-clock `now`.
+///
+/// Scans `namespace_broadcasts` for channels with zero receivers:
+/// - Records the first-idle timestamp in `idle_since`.
+/// - After `GC_GRACE` elapses, aborts the watcher task and removes the
+///   namespace from all three maps.
+/// - Resets the idle timer for namespaces that become active again.
+///
+/// This function is synchronous and allocation-free on the hot path so that
+/// it can be called directly from unit tests without the `tokio/test-util`
+/// feature (no `tokio::time::pause` / `advance` required).
+pub fn gc_tick(
+    now: Instant,
+    namespace_broadcasts: &DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>,
+    namespace_replay_buffers: &DashMap<String, ReplayBuffer>,
+    watcher_handles: &DashMap<String, JoinHandle<()>>,
+    idle_since: &DashMap<String, Instant>,
+) {
+    // Collect namespaces eligible for GC — never hold DashMap entry refs across
+    // any subsequent mutation (DashMap deadlocks if you do).
+    let to_gc: Vec<String> = namespace_broadcasts
+        .iter()
+        .filter_map(|entry| {
+            let ns = entry.key().clone();
+            let count = entry.value().receiver_count();
+            if count == 0 {
+                // No active receivers — check how long the channel has been idle.
+                let since = *idle_since
+                    .entry(ns.clone())
+                    .or_insert_with(Instant::now)
+                    .value();
+                if now.duration_since(since) > GC_GRACE {
+                    Some(ns)
+                } else {
+                    None
+                }
+            } else {
+                // Still active — reset the idle timer.
+                idle_since.remove(&ns);
+                None
+            }
+        })
+        .collect();
+
+    for ns in to_gc {
+        if let Some((_, handle)) = watcher_handles.remove(&ns) {
+            handle.abort();
+        }
+        namespace_broadcasts.remove(&ns);
+        namespace_replay_buffers.remove(&ns);
+        idle_since.remove(&ns);
+        info!(namespace = %ns, "GC: removed idle namespace watcher");
+    }
+}
+
+/// Background GC task — runs `gc_tick` every 10 seconds.
+///
+/// Aborts namespace watchers whose broadcast channel has had zero receivers for
+/// longer than `GC_GRACE` seconds, preventing indefinite K8s watch connection
+/// leaks when all subscribers disconnect.
+///
+/// The next `get_or_create_broadcast()` call will recreate everything cleanly.
+///
+/// Design rules observed:
+/// - Never hold a DashMap entry ref (`.get()`, `.entry()`) across an `.await`.
+/// - The GC list is collected to a `Vec` inside `gc_tick` before any mutations.
+pub async fn gc_task(
+    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
+    namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
+    watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
+    idle_since: Arc<DashMap<String, Instant>>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+        gc_tick(
+            Instant::now(),
+            &namespace_broadcasts,
+            &namespace_replay_buffers,
+            &watcher_handles,
+            &idle_since,
+        );
+    }
 }
 
 /// Resume a subscriber from `resume_rv` using the in-memory replay buffer.
@@ -351,7 +449,7 @@ async fn resume_from_buffer(
     }
 
     // Join the live broadcast for future events.
-    bridge_broadcast(bcast_rx, tx).await;
+    bridge_broadcast(bcast_rx, tx, namespace).await;
 }
 
 /// Forward events from the namespace broadcast to a single subscriber's mpsc.
@@ -364,10 +462,19 @@ async fn resume_from_buffer(
 /// Disconnects the subscriber with RESOURCE_EXHAUSTED if:
 /// - the mpsc channel is full (subscriber too slow to drain), or
 /// - the broadcast ring wrapped before this receiver drained (lagged).
+///
+/// Increments `konfig_active_subscribers` on entry and decrements on every
+/// exit path via a `SubGauge` RAII guard.  Increments
+/// `konfig_broadcast_lag_total` when the broadcast ring wraps.
 async fn bridge_broadcast(
     mut bcast_rx: broadcast::Receiver<Arc<ConfigEvent>>,
     tx: mpsc::Sender<Result<ConfigEvent, Status>>,
+    namespace: String,
 ) {
+    ACTIVE_SUBSCRIBERS.with_label_values(&[&namespace]).inc();
+    // Decrement on every exit path — including early returns from break.
+    let _guard = SubGauge(namespace.clone());
+
     loop {
         match bcast_rx.recv().await {
             Ok(event) => match tx.try_send(Ok((*event).clone())) {
@@ -384,6 +491,7 @@ async fn bridge_broadcast(
             },
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!(missed = n, "Subscriber lagged — disconnecting");
+                BROADCAST_LAG.with_label_values(&[&namespace]).inc();
                 let _ = tx.try_send(Err(Status::resource_exhausted("subscriber lagged")));
                 break;
             }
@@ -761,5 +869,109 @@ mod tests {
             expected_ptr,
             "received Arc must be the same allocation as the one sent"
         );
+    }
+
+    // ── GC: idle namespace removed after grace period ─────────────────────────
+
+    /// After all receivers disconnect and the grace period elapses, `gc_tick`
+    /// must remove the namespace from `namespace_broadcasts` and
+    /// `namespace_replay_buffers`.
+    ///
+    /// We call `gc_tick` directly with an explicit `now` rather than using
+    /// `tokio::time::pause` / `advance` to avoid requiring the `test-util`
+    /// feature of the `tokio` crate.
+    #[tokio::test]
+    async fn gc_removes_idle_namespace_after_grace_period() {
+        let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>> =
+            Arc::new(DashMap::new());
+        let namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>> = Arc::new(DashMap::new());
+        let watcher_handles: Arc<DashMap<String, JoinHandle<()>>> = Arc::new(DashMap::new());
+        let idle_since: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
+
+        // Insert a broadcast channel with NO active receivers (sender only).
+        let (tx, _rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
+        // Drop _rx so receiver_count() == 0.
+        drop(_rx);
+        namespace_broadcasts.insert("test-ns".to_string(), tx);
+        namespace_replay_buffers
+            .insert("test-ns".to_string(), Arc::new(Mutex::new(VecDeque::new())));
+
+        let t0 = Instant::now();
+
+        // Tick 1: namespace becomes idle — idle_since is recorded.
+        // Grace period has not yet elapsed so the namespace must survive.
+        gc_tick(
+            t0,
+            &namespace_broadcasts,
+            &namespace_replay_buffers,
+            &watcher_handles,
+            &idle_since,
+        );
+        assert!(
+            namespace_broadcasts.contains_key("test-ns"),
+            "namespace must still be present before grace period elapses"
+        );
+
+        // Tick 2: simulate 31 s later — past the 30 s grace period.
+        let t1 = t0 + Duration::from_secs(31);
+        gc_tick(
+            t1,
+            &namespace_broadcasts,
+            &namespace_replay_buffers,
+            &watcher_handles,
+            &idle_since,
+        );
+
+        assert!(
+            !namespace_broadcasts.contains_key("test-ns"),
+            "gc_tick must remove idle namespace from namespace_broadcasts after grace period"
+        );
+        assert!(
+            !namespace_replay_buffers.contains_key("test-ns"),
+            "gc_tick must remove idle namespace from namespace_replay_buffers after grace period"
+        );
+    }
+
+    // ── GC: active namespace is not removed ───────────────────────────────────
+
+    /// A namespace with at least one active receiver must NOT be removed by GC,
+    /// even when called with a `now` far in the future.
+    #[tokio::test]
+    async fn gc_does_not_remove_namespace_with_active_subscriber() {
+        let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>> =
+            Arc::new(DashMap::new());
+        let namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>> = Arc::new(DashMap::new());
+        let watcher_handles: Arc<DashMap<String, JoinHandle<()>>> = Arc::new(DashMap::new());
+        let idle_since: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
+
+        // Insert a broadcast channel AND keep a live receiver so receiver_count() > 0.
+        let (tx, _live_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
+        namespace_broadcasts.insert("active-ns".to_string(), tx);
+        namespace_replay_buffers.insert(
+            "active-ns".to_string(),
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+
+        // Run GC with a `now` far past any grace period.
+        let far_future = Instant::now() + Duration::from_secs(3600);
+        gc_tick(
+            far_future,
+            &namespace_broadcasts,
+            &namespace_replay_buffers,
+            &watcher_handles,
+            &idle_since,
+        );
+
+        assert!(
+            namespace_broadcasts.contains_key("active-ns"),
+            "gc_tick must NOT remove a namespace with active subscribers"
+        );
+        assert!(
+            namespace_replay_buffers.contains_key("active-ns"),
+            "gc_tick must NOT remove a namespace with active subscribers"
+        );
+
+        // Keep _live_rx alive until here so receiver_count() stays > 0.
+        drop(_live_rx);
     }
 }

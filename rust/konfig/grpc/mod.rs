@@ -12,16 +12,19 @@ pub mod subscribe_secrets;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use dashmap::DashMap;
 use kube::Client;
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::cache::ConfigCache;
-use crate::grpc::subscribe::ReplayBuffer;
+use crate::grpc::subscribe::{ReplayBuffer, gc_task};
+use crate::metrics::REPLAY_BUFFER_DEPTH;
 use crate::proto::{
     ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, Config, ConfigEvent,
     GetAllRequest, GetAllSecretsRequest, GetRequest, GetSecretRequest, SecretEvent, SecretResponse,
@@ -65,6 +68,9 @@ pub struct KonfigServer {
     /// path.  Holds the last `REPLAY_BUFFER_SIZE` events so reconnecting clients
     /// can catch up without opening a new kube watch.
     pub(crate) namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
+    /// JoinHandles for the per-namespace kube watcher tasks.  The GC task uses
+    /// these to abort idle watchers and prevent K8s watch connection leaks.
+    pub(crate) watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
     /// Separate broadcast map for secret events — keyed by namespace.
     /// Intentionally distinct from `namespace_broadcasts` so Config and Secret
     /// streams do not interfere.
@@ -104,6 +110,7 @@ impl KonfigService for KonfigServer {
             self.kube_client.clone(),
             Arc::clone(&self.namespace_broadcasts),
             Arc::clone(&self.namespace_replay_buffers),
+            Arc::clone(&self.watcher_handles),
             request.into_inner(),
         )
         .await
@@ -155,12 +162,46 @@ impl KonfigService for KonfigServer {
 pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
     info!(addr = %cfg.addr, "KonfigService gRPC server starting");
 
+    let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>> =
+        Arc::new(DashMap::new());
+    let namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>> = Arc::new(DashMap::new());
+    let watcher_handles: Arc<DashMap<String, JoinHandle<()>>> = Arc::new(DashMap::new());
+    let idle_since: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
+
+    // Spawn background GC task — cleans up idle namespace watchers to prevent
+    // K8s watch connection leaks when all subscribers disconnect.
+    tokio::spawn(gc_task(
+        Arc::clone(&namespace_broadcasts),
+        Arc::clone(&namespace_replay_buffers),
+        Arc::clone(&watcher_handles),
+        Arc::clone(&idle_since),
+    ));
+
+    // Spawn background metric sampler — samples replay buffer depth every 5 s.
+    // Runs off the hot path to avoid lock contention during event delivery.
+    {
+        let replay_buffers_for_sampler = Arc::clone(&namespace_replay_buffers);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                for entry in replay_buffers_for_sampler.iter() {
+                    let depth = entry.value().lock().expect("replay buffer poisoned").len();
+                    REPLAY_BUFFER_DEPTH
+                        .with_label_values(&[entry.key()])
+                        .set(depth as f64);
+                }
+            }
+        });
+    }
+
     let server = KonfigServer {
         cache: cfg.cache,
         secret_cache: cfg.secret_cache,
         kube_client: cfg.kube_client,
-        namespace_broadcasts: Arc::new(DashMap::new()),
-        namespace_replay_buffers: Arc::new(DashMap::new()),
+        namespace_broadcasts,
+        namespace_replay_buffers,
+        watcher_handles,
         secret_namespace_broadcasts: cfg.secret_namespace_broadcasts,
     };
     let svc = KonfigServiceServer::new(server);

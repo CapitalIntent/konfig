@@ -41,6 +41,7 @@ rust_library(
         "@konfig_crates//:futures-util",
         "@konfig_crates//:k8s-openapi",
         "@konfig_crates//:kube",
+        "@konfig_crates//:lazy_static",
         "@konfig_crates//:prometheus",
         "@konfig_crates//:prost",
         "@konfig_crates//:serde",

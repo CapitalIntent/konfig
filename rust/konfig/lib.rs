@@ -15,6 +15,7 @@ pub mod cache;
 pub mod configmap_watcher;
 pub mod grpc;
 pub mod import;
+pub mod metrics;
 pub mod secret_cache;
 pub mod secret_watcher;
 pub mod types;

@@ -16,6 +16,7 @@ use serde_json::json;
 use tonic::{Response, Status};
 use tracing::{debug, info, warn};
 
+use crate::metrics::APPLY_TOTAL;
 use crate::proto::{ApplyRequest, ApplyResponse};
 use crate::types::ConfigSpec;
 use crate::watcher::{GROUP, VERSION, config_api_resource};
@@ -52,6 +53,9 @@ pub async fn apply_inner(
             incoming,
             current, "Apply rejected: schema_version not increasing"
         );
+        APPLY_TOTAL
+            .with_label_values(&[namespace, "rejected"])
+            .inc();
         return Err(Status::failed_precondition(format!(
             "schema_version must be > {current}; got {incoming}"
         )));
@@ -65,13 +69,19 @@ pub async fn apply_inner(
             .map_err(|e| Status::internal(format!("serialize error: {e}")))?
     });
 
-    let rv = patch_with_retry(&api, name, patch_body).await?;
-
-    info!(namespace, name, schema_version = incoming, resource_version = %rv, "Apply succeeded");
-
-    Ok(Response::new(ApplyResponse {
-        resource_version: rv,
-    }))
+    match patch_with_retry(&api, name, patch_body).await {
+        Ok(rv) => {
+            info!(namespace, name, schema_version = incoming, resource_version = %rv, "Apply succeeded");
+            APPLY_TOTAL.with_label_values(&[namespace, "ok"]).inc();
+            Ok(Response::new(ApplyResponse {
+                resource_version: rv,
+            }))
+        }
+        Err(e) => {
+            APPLY_TOTAL.with_label_values(&[namespace, "error"]).inc();
+            Err(e)
+        }
+    }
 }
 
 async fn fetch_current_schema_version(api: &Api<DynamicObject>, name: &str) -> Result<u32, Status> {
