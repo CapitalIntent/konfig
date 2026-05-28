@@ -4,7 +4,12 @@ metadata:
   name: konfig
   namespace: konfig-system
 spec:
-  replicas: 1
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: konfig
@@ -14,9 +19,20 @@ spec:
         app: konfig
     spec:
       serviceAccountName: konfig
+      affinity:
+        podAntiAffinity:
+          # Preferred (not required) so this works on single-node kind clusters.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: konfig
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: konfig
-          image: kasa288/konfig:latest
+          # TODO: replace :main with a pinned sha256 digest in CI (e.g. @sha256:<digest>).
+          image: kasa288/konfig:main
           args:
             - --grpc-addr=0.0.0.0:50051
             - --metrics-addr=0.0.0.0:9090

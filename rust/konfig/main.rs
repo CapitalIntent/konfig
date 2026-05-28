@@ -39,8 +39,9 @@ struct Args {
     #[arg(long, env = "KONFIG_NAMESPACE", default_value = "default")]
     namespace: String,
 
-    /// Config CRD name to watch
-    #[arg(long, env = "KONFIG_NAME", default_value = "trading")]
+    /// Config CRD name to watch.
+    /// KONFIG_NAME must be set — no default config name; konfig is domain-agnostic.
+    #[arg(long, env = "KONFIG_NAME")]
     name: String,
 }
 
