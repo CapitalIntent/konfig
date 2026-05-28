@@ -19,3 +19,12 @@ build:release --@rules_rust//:extra_rustc_flags=-Ctarget-cpu=native
 
 # Linux arm64 target — used when building container images on Apple Silicon.
 build:linux-arm64 --platforms=//platforms:linux_arm64
+
+# Pipelined compilation — ~20% faster incremental builds for crates w/ many deps
+build --@rules_rust//rust/settings:pipelined_compilation=True
+
+# JSON error output for CI parsing
+build --@rules_rust//rust/settings:error_format=json
+
+# Version stamping (commit SHA + timestamp into binaries)
+build --workspace_status_command=tools/workspace_status.sh

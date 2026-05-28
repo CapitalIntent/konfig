@@ -68,8 +68,6 @@ register_toolchains("@rust_toolchains//:all", dev_dependency = True)
 ##################################
 bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "protobuf", version = "29.3")
-bazel_dep(name = "rules_rust_prost", version = "0.69.0")
-bazel_dep(name = "rules_rust_protobuf", version = "0.69.0")
 
 ##################################
 # Shell rules (sh_binary — removed from Bazel 9 built-ins)

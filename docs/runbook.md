@@ -67,6 +67,13 @@ helm uninstall konfig -n konfig-system
 kubectl delete crd configs.konfig.io
 ```
 
+## Coverage
+
+```bash
+bazel coverage --combined_report=lcov //rust/konfig:test
+# lcov report at: bazel-out/_coverage/_coverage_report.dat
+```
+
 ## Dial9 trace analysis
 
 ```bash

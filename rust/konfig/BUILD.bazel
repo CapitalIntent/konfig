@@ -1,5 +1,5 @@
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy", "rust_library", "rust_test", "rustfmt_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy", "rust_doc", "rust_doc_test", "rust_library", "rust_test", "rust_test_suite", "rustfmt_test")
 
 # Run build.rs to generate protobuf/tonic bindings into OUT_DIR.
 # The proto file is available in the sandbox at
@@ -61,9 +61,15 @@ rust_library(
 
 # Server binary — standalone konfig server entry point.
 # Direct crate deps required: standard rust_binary does not inherit library deps.
+#
+# stamp = 1: link workspace_status_command (tools/workspace_status.sh) output
+# into the build. STABLE_GIT_SHA / STABLE_BUILD_TIMESTAMP / STABLE_VERSION are
+# emitted into stable-status.txt; rustc_env_files wiring is a TODO for a
+# follow-up PR to expose them as compile-time env vars to the binary.
 rust_binary(
     name = "konfig_bin",
     srcs = ["main.rs"],
+    stamp = 1,
     tags = ["konfig", "rust"],
     visibility = ["//visibility:public"],
     deps = [
@@ -88,20 +94,21 @@ rust_test(
 )
 
 # Integration tests — each requires K3s via Testcontainers (needs Docker daemon).
-# Run with: bazel test //rust/konfig:integration_watcher_test --test_output=streamed
+# Run with: bazel test //rust/konfig:integration_watcher --test_output=streamed
 # Or all at once: bazel test //rust/konfig:all --test_tag_filters=integration
-[rust_test(
-    name = "%s_test" % name,
-    size = "large",
-    srcs = [
-        "tests/%s.rs" % name,
-        "tests/common/mod.rs",
-    ],
+rust_test_suite(
+    name = "integration_tests",
+    srcs = glob(
+        ["tests/*.rs"],
+        allow_empty = False,
+    ),
     crate_features = ["integration"],
+    edition = "2024",
     env = {
         "RUST_LOG": "konfig=debug,kube=info",
         "TESTCONTAINERS_RYUK_DISABLED": "false",
     },
+    shared_srcs = ["tests/common/mod.rs"],
     tags = [
         "integration",
         "konfig",
@@ -122,13 +129,21 @@ rust_test(
         "@konfig_crates//:tokio-stream",
         "@konfig_crates//:tonic",
     ],
-) for name in [
-    "integration_watcher",
-    "integration_watch_timing",
-    "integration_grpc",
-    "integration_revert",
-    "cp_integration",
-]]
+)
+
+# Rustdoc — `bazel build //rust/konfig:doc` to produce HTML docs.
+rust_doc(
+    name = "doc",
+    crate = ":konfig",
+    tags = ["konfig", "rust"],
+)
+
+# Doc tests — runs any ``` examples embedded in /// rustdoc comments.
+rust_doc_test(
+    name = "doc_test",
+    crate = ":konfig",
+    tags = ["konfig", "rust", "unit"],
+)
 
 rustfmt_test(
     name = "fmt_test",

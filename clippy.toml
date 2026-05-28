@@ -1,0 +1,7 @@
+# Workspace-level clippy configuration.
+# Per-crate [lints.clippy] in Cargo.toml takes precedence.
+
+msrv = "1.85"
+cognitive-complexity-threshold = 30
+type-complexity-threshold = 250
+too-many-arguments-threshold = 8

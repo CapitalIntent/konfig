@@ -108,6 +108,19 @@ konfig server is down.
 - [konfig-cli reference](docs/cli.md) — all commands and flags
 - [Runbook](docs/runbook.md) — health checks, metrics, partition recovery, upgrading
 
+## Development
+
+```bash
+# Generate rust-project.json for IDE (rust-analyzer):
+bazel run @rules_rust//tools/rust_analyzer:gen_rust_project
+
+# Build rustdoc:
+bazel build //rust/konfig:doc
+
+# Run doc tests:
+bazel test //rust/konfig:doc_test
+```
+
 ## License
 
 See [LICENSE](LICENSE).
