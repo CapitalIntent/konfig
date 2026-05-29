@@ -1,0 +1,172 @@
+name: Loadtest Integration Gate
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Replaces the Testcontainers-based integration tests removed in PR #29.
+# The in-cluster konfig-loadtest Job runs all four scenarios end-to-end
+# against a real konfig Deployment on kind (single node), covering the
+# same gRPC surface (Apply / Get / Subscribe / Secrets) and additionally
+# asserting latency budgets via p99 thresholds. The loadtest binary exits
+# non-zero on any FAIL row, so this job naturally fails the gate.
+jobs:
+  loadtest:
+    name: konfig-loadtest in-cluster gate (kind)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler
+
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
+
+      - name: Build konfig + konfig-loadtest OCI images (linux/amd64)
+        # The :load target on the macro builds arm64 for Apple Silicon dev
+        # hosts; :load_amd64 builds the matching arch for ubuntu-latest.
+        run: |
+          bazel run //docker/konfig:load_amd64
+          bazel run //docker/konfig-loadtest:load_amd64
+
+      - name: Create kind cluster (1 node)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: konfig-loadtest
+          wait: 120s
+
+      - name: Load images into kind
+        run: |
+          kind load docker-image kasa288/konfig:latest --name konfig-loadtest
+          kind load docker-image kasa288/konfig-loadtest:latest --name konfig-loadtest
+
+      - name: Apply CRDs (Config) and wait for establishment
+        run: |
+          kubectl apply -f infra/konfig/crd.yaml
+          kubectl wait --for=condition=Established crd/configs.konfig.io --timeout=60s
+
+      - name: Apply namespace, RBAC, ServiceAccount, Service
+        run: |
+          kubectl apply -f infra/konfig/namespace.yaml
+          kubectl apply -f infra/konfig/serviceaccount.yaml
+          kubectl apply -f infra/konfig/clusterrole.yaml
+          kubectl apply -f infra/konfig/clusterrole-configmap.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding-configmap.yaml
+          kubectl apply -f infra/konfig/role-secret.yaml
+          kubectl apply -f infra/konfig/service.yaml
+
+      - name: Apply konfig ConfigMap (override watched Config name for loadtest)
+        # The default `infra/konfig/configmap.yaml` sets name=app-config.
+        # The loadtest expects name=konfig-loadtest; override here without
+        # mutating the on-disk manifest used by ArgoCD/Helm.
+        run: |
+          kubectl create configmap konfig-config \
+            --namespace=konfig-system \
+            --from-literal=namespace=konfig-system \
+            --from-literal=name=konfig-loadtest \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Pre-seed Config CR (must exist before konfig starts)
+        # konfig's health endpoint stays NOT_SERVING until the watched Config
+        # CR is observed at least once (cache populated). Without this, the
+        # readiness/liveness probes fail and the Deployment never rolls out.
+        # Also makes scenario 2 (get_flood) independent of scenario ordering.
+        run: |
+          kubectl apply -f infra/konfig-loadtest/seed-config.yaml
+
+      - name: Apply konfig Deployment (override image tag to locally-loaded :latest)
+        # deployment.yaml references kasa288/konfig:main (the prod tag).
+        # The oci_load target tags the locally-built image :latest, so we
+        # rewrite the tag and force IfNotPresent to keep kind from trying
+        # to pull from Docker Hub.
+        run: |
+          kubectl apply -f infra/konfig/deployment.yaml
+          kubectl set image -n konfig-system deploy/konfig konfig=kasa288/konfig:latest
+          kubectl patch -n konfig-system deploy/konfig --type=json -p='[
+            {"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}
+          ]'
+
+      - name: Wait for konfig rollout
+        run: |
+          kubectl rollout status -n konfig-system deploy/konfig --timeout=180s
+
+      - name: Apply konfig-loadtest Job (rewrite imagePullPolicy → IfNotPresent)
+        # Job pod templates are immutable after creation, so we rewrite the
+        # manifest in-stream before applying — kind has the locally-loaded
+        # :latest image; Always would force a pull from Docker Hub and fail.
+        run: |
+          sed 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/' \
+            infra/konfig-loadtest/job.yaml | kubectl apply -f -
+
+      - name: Stream loadtest logs and wait for completion
+        run: |
+          # Wait for the pod to be created (Job → Pod controller).
+          for i in $(seq 1 60); do
+            POD=$(kubectl get pods -n konfig-system -l job-name=konfig-loadtest \
+                    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            if [ -n "$POD" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$POD" ]; then
+            echo "loadtest pod did not appear within 120s"
+            kubectl get pods -n konfig-system
+            exit 1
+          fi
+          echo "Tailing logs from $POD (blocks until pod terminates)"
+          # `kubectl logs -f` exits when the pod completes — its exit code is
+          # not the pod's exit code, so we check Job status afterwards.
+          kubectl logs -n konfig-system -f "$POD" || true
+          # Pod has terminated — check the Job's success/fail status.
+          for i in $(seq 1 30); do
+            SUCCEEDED=$(kubectl get job/konfig-loadtest -n konfig-system -o jsonpath='{.status.succeeded}' 2>/dev/null || true)
+            FAILED=$(kubectl get job/konfig-loadtest -n konfig-system -o jsonpath='{.status.failed}' 2>/dev/null || true)
+            if [ -n "$SUCCEEDED" ] && [ "$SUCCEEDED" != "0" ]; then
+              echo "Loadtest job succeeded"
+              exit 0
+            fi
+            if [ -n "$FAILED" ] && [ "$FAILED" != "0" ]; then
+              echo "Loadtest job failed (status.failed=$FAILED)"
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Job status never settled — treating as failure"
+          kubectl get job/konfig-loadtest -n konfig-system -o yaml
+          exit 1
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods -A
+          echo "=== konfig deployment describe ==="
+          kubectl describe -n konfig-system deploy/konfig || true
+          echo "=== konfig pod logs ==="
+          kubectl logs -n konfig-system -l app=konfig --tail=200 || true
+          echo "=== loadtest pod describe ==="
+          kubectl describe -n konfig-system job/konfig-loadtest || true
+          echo "=== events ==="
+          kubectl get events -n konfig-system --sort-by=.lastTimestamp || true

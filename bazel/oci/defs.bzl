@@ -100,9 +100,11 @@ def konfig_oci_image(
 
     # `:load` loads one arch into the local docker daemon — docker without
     # the containerd image store cannot accept an OCI image index, so we
-    # tag the arm64 image (the dev host) for the load path. `:push` uses
-    # the full index for both arches in the remote.
+    # tag the arm64 image (the dev host on Apple Silicon) for the default
+    # load path. `:load_amd64` is the amd64 equivalent for Linux CI hosts.
+    # `:push` uses the full index for both arches in the remote.
     local_image_label = "_{}_image_arm64".format(name)
+    amd64_image_label = "_{}_image_amd64".format(name)
 
     # Stamped tag list: short git SHA + "latest". The literal "0000000" gets
     # substituted with STABLE_GIT_SHA only when `bazel run --stamp` is used;
@@ -120,6 +122,12 @@ def konfig_oci_image(
     oci_load(
         name = "load",
         image = ":" + local_image_label,
+        repo_tags = ["{}:latest".format(repository)],
+    )
+
+    oci_load(
+        name = "load_amd64",
+        image = ":" + amd64_image_label,
         repo_tags = ["{}:latest".format(repository)],
     )
 
