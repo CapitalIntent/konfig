@@ -202,24 +202,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 // ── Scenario 1: Subscribe flood + rapid apply ─────────────────────────────────
 
-const S1_SUBSCRIBERS: usize = 100;
-const S1_APPLIES: u32 = 200;
-const S1_INTERVAL_MS: u64 = 100;
 const S1_DRAIN_SECS: u64 = 30;
 const S1_P99_LIMIT_MS: u128 = 500;
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
 
 async fn scenario_subscribe_flood(
     addr: &str,
     namespace: &str,
     config_name: &str,
 ) -> ScenarioResult {
+    // S1 knobs — env overrides let the CI gate and the stress profile share
+    // one binary. Defaults preserve the historical 100×200×100 ms shape.
+    let s1_subscribers: usize = env_usize("S1_SUBSCRIBERS", 100);
+    let s1_applies: u32 = env_u32("S1_APPLIES", 200);
+    let s1_interval_ms: u64 = env_u64("S1_INTERVAL_MS", 100);
+
     // Shared state.
     let latencies: Arc<Mutex<Stats>> = Arc::new(Mutex::new(Stats::new()));
-    let event_counts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(vec![0u32; S1_SUBSCRIBERS]));
+    let event_counts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(vec![0u32; s1_subscribers]));
     let apply_timestamps: Arc<Mutex<Vec<Option<Instant>>>> =
-        Arc::new(Mutex::new(vec![None; S1_APPLIES as usize]));
+        Arc::new(Mutex::new(vec![None; s1_applies as usize]));
     let successful_applies: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    let barrier = Arc::new(Barrier::new(S1_SUBSCRIBERS + 1));
+    let barrier = Arc::new(Barrier::new(s1_subscribers + 1));
 
     // Seed: get current schema_version to start above it.
     let start_seq = {
@@ -244,11 +266,10 @@ async fn scenario_subscribe_flood(
             Err(_) => 1,
         }
     };
-    let end_seq = start_seq + S1_APPLIES - 1;
+    let end_seq = start_seq + s1_applies - 1;
 
-    // Spawn 100 subscribers.
-    let mut sub_handles = Vec::with_capacity(S1_SUBSCRIBERS);
-    for sub_id in 0..S1_SUBSCRIBERS {
+    let mut sub_handles = Vec::with_capacity(s1_subscribers);
+    for sub_id in 0..s1_subscribers {
         let h = tokio::spawn(s1_subscriber(
             sub_id,
             addr.to_owned(),
@@ -267,7 +288,7 @@ async fn scenario_subscribe_flood(
     barrier.wait().await;
     info!(
         "S1: all {} subscribers connected — starting apply loop ({}ms interval)",
-        S1_SUBSCRIBERS, S1_INTERVAL_MS
+        s1_subscribers, s1_interval_ms
     );
 
     // Apply loop: 200 applies at 100 ms intervals.
@@ -302,15 +323,15 @@ async fn scenario_subscribe_flood(
             Err(e) => warn!(seq, "S1: Apply failed: {e}"),
         }
         if seq < end_seq {
-            tokio::time::sleep(Duration::from_millis(S1_INTERVAL_MS)).await;
+            tokio::time::sleep(Duration::from_millis(s1_interval_ms)).await;
         }
     }
 
     let n_ok = *successful_applies.lock().await;
-    let total_expected = S1_SUBSCRIBERS as u32 * n_ok;
+    let total_expected = s1_subscribers as u32 * n_ok;
     info!(
         "S1: apply loop done ({n_ok}/{} succeeded) — draining",
-        S1_APPLIES
+        s1_applies
     );
 
     // Drain with timeout.
