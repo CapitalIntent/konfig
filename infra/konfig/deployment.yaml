@@ -4,7 +4,8 @@ metadata:
   name: konfig
   namespace: konfig-system
 spec:
-  replicas: 2
+  # 1 replica for load testing (per project rule); HA deploys override via Helm.
+  replicas: 1
   strategy:
     type: RollingUpdate
     rollingUpdate:
