@@ -17,7 +17,6 @@ use futures_util::StreamExt as _;
 use tokio::sync::{Barrier, Mutex};
 use tonic::transport::Channel;
 use tracing::{error, info, warn};
-use tracing_subscriber::prelude::*;
 
 use konfig::proto::konfig_service_client::KonfigServiceClient;
 use konfig::proto::{

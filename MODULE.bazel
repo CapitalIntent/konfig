@@ -61,7 +61,11 @@ rust.toolchain(
     versions = ["1.95.0"],
 )
 use_repo(rust, "rust_toolchains")
-register_toolchains("@rust_toolchains//:all", dev_dependency = True)
+
+register_toolchains(
+    "@rust_toolchains//:all",
+    dev_dependency = True,
+)
 
 ##################################
 # Protobuf
@@ -134,7 +138,6 @@ llvm.toolchain(
         "x86_64-unknown-linux-gnu": "libc++",
     },
 )
-
 llvm.sysroot(
     name = "konfig_llvm_toolchain",
     label = "@linux_arm64_sysroot//:sysroot",
@@ -146,7 +149,11 @@ llvm.sysroot(
     targets = ["linux-x86_64"],
 )
 use_repo(llvm, "konfig_llvm_toolchain", "konfig_llvm_toolchain_llvm")
-register_toolchains("@konfig_llvm_toolchain//:all", dev_dependency = True)
+
+register_toolchains(
+    "@konfig_llvm_toolchain//:all",
+    dev_dependency = True,
+)
 
 ##################################
 # Crate universe — konfig's Rust deps
