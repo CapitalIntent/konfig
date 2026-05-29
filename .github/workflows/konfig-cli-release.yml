@@ -18,7 +18,7 @@ jobs:
   # ── Linux x86_64 ────────────────────────────────────────────────────────────
   build-linux-amd64:
     name: Build linux/amd64
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -110,7 +110,7 @@ jobs:
   release:
     name: Publish release to jayakasadev/konfig
     needs: [build-linux-amd64, build-macos-arm64]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:

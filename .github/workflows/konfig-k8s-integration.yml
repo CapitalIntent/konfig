@@ -16,7 +16,7 @@ concurrency:
 jobs:
   k8s-integration:
     name: All integration tests (Testcontainers K3s)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
