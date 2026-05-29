@@ -1,18 +1,40 @@
 """Platform transition for OCI image binaries.
 
-`platform_transition_binary` rebuilds its `binary` for the given `platform`,
-without affecting host-config tools (rules_oci's load.sh runner, bsd_tar, etc.).
-This lets `bazel run //docker/...:load` produce a linux/arm64 binary inside the
-image while keeping the loader script on darwin_arm64 / linux_amd64 / etc.
+`platform_transition_binary` rebuilds its `binary` for the given `platform`
+in release configuration, without affecting host-config tools (rules_oci's
+load.sh runner, bsd_tar, etc.).
+
+Release knobs baked in:
+  - compilation_mode=opt   → -Copt-level=3, codegen tuning, deps in release
+  - extra_rustc_flag=
+      -Cstrip=symbols      → drop debug + symbol tables (rust strip; the
+                             generic `--strip=always` doesn't apply to
+                             rules_rust binaries)
+      -Cpanic=abort        → drop unwinding tables (rust panics in containers
+                             should never be caught anyway)
+
+Native CPU tuning is intentionally NOT applied: image binaries must run on
+any matching-arch host, not just the build machine's microarch.
 """
 
-def _platforms_transition_impl(_settings, attr):
-    return {"//command_line_option:platforms": str(attr.platform)}
+def _release_platform_transition_impl(_settings, attr):
+    return {
+        "//command_line_option:platforms": str(attr.platform),
+        "//command_line_option:compilation_mode": "opt",
+        "@rules_rust//rust/settings:extra_rustc_flag": [
+            "-Cstrip=symbols",
+            "-Cpanic=abort",
+        ],
+    }
 
-_platforms_transition = transition(
-    implementation = _platforms_transition_impl,
+_release_platform_transition = transition(
+    implementation = _release_platform_transition_impl,
     inputs = [],
-    outputs = ["//command_line_option:platforms"],
+    outputs = [
+        "//command_line_option:platforms",
+        "//command_line_option:compilation_mode",
+        "@rules_rust//rust/settings:extra_rustc_flag",
+    ],
 )
 
 def _platform_transition_binary_impl(ctx):
@@ -28,7 +50,7 @@ platform_transition_binary = rule(
     implementation = _platform_transition_binary_impl,
     attrs = {
         "binary": attr.label(
-            cfg = _platforms_transition,
+            cfg = _release_platform_transition,
             executable = True,
             mandatory = True,
         ),
