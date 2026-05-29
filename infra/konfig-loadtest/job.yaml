@@ -12,6 +12,7 @@ spec:
       containers:
         - name: konfig-loadtest
           image: kasa288/konfig-loadtest:latest
+          imagePullPolicy: Always
           args:
             - --addr
             - http://konfig.konfig-system.svc.cluster.local:50051
@@ -19,6 +20,8 @@ spec:
             - konfig-system
             - --config-name
             - konfig-loadtest
+            - --secret-name
+            - konfig-loadtest-secret
           resources:
             requests:
               cpu: 500m
