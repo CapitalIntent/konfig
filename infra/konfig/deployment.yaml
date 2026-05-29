@@ -20,6 +20,17 @@ spec:
         app: konfig
     spec:
       serviceAccountName: konfig
+      # ----------------------------------------------------------------------
+      # netprobe sidecar (DISABLED by default)
+      # ----------------------------------------------------------------------
+      # Uncomment the `shareProcessNamespace` line below AND the `netprobe`
+      # container block under `containers:` together to attach a busybox
+      # netprobe sidecar for reading `/proc/1/net/dev` from the konfig PID
+      # namespace when cAdvisor (e.g. on docker-desktop / linuxkit) does not
+      # expose per-pod network metrics. Increases pod memory by ~5 MiB.
+      #
+      # shareProcessNamespace: true
+      # ----------------------------------------------------------------------
       affinity:
         podAntiAffinity:
           # Preferred (not required) so this works on single-node kind clusters.
@@ -78,3 +89,18 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 3
+        # --------------------------------------------------------------------
+        # netprobe sidecar template (DISABLED by default).
+        # Uncomment the block below AND `shareProcessNamespace: true` in the
+        # pod spec above together. Both must be uncommented for the sidecar
+        # to see the konfig PID namespace and read /proc/1/net/dev. Use this
+        # when cAdvisor (e.g. on docker-desktop / linuxkit) does not expose
+        # per-pod network metrics. Increases pod memory by ~5 MiB.
+        # --------------------------------------------------------------------
+        # - name: netprobe
+        #   image: busybox:1.36
+        #   imagePullPolicy: IfNotPresent
+        #   command: ["sh", "-c", "sleep infinity"]
+        #   securityContext:
+        #     capabilities:
+        #       add: ["SYS_PTRACE"]
