@@ -38,6 +38,7 @@ spec:
             - --metrics-addr=0.0.0.0:9090
             - --namespace=$(KONFIG_NAMESPACE)
             - --name=$(KONFIG_NAME)
+            - --secret-namespaces=konfig-system
           env:
             - name: KONFIG_NAMESPACE
               valueFrom:
