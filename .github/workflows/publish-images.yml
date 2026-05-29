@@ -1,0 +1,86 @@
+name: Publish images
+on:
+  push:
+    branches: [main]
+
+# Required repository secrets:
+#   DOCKERHUB_USERNAME      — Docker Hub user for push.
+#   DOCKERHUB_TOKEN         — Docker Hub PAT with write:packages on the
+#                             kasa288/konfig* repositories.
+#   KONFIG_RELEASE_TOKEN    — PAT with `contents: write` on this repo
+#                             (so the pin-back commit can land on main
+#                             past branch protection's default `GITHUB_TOKEN`).
+#
+# Skips itself when the commit message contains `[skip publish]` so the
+# pin-back commit doesn't loop into another publish run.
+
+concurrency:
+  group: publish-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Push multi-arch images + pin manifest SHAs
+    if: "!contains(github.event.head_commit.message, '[skip publish]')"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.KONFIG_RELEASE_TOKEN }}
+
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
+
+      - name: Resolve short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push konfig image
+        run: bazel run --stamp //docker/konfig:push
+
+      - name: Push konfig-cli image
+        run: bazel run --stamp //docker/konfig-cli:push
+
+      - name: Push konfig-loadtest image
+        run: bazel run --stamp //docker/konfig-loadtest:push
+
+      - name: Pin manifest tags to short SHA
+        run: ./tools/pin-image-tags.sh "${{ steps.sha.outputs.short }}"
+
+      - name: Commit pinned manifests
+        run: |
+          if git diff --quiet; then
+            echo "Manifests already pinned to ${{ steps.sha.outputs.short }}; nothing to commit."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add infra/konfig/deployment.yaml \
+                  infra/konfig-loadtest/job.yaml \
+                  chart/values.yaml
+          git commit -m "ci: pin image tags to ${{ steps.sha.outputs.short }} [skip publish]"
+          git push origin HEAD:main

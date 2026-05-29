@@ -32,8 +32,9 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: konfig
-          # TODO: replace :main with a pinned sha256 digest in CI (e.g. @sha256:<digest>).
-          image: kasa288/konfig:main
+          # Tag is rewritten to the merged-commit short SHA by
+          # .github/workflows/publish-images.yml on every push to main.
+          image: kasa288/konfig:latest
           args:
             - --grpc-addr=0.0.0.0:50051
             - --metrics-addr=0.0.0.0:9090
