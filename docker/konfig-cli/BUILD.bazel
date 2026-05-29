@@ -1,42 +1,8 @@
-load("@rules_shell//shell:defs.bzl", "sh_binary")
+load("//bazel/oci:defs.bzl", "konfig_oci_image")
 
-# Multistage Docker builds for konfig-cli.
-#
-# Container image (for distribution as a runnable image):
-#   bazel run //docker/konfig-cli:push                  # linux/arm64 (Docker Desktop)
-#   bazel run //docker/konfig-cli:push -- linux/amd64   # linux/amd64 (EKS)
-#   bazel run //docker/konfig-cli:load                  # load into local daemon
-#
-# Native binary extraction (for GitHub releases):
-#   bazel run //docker/konfig-cli:build_linux_amd64     # → dist/konfig-cli-linux-amd64
-#   bazel run //docker/konfig-cli:build_linux_arm64     # → dist/konfig-cli-linux-arm64
-#   bazel run //docker/konfig-cli:build_macos_arm64     # → dist/konfig-cli-darwin-arm64
-
-sh_binary(
-    name = "push",
-    srcs = ["push.sh"],
-    data = ["Dockerfile"],
-)
-
-sh_binary(
-    name = "load",
-    srcs = ["load.sh"],
-    data = ["Dockerfile"],
-)
-
-sh_binary(
-    name = "build_linux_amd64",
-    srcs = ["build_linux_amd64.sh"],
-    data = ["Dockerfile"],
-)
-
-sh_binary(
-    name = "build_linux_arm64",
-    srcs = ["build_linux_arm64.sh"],
-    data = ["Dockerfile"],
-)
-
-sh_binary(
-    name = "build_macos_arm64",
-    srcs = ["build_macos_arm64.sh"],
+konfig_oci_image(
+    name = "konfig_cli",
+    binary = "//tools/konfig-cli:konfig_cli",
+    binary_name = "konfig-cli",
+    repository = "kasa288/konfig-cli",
 )

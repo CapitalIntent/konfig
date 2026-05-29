@@ -1,0 +1,8 @@
+load("//bazel/oci:defs.bzl", "konfig_oci_image")
+
+konfig_oci_image(
+    name = "konfig_loadtest",
+    binary = "//tools/konfig-loadtest:konfig_loadtest",
+    binary_name = "konfig-loadtest",
+    repository = "kasa288/konfig-loadtest",
+)

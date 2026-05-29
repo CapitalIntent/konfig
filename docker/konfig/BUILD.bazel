@@ -1,51 +1,12 @@
-load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
-load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "strip_prefix")
-load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("//bazel/oci:defs.bzl", "konfig_oci_image")
 
-# Rename konfig_bin → konfig for the container entrypoint.
-pkg_files(
-    name = "konfig_files",
-    srcs = ["//rust/konfig:konfig_bin"],
-    prefix = "/",
-    renames = {"//rust/konfig:konfig_bin": "konfig"},
-    strip_prefix = strip_prefix.from_root(),
-)
-
-# Single layer containing the renamed binary.
-pkg_tar(
-    name = "layer",
-    srcs = [":konfig_files"],
-)
-
-# OCI image: distroless base + binary layer.
-# Build with: bazel run //docker/konfig:load --config=release --config=linux-arm64
-oci_image(
-    name = "image",
-    base = "@distroless_cc",
-    tars = [":layer"],
-    entrypoint = ["/konfig"],
+konfig_oci_image(
+    name = "konfig",
+    binary = "//rust/konfig:konfig_bin",
+    binary_name = "konfig",
     exposed_ports = [
         "50051/tcp",
         "9090/tcp",
     ],
-)
-
-# Load into local Docker daemon (docker-desktop).
-# bazel run //docker/konfig:load --config=release --config=linux-arm64
-oci_load(
-    name = "load",
-    image = ":image",
-    repo_tags = [
-        "kasa288/konfig:main",
-        "kasa288/konfig:latest",
-    ],
-)
-
-# Push to registry.
-# bazel run //docker/konfig:push --config=release --config=linux-arm64
-oci_push(
-    name = "push",
-    image = ":image",
-    remote_tags = ["main"],
     repository = "kasa288/konfig",
 )
