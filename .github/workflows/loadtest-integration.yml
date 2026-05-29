@@ -97,19 +97,41 @@ jobs:
         run: |
           kubectl apply -f infra/konfig-loadtest/seed-config.yaml
 
+      - name: Verify locally-loaded image is linux/amd64
+        # Catch arch mismatches before they manifest as `exec format error`
+        # crashes inside kind. We just loaded the image into the local docker
+        # daemon via `bazel run //docker/konfig:load_amd64`; assert its
+        # Architecture before letting it propagate into the cluster.
+        run: |
+          for img in kasa288/konfig:latest kasa288/konfig-loadtest:latest; do
+            arch=$(docker inspect --format '{{.Architecture}}' "$img")
+            os=$(docker inspect --format '{{.Os}}' "$img")
+            echo "$img -> $os/$arch"
+            if [ "$os" != "linux" ] || [ "$arch" != "amd64" ]; then
+              echo "::error::Expected linux/amd64 for $img, got $os/$arch"
+              exit 1
+            fi
+          done
+
       - name: Apply konfig Deployment (force IfNotPresent for locally-loaded image)
-        # `infra/konfig/deployment.yaml` now references `kasa288/konfig:latest`
+        # `infra/konfig/deployment.yaml` references `kasa288/konfig:latest`
         # (post-PR-#31 sha-pinning rewrites this to a short SHA on main pushes,
         # but on PR branches we apply with the `:latest` tag that
         # `kind load docker-image` placed in the cluster). The default
-        # imagePullPolicy for the `:latest` tag is `Always`, which would force
-        # a Docker Hub pull and fail — patch to `IfNotPresent` so the locally
-        # loaded image is used.
+        # imagePullPolicy for the `:latest` tag is `Always`, which would
+        # otherwise have kubelet pull from Docker Hub on first rollout —
+        # if the registry's `:latest` differs from what we just loaded (e.g.
+        # a stale arm64 manual push), containerd would overwrite the locally
+        # loaded tag and the pod would fail with `exec format error`.
+        #
+        # Force `IfNotPresent` *before* the first apply (via yq, preinstalled
+        # on ubuntu-latest) so revision 1 already has the correct policy —
+        # avoiding the patch-then-second-revision race window where the old
+        # ReplicaSet pulls from the registry before being torn down.
         run: |
-          kubectl apply -f infra/konfig/deployment.yaml
-          kubectl patch -n konfig-system deploy/konfig --type=json -p='[
-            {"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}
-          ]'
+          yq '(.spec.template.spec.containers[] | select(.name == "konfig")).imagePullPolicy = "IfNotPresent"' \
+            infra/konfig/deployment.yaml \
+          | kubectl apply -f -
 
       - name: Wait for konfig Deployment + Pod Ready (cache populated)
         # `Available` alone is insufficient because konfig's gRPC health stays
