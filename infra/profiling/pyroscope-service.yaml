@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pyroscope
+  namespace: profiling
+spec:
+  # ClusterIP is the safe default. For local docker-desktop access to the
+  # Pyroscope UI, override with `kubectl patch svc pyroscope -n profiling \
+  #   -p '{"spec":{"type":"LoadBalancer"}}'` — see README.md.
+  type: ClusterIP
+  selector:
+    app: pyroscope
+  ports:
+    - name: http
+      port: 4040
+      targetPort: 4040

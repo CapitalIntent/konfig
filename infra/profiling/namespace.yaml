@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: profiling
+  labels:
+    # Dev-only: gate ArgoCD reconcile off this label in prod overlays.
+    konfig.traversal.com/scope: dev

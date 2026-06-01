@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: profiling
+data:
+  config.alloy: |
+    // Discover konfig pods cluster-wide. The pyroscope.ebpf component
+    // attaches per-node based on `__meta_kubernetes_pod_node_name`.
+    discovery.kubernetes "konfig_pods" {
+      role = "pod"
+      selectors {
+        role  = "pod"
+        label = "app=konfig"
+      }
+    }
+
+    discovery.relabel "konfig_pods" {
+      targets = discovery.kubernetes.konfig_pods.targets
+      rule {
+        source_labels = ["__meta_kubernetes_pod_node_name"]
+        target_label  = "node"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+      rule {
+        replacement  = "konfig"
+        target_label = "service_name"
+      }
+    }
+
+    pyroscope.ebpf "konfig" {
+      forward_to       = [pyroscope.write.local.receiver]
+      targets          = discovery.relabel.konfig_pods.output
+      collect_interval = "10s"
+      sample_rate      = 97
+    }
+
+    pyroscope.write "local" {
+      endpoint {
+        url = "http://pyroscope.profiling.svc.cluster.local:4040"
+      }
+    }

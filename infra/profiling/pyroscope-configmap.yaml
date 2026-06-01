@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pyroscope-config
+  namespace: profiling
+data:
+  config.yaml: |
+    target: all
+    server:
+      http_listen_port: 4040
+    storage:
+      backend: filesystem
+      filesystem:
+        dir: /data/blocks

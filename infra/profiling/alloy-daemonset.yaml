@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: alloy
+  namespace: profiling
+spec:
+  selector:
+    matchLabels:
+      app: alloy
+  template:
+    metadata:
+      labels:
+        app: alloy
+    spec:
+      serviceAccountName: alloy
+      # Required so pyroscope.ebpf can resolve symbols of processes on the host.
+      hostPID: true
+      containers:
+        - name: alloy
+          # Pinned to the multi-arch manifest-list digest for grafana/alloy:v1.4.2.
+          image: grafana/alloy:v1.4.2@sha256:625174f60ee3287a4ec9de7e818805f117376f1375169bc73482b41540697376
+          args:
+            - run
+            - /etc/alloy/config.alloy
+            - --server.http.listen-addr=0.0.0.0:12345
+            - --stability.level=public-preview
+          ports:
+            - name: http
+              containerPort: 12345
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          # eBPF + hostPID requires privileged + root.
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alloy
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: alloy-config
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: proc
+          hostPath:
+            path: /proc

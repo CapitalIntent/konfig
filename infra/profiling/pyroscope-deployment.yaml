@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pyroscope
+  namespace: profiling
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pyroscope
+  template:
+    metadata:
+      labels:
+        app: pyroscope
+    spec:
+      containers:
+        - name: pyroscope
+          # Pinned to the multi-arch manifest-list digest for grafana/pyroscope:1.9.0
+          # to keep ArgoCD reconciliation deterministic across nodes.
+          image: grafana/pyroscope:1.9.0@sha256:961986eeab904653576f9d1603002170ded71f5a1df3e955f947ed2bfb359b93
+          args:
+            - -target=all
+            - -config.file=/etc/pyroscope/config.yaml
+          ports:
+            - name: http
+              containerPort: 4040
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/pyroscope
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: pyroscope-config
