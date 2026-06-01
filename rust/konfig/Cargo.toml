@@ -84,6 +84,13 @@ pyroscope_pprofrs = {version = "0.2", optional = true}
 # client to the running process.
 console-subscriber = {version = "0.4", optional = true}
 
+# Per-OS allocator pin (memory rule: jemalloc on Linux pods, snmalloc on macOS dev).
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+snmalloc-rs = "0.3"
+
 [build-dependencies]
 tonic-prost-build = {workspace = true}
 

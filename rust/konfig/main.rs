@@ -16,6 +16,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+// Per-OS allocator pin (memory rule: jemalloc on Linux pods, snmalloc on macOS dev).
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
 use clap::Parser;
 use dashmap::DashMap;
 use kube::Client;
