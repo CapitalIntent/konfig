@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: konfig-loadtest-saturate
+  namespace: konfig-system
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: konfig-loadtest
+          image: kasa288/konfig-loadtest:latest
+          imagePullPolicy: Always
+          args:
+            - --addr
+            - http://konfig.konfig-system.svc.cluster.local:50051
+            - --namespace
+            - konfig-system
+            - --config-name
+            - konfig-loadtest
+            - --secret-name
+            - konfig-loadtest-secret
+          env:
+            - name: S1_SUBSCRIBERS
+              value: "1000"
+            - name: S1_APPLIES
+              value: "1000"
+            - name: S1_INTERVAL_MS
+              value: "5"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 1Gi
+            limits:
+              cpu: "8"
+              memory: 2Gi
