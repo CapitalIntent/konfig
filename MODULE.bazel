@@ -116,6 +116,27 @@ use_repo(
     "distroless_cc_linux_arm64_v8",
 )
 
+# Debug base for the `konfig-debug` image variant. Identical glibc + libgcc_s
+# + libstdc++ runtime as `distroless_cc` above, but layered with busybox under
+# /busybox/ so operators get /busybox/sh plus the standard busybox applets
+# (ps, wget, nslookup, netstat, ...) for in-cluster triage. Same image family
+# as distroless_cc → no ABI drift between the production and debug images.
+oci.pull(
+    name = "distroless_cc_debug",
+    image = "gcr.io/distroless/cc-debian13",
+    platforms = [
+        "linux/amd64",
+        "linux/arm64/v8",
+    ],
+    tag = "debug-nonroot",
+)
+use_repo(
+    oci,
+    "distroless_cc_debug",
+    "distroless_cc_debug_linux_amd64",
+    "distroless_cc_debug_linux_arm64_v8",
+)
+
 ##################################
 # LLVM cross-compilation toolchain (dev only)
 ##################################

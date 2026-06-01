@@ -20,23 +20,37 @@ load("@rules_pkg//pkg:mappings.bzl", "pkg_attributes", "pkg_files", "strip_prefi
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("//bazel/oci:transitions.bzl", "platform_transition_binary")
 
-# Supported (arch, platform_label, distroless base) tuples. amd64 first
-# so the load target tags amd64 on `--platform linux/amd64` hosts; docker
-# load picks the matching arch automatically from the index.
+# Supported (arch, platform_label) tuples. amd64 first so the load target
+# tags amd64 on `--platform linux/amd64` hosts; docker load picks the
+# matching arch automatically from the index. The base image is selected
+# per-image-flavor via `_BASE_SETS` below.
 _ARCHES = [
     struct(
         arch = "amd64",
         platform = "//platforms:linux_amd64",
-        base = "@distroless_cc_linux_amd64",
     ),
     struct(
         arch = "arm64",
         platform = "//platforms:linux_arm64",
-        base = "@distroless_cc_linux_arm64_v8",
     ),
 ]
 
-def _per_arch_image(name, arch_cfg, binary, binary_name, exposed_ports):
+# Per-arch base override sets. Keys map to konfig_oci_image(base=) values.
+# Adding a new entry here registers a new image flavor (e.g.
+# `distroless_cc_debug` for the konfig-debug variant that ships /busybox/sh
+# + POSIX applets on top of the same glibc runtime as the production image).
+_BASE_SETS = {
+    "distroless_cc": {
+        "amd64": "@distroless_cc_linux_amd64",
+        "arm64": "@distroless_cc_linux_arm64_v8",
+    },
+    "distroless_cc_debug": {
+        "amd64": "@distroless_cc_debug_linux_amd64",
+        "arm64": "@distroless_cc_debug_linux_arm64_v8",
+    },
+}
+
+def _per_arch_image(name, arch_cfg, base, binary, binary_name, exposed_ports, extra_tars):
     """Build a single-arch oci_image and return its label."""
     suffix = arch_cfg.arch
     transitioned = "_{}_bin_{}_transitioned".format(name, suffix)
@@ -66,10 +80,10 @@ def _per_arch_image(name, arch_cfg, binary, binary_name, exposed_ports):
 
     oci_image(
         name = image_target,
-        base = arch_cfg.base,
+        base = base,
         entrypoint = ["/" + binary_name],
         exposed_ports = exposed_ports or [],
-        tars = [":" + layer_target],
+        tars = [":" + layer_target] + (extra_tars or []),
     )
 
     return ":" + image_target
@@ -79,7 +93,9 @@ def konfig_oci_image(
         binary,
         binary_name,
         repository,
-        exposed_ports = None):
+        exposed_ports = None,
+        base = "distroless_cc",
+        extra_tars = None):
     """Build/load/push a multi-arch Konfig container image.
 
     Args:
@@ -88,9 +104,31 @@ def konfig_oci_image(
       binary_name: filename written into / inside the image (also the entrypoint).
       repository: Docker Hub repository (e.g. "kasa288/konfig").
       exposed_ports: optional list like ["50051/tcp", "9090/tcp"].
+      base: base-image set key from `_BASE_SETS`. Defaults to "distroless_cc"
+        (slim runtime). Use "distroless_cc_debug" for the konfig-debug variant
+        which ships /busybox/sh + POSIX applets for in-cluster triage on top
+        of the same glibc/libgcc_s runtime as the production image.
+      extra_tars: optional list of additional pkg_tar labels layered on top of
+        the binary layer (e.g. a symlink tar exposing /bin/sh in the debug
+        variant). Same list is applied to every per-arch image.
     """
+    if base not in _BASE_SETS:
+        fail("konfig_oci_image: unknown base={}; valid: {}".format(
+            base,
+            sorted(_BASE_SETS.keys()),
+        ))
+    base_map = _BASE_SETS[base]
+
     per_arch_labels = [
-        _per_arch_image(name, arch_cfg, binary, binary_name, exposed_ports)
+        _per_arch_image(
+            name,
+            arch_cfg,
+            base_map[arch_cfg.arch],
+            binary,
+            binary_name,
+            exposed_ports,
+            extra_tars,
+        )
         for arch_cfg in _ARCHES
     ]
 
