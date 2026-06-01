@@ -86,6 +86,33 @@ rust_binary(
     ],
 )
 
+# Opt-in profiling binary — same sources as `:konfig_bin` but built with
+# `--cfg feature="profiling"`, which pulls in pyroscope-rs and compiles the
+# agent init block in `main.rs`. Packaged separately as the `konfig-profiling`
+# image; the default `konfig` image stays slim.
+rust_binary(
+    name = "konfig_bin_profiling",
+    srcs = ["main.rs"],
+    crate_features = ["profiling"],
+    stamp = 1,
+    tags = ["konfig", "rust", "profiling"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":konfig",
+        "@konfig_crates//:axum",
+        "@konfig_crates//:clap",
+        "@konfig_crates//:dashmap",
+        "@konfig_crates//:kube",
+        "@konfig_crates//:prometheus",
+        "@konfig_crates//:pyroscope",
+        "@konfig_crates//:pyroscope_pprofrs",
+        "@konfig_crates//:tokio",
+        "@konfig_crates//:tonic-health",
+        "@konfig_crates//:tracing",
+        "@konfig_crates//:tracing-subscriber",
+    ],
+)
+
 rust_test(
     name = "test",
     size = "small",

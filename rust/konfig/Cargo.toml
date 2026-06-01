@@ -16,6 +16,12 @@ path = "lib.rs"
 
 [features]
 integration = []
+# Enables in-process pyroscope-rs CPU profiling agent. The agent is only
+# started at runtime if PYROSCOPE_SERVER_ADDRESS is set; this feature gates
+# whether the pyroscope crates are compiled in at all. Off by default so
+# the default `konfig` image stays slim — opt in via the `konfig-profiling`
+# image variant.
+profiling = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
 
 [[test]]
 name = "integration_watcher"
@@ -62,6 +68,10 @@ tonic-health = "0.14.6"
 tracing = {workspace = true}
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}
 thiserror = {workspace = true}
+# Optional — pulled in by the `profiling` feature; the default `konfig`
+# image is built without these so it stays slim.
+pyroscope = {version = "0.5", optional = true}
+pyroscope_pprofrs = {version = "0.2", optional = true}
 
 [build-dependencies]
 tonic-prost-build = {workspace = true}

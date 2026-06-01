@@ -7,9 +7,13 @@ load.sh runner, bsd_tar, etc.).
 Release knobs baked in:
   - compilation_mode=opt   → -Copt-level=3, codegen tuning, deps in release
   - extra_rustc_flag=
-      -Cstrip=symbols      → drop debug + symbol tables (rust strip; the
-                             generic `--strip=always` doesn't apply to
-                             rules_rust binaries)
+      -Cstrip=debuginfo    → drop DWARF debug info but KEEP the symbol
+                             table. eBPF profilers and addr2line need
+                             function names to symbolicate stacks; full
+                             `-Cstrip=symbols` would erase those too.
+                             The size cost over `symbols` is a few hundred
+                             KB of `.symtab` + `.strtab`, worth it for
+                             on-demand profiling of the default image.
       -Cpanic=abort        → drop unwinding tables (rust panics in containers
                              should never be caught anyway)
 
@@ -22,7 +26,7 @@ def _release_platform_transition_impl(_settings, attr):
         "//command_line_option:platforms": str(attr.platform),
         "//command_line_option:compilation_mode": "opt",
         "@rules_rust//rust/settings:extra_rustc_flag": [
-            "-Cstrip=symbols",
+            "-Cstrip=debuginfo",
             "-Cpanic=abort",
         ],
     }

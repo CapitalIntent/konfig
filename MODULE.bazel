@@ -116,6 +116,27 @@ use_repo(
     "distroless_cc_linux_arm64_v8",
 )
 
+# Debug base for the `konfig-debug` image variant. Identical glibc + libgcc_s
+# + libstdc++ runtime as `distroless_cc` above, but layered with busybox under
+# /busybox/ so operators get /busybox/sh plus the standard busybox applets
+# (ps, wget, nslookup, netstat, ...) for in-cluster triage. Same image family
+# as distroless_cc → no ABI drift between the production and debug images.
+oci.pull(
+    name = "distroless_cc_debug",
+    image = "gcr.io/distroless/cc-debian13",
+    platforms = [
+        "linux/amd64",
+        "linux/arm64/v8",
+    ],
+    tag = "debug-nonroot",
+)
+use_repo(
+    oci,
+    "distroless_cc_debug",
+    "distroless_cc_debug_linux_amd64",
+    "distroless_cc_debug_linux_arm64_v8",
+)
+
 ##################################
 # LLVM cross-compilation toolchain (dev only)
 ##################################
@@ -174,5 +195,20 @@ crate.from_cargo(
         "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-gnu",
     ],
+)
+
+# pyroscope + pyroscope_pprofrs are optional deps of the `konfig` crate, only
+# pulled in by the `profiling` cargo feature (used by `:konfig_bin_profiling`
+# and the `konfig-profiling` image). `cargo tree` without `--features` skips
+# optional deps, so crate_universe wouldn't generate @konfig_crates targets
+# for them off the lockfile alone. Listing them here as `crate.spec` forces
+# the generation; the actual crate version is still pinned by Cargo.lock.
+crate.spec(
+    package = "pyroscope",
+    version = "0.5",
+)
+crate.spec(
+    package = "pyroscope_pprofrs",
+    version = "0.2",
 )
 use_repo(crate, "konfig_crates")

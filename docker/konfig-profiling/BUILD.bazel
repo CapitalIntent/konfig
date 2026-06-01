@@ -1,0 +1,17 @@
+load("//bazel/oci:defs.bzl", "konfig_oci_image")
+
+# `konfig-profiling` — opt-in image variant compiled with the `profiling`
+# cargo feature, which links in pyroscope-rs. The agent only starts when
+# PYROSCOPE_SERVER_ADDRESS is set, so this image is safe to deploy without
+# pyroscope wired up; deploy it on demand when symbolicated CPU profiles
+# are wanted. The default `konfig` image stays slim (no pyroscope linked).
+konfig_oci_image(
+    name = "konfig_profiling",
+    binary = "//rust/konfig:konfig_bin_profiling",
+    binary_name = "konfig",
+    exposed_ports = [
+        "50051/tcp",
+        "9090/tcp",
+    ],
+    repository = "kasa288/konfig-profiling",
+)

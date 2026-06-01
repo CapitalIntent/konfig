@@ -31,6 +31,10 @@ use konfig::secret_cache::SecretCache;
 use konfig::secret_watcher::SecretWatcher;
 use konfig::types::ConfigSnapshot;
 use konfig::watcher::Watcher;
+#[cfg(feature = "profiling")]
+use pyroscope::PyroscopeAgent;
+#[cfg(feature = "profiling")]
+use pyroscope_pprofrs::{PprofConfig, pprof_backend};
 
 #[derive(Parser)]
 #[command(name = "konfig", about = "Konfig config distribution service")]
@@ -72,6 +76,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+
+    // Pyroscope agent — only compiled into the `konfig-profiling` image
+    // variant (`--features profiling`).  Started if PYROSCOPE_SERVER_ADDRESS
+    // is set; held until process exit (dropping stops the agent).  The
+    // default `konfig` image omits this entirely so the binary stays slim.
+    #[cfg(feature = "profiling")]
+    let _pyroscope = match std::env::var("PYROSCOPE_SERVER_ADDRESS") {
+        Ok(url) if !url.is_empty() => {
+            let app = std::env::var("PYROSCOPE_APPLICATION_NAME")
+                .unwrap_or_else(|_| "konfig".to_string());
+            let pod = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
+            let agent = PyroscopeAgent::builder(&url, &app)
+                .backend(pprof_backend(PprofConfig::new().sample_rate(100)))
+                .tags(vec![("pod", Box::leak(pod.into_boxed_str()))])
+                .build()?;
+            let running = agent.start()?;
+            info!(server = %url, application = %app, "pyroscope agent started");
+            Some(running)
+        }
+        _ => None,
+    };
 
     let kube_client = Client::try_default().await?;
 
