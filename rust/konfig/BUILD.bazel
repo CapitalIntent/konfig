@@ -83,7 +83,11 @@ rust_binary(
         "@konfig_crates//:tonic-health",
         "@konfig_crates//:tracing",
         "@konfig_crates//:tracing-subscriber",
-    ],
+    ] + select({
+        # Per-OS allocator pin (memory rule).
+        "@platforms//os:linux": ["@konfig_crates//:tikv-jemallocator"],
+        "@platforms//os:macos": ["@konfig_crates//:snmalloc-rs"],
+    }),
 )
 
 # Opt-in profiling binary — same sources as `:konfig_bin` but built with
@@ -110,7 +114,11 @@ rust_binary(
         "@konfig_crates//:tonic-health",
         "@konfig_crates//:tracing",
         "@konfig_crates//:tracing-subscriber",
-    ],
+    ] + select({
+        # Per-OS allocator pin (memory rule).
+        "@platforms//os:linux": ["@konfig_crates//:tikv-jemallocator"],
+        "@platforms//os:macos": ["@konfig_crates//:snmalloc-rs"],
+    }),
 )
 
 rust_test(

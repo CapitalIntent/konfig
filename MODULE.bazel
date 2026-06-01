@@ -211,4 +211,16 @@ crate.spec(
     package = "pyroscope_pprofrs",
     version = "0.2",
 )
+
+# Per-OS allocator pin (memory rule). Declared as platform-specific via
+# `target_compatible_with` semantics in crate_universe; konfig_bin selects
+# them on the corresponding @platforms//os: target.
+crate.spec(
+    package = "tikv-jemallocator",
+    version = "0.6",
+)
+crate.spec(
+    package = "snmalloc-rs",
+    version = "0.3",
+)
 use_repo(crate, "konfig_crates")
