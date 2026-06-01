@@ -545,6 +545,8 @@ const S3_WARM_APPLIES: u32 = 5;
 const S3_POST_APPLIES: u32 = 10;
 const S3_INTERVAL_MS: u64 = 100;
 const S3_DRAIN_SECS: u64 = 15;
+const S3_WARM_DRAIN_SECS: u64 = 5;
+const S3_WARM_RV_QUORUM: usize = S3_SUBSCRIBERS;
 
 async fn scenario_reconnect_storm(
     addr: &str,
@@ -607,10 +609,29 @@ async fn scenario_reconnect_storm(
     }
 
     barrier.wait().await;
-    info!("S3: {S3_SUBSCRIBERS} subscribers connected — letting them drain warm events");
+    info!("S3: {S3_SUBSCRIBERS} subscribers connected — waiting for warm events to land");
 
-    // Brief drain window — let subscribers receive the warm-up events.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(S3_WARM_DRAIN_SECS);
+    loop {
+        let populated = last_rvs
+            .lock()
+            .await
+            .iter()
+            .filter(|rv| !rv.is_empty())
+            .count();
+        if populated >= S3_WARM_RV_QUORUM {
+            break;
+        }
+        if tokio::time::Instant::now() >= drain_deadline {
+            warn!(
+                populated,
+                quorum = S3_WARM_RV_QUORUM,
+                "S3: warm drain timeout — fewer subscribers have RV than quorum"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Phase 4: abort all subscribers simultaneously (simulate disconnect).
     info!("S3: aborting all subscribers simultaneously");
@@ -618,16 +639,22 @@ async fn scenario_reconnect_storm(
         h.abort();
     }
 
-    // Collect the last RV seen by each subscriber.
+    // Collect the highest RV across subscribers — picking the max means we
+    // resume from the latest warm event everybody has acknowledged, avoiding
+    // duplicate replay and ensuring post-applies are the only events expected.
     let rvs = last_rvs.lock().await.clone();
     let known_rv = rvs
         .iter()
-        .find(|rv| !rv.is_empty())
+        .filter(|rv| !rv.is_empty())
+        .max_by_key(|rv| rv.parse::<u64>().unwrap_or(0))
         .cloned()
         .unwrap_or_default();
     info!(known_rv = %known_rv, "S3: using resume_rv for reconnect");
 
-    // Phase 5: issue 10 more applies while reconnecting.
+    // Phase 5: reconnect first, then fire post-applies. Spawning the apply
+    // loop before subscribers register lets the leading applies race ahead of
+    // the server-side subscribe registration, which surfaces as "missed events
+    // post-reconnect" even though resume_resource_version replay is correct.
     let post_start = warm_end + 1;
     let post_end = post_start + S3_POST_APPLIES - 1;
 
@@ -635,7 +662,29 @@ async fn scenario_reconnect_storm(
         Arc::new(Mutex::new(vec![None; S3_POST_APPLIES as usize]));
     let successful_post: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
 
-    // Spawn reconnect task (fires post-applies concurrently with reconnects).
+    info!("S3: reconnecting {S3_SUBSCRIBERS} subscribers with resume_rv={known_rv}");
+    let event_counts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(vec![0u32; S3_SUBSCRIBERS]));
+    let reconnect_barrier = Arc::new(Barrier::new(S3_SUBSCRIBERS + 1));
+    let mut reconnect_handles = Vec::with_capacity(S3_SUBSCRIBERS);
+
+    for sub_id in 0..S3_SUBSCRIBERS {
+        let h = tokio::spawn(s3_subscriber_phase2(
+            sub_id,
+            addr.to_owned(),
+            namespace.to_owned(),
+            config_name.to_owned(),
+            known_rv.clone(),
+            post_start,
+            Arc::clone(&event_counts),
+            Arc::clone(&apply_timestamps),
+            Arc::clone(&reconnect_barrier),
+        ));
+        reconnect_handles.push(h);
+    }
+
+    reconnect_barrier.wait().await;
+    info!("S3: all {S3_SUBSCRIBERS} subscribers reconnected");
+
     let apply_ts_clone = Arc::clone(&apply_timestamps);
     let successful_post_clone = Arc::clone(&successful_post);
     let addr2 = addr.to_owned();
@@ -665,30 +714,6 @@ async fn scenario_reconnect_storm(
             tokio::time::sleep(Duration::from_millis(S3_INTERVAL_MS)).await;
         }
     });
-
-    // Reconnect all 50 with resume_resource_version.
-    info!("S3: reconnecting {S3_SUBSCRIBERS} subscribers with resume_rv={known_rv}");
-    let event_counts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(vec![0u32; S3_SUBSCRIBERS]));
-    let reconnect_barrier = Arc::new(Barrier::new(S3_SUBSCRIBERS + 1));
-    let mut reconnect_handles = Vec::with_capacity(S3_SUBSCRIBERS);
-
-    for sub_id in 0..S3_SUBSCRIBERS {
-        let h = tokio::spawn(s3_subscriber_phase2(
-            sub_id,
-            addr.to_owned(),
-            namespace.to_owned(),
-            config_name.to_owned(),
-            known_rv.clone(),
-            post_start,
-            Arc::clone(&event_counts),
-            Arc::clone(&apply_timestamps),
-            Arc::clone(&reconnect_barrier),
-        ));
-        reconnect_handles.push(h);
-    }
-
-    reconnect_barrier.wait().await;
-    info!("S3: all {S3_SUBSCRIBERS} subscribers reconnected");
 
     // Wait for applies to finish.
     let _ = apply_handle.await;
