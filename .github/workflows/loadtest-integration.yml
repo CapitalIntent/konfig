@@ -113,7 +113,7 @@ jobs:
             fi
           done
 
-      - name: Apply konfig Deployment (force IfNotPresent for locally-loaded image)
+      - name: Apply konfig Deployment (force IfNotPresent, disable TLS for loadtest)
         # `infra/konfig/deployment.yaml` references `kasa288/konfig:latest`
         # (post-PR-#31 sha-pinning rewrites this to a short SHA on main pushes,
         # but on PR branches we apply with the `:latest` tag that
@@ -128,9 +128,23 @@ jobs:
         # on ubuntu-latest) so revision 1 already has the correct policy —
         # avoiding the patch-then-second-revision race window where the old
         # ReplicaSet pulls from the registry before being torn down.
+        #
+        # Also disable mTLS for the loadtest gate: cert-manager is not
+        # installed in the kind cluster, and the in-cluster konfig-loadtest
+        # Job binary does not yet speak mTLS (Phase 6 wires that client-side).
+        # The `--tls=false` opt-out is explicitly reserved for test harnesses
+        # per the Phase 8 design — production deploys keep TLS on by default.
+        # We strip the four --tls* args, replace with --tls=false, and drop
+        # the konfig-tls volume mount + Secret volume so the pod can start
+        # without cert-manager.
         run: |
-          yq '(.spec.template.spec.containers[] | select(.name == "konfig")).imagePullPolicy = "IfNotPresent"' \
-            infra/konfig/deployment.yaml \
+          yq '
+            (.spec.template.spec.containers[] | select(.name == "konfig")).imagePullPolicy = "IfNotPresent"
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).args |=
+                ([.[] | select(test("^--tls") | not)] + ["--tls=false"])
+            | del(.spec.template.spec.containers[] | select(.name == "konfig").volumeMounts[] | select(.name == "konfig-tls"))
+            | del(.spec.template.spec.volumes[] | select(.name == "konfig-tls"))
+          ' infra/konfig/deployment.yaml \
           | kubectl apply -f -
 
       - name: Wait for konfig Deployment + Pod Ready (cache populated)
