@@ -55,6 +55,7 @@ konfig is a **CP system**:
 | ConfigMaps via `ClusterRole` | Non-sensitive; cross-namespace access acceptable |
 | Single broadcast channel per namespace | O(1) fan-out regardless of subscriber count; 100 subscribers at p50 < 2 ms on Docker Desktop |
 | Stateless Deployment (not StatefulSet) | Watch stream is rebuilt on restart from etcd; no persistent state |
+| Raw YAML + Kustomize, not Helm | One topology, no drift between two parallel sources — see [ADR-0001](adr/0001-deployment-raw-yaml.md) |
 
 ## RBAC model
 

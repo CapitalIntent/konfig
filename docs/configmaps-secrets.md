@@ -75,21 +75,27 @@ secret = client.get_secret("production", "api-creds")
 api_key = secret.data["api_key"].decode()
 ```
 
-## Enable in Helm
+## Enable
+
+ConfigMaps across all namespaces — add `--watch-configmaps` to the Deployment
+args:
 
 ```bash
-# ConfigMaps across all namespaces
-helm upgrade konfig ./chart --set konfig.watchConfigMaps=true
-
-# Secrets in specific namespaces
-helm upgrade konfig ./chart \
-  --set-string "konfig.secretNamespaces=production,staging"
-
-# Both
-helm upgrade konfig ./chart \
-  --set konfig.watchConfigMaps=true \
-  --set-string "konfig.secretNamespaces=production,staging"
+kubectl -n konfig-system patch deployment konfig --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--watch-configmaps"}]'
 ```
+
+Secrets in specific namespaces — extend `--secret-namespaces` (index `4` is
+the position in `infra/konfig/deployment.yaml`; verify with `kubectl -n
+konfig-system get deploy konfig -o jsonpath='{.spec.template.spec.containers[0].args}'`):
+
+```bash
+kubectl -n konfig-system patch deployment konfig --type=json \
+  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args/4","value":"--secret-namespaces=konfig-system,production,staging"}]'
+```
+
+For HA / production deploys, encode both as Kustomize patches in your overlay
+instead of imperative `kubectl patch`.
 
 > Config CRD and ConfigMap caches are unified. Secrets use a separate cache.
 > Use `Get`/`GetAll` for configs and ConfigMaps; `GetSecret`/`GetAllSecrets` for Secrets.

@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Install: kubectl apply -k infra/konfig/
+#
+# Order matters for the first apply on a fresh cluster: the CRD must be
+# established before the Deployment starts, otherwise the kube-rs watcher
+# panics at startup. Kustomize applies in the order listed; for the bootstrap
+# case run `kubectl apply -k infra/konfig/ --server-side` twice or split:
+#   kubectl apply -f infra/konfig/crd.yaml
+#   kubectl wait --for=condition=Established crd/configs.konfig.io --timeout=30s
+#   kubectl apply -k infra/konfig/
+
+resources:
+  - namespace.yaml
+  - crd.yaml
+  - serviceaccount.yaml
+  - clusterrole.yaml
+  - clusterrolebinding.yaml
+  - clusterrole-configmap.yaml
+  - clusterrolebinding-configmap.yaml
+  - role-secret.yaml
+  - service.yaml
+  - configmap.yaml
+  - pdb.yaml
+  - deployment.yaml
+  - networkpolicy.yaml
+
+# example.yaml is illustrative — apply it separately:
+#   kubectl apply -f infra/konfig/example.yaml

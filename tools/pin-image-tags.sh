@@ -7,7 +7,6 @@
 # Updates every `kasa288/konfig*:...` reference in:
 #   - infra/konfig/deployment.yaml
 #   - infra/konfig-loadtest/job.yaml
-#   - chart/values.yaml      (default `image.tag`)
 #
 # The CI workflow (.github/workflows/publish-images.yml) calls this after
 # pushing the multi-arch images so the committed-back manifests pin to the
@@ -44,10 +43,6 @@ PATTERN='s|(kasa288/konfig[a-z-]*):[A-Za-z0-9._-]+|\1:'"$SHA"'|g'
 sed_inplace -E "$PATTERN" infra/konfig/deployment.yaml
 sed_inplace -E "$PATTERN" infra/konfig-loadtest/job.yaml
 
-# Chart's image tag default lives in values.yaml under image.tag.
-sed_inplace -E "s|^( *tag: ).*|\1\"$SHA\"|" chart/values.yaml
-
 echo "Pinned image tags to $SHA in:"
 echo "  infra/konfig/deployment.yaml"
 echo "  infra/konfig-loadtest/job.yaml"
-echo "  chart/values.yaml"

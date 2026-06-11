@@ -49,7 +49,11 @@ No operator action required unless the partition exceeds your alerting threshold
 
 ## Upgrading
 
-The CRD is in `chart/crds/` — Helm 3 applies it automatically before templates on `helm upgrade`.
+```bash
+kubectl apply -f infra/konfig/crd.yaml
+kubectl wait --for=condition=Established crd/configs.konfig.io --timeout=30s
+kubectl apply -k infra/konfig/
+```
 
 After upgrading, verify existing resources still pass validation:
 
@@ -60,10 +64,10 @@ kubectl get configs.konfig.io --all-namespaces
 ## Uninstalling
 
 ```bash
-helm uninstall konfig -n konfig-system
+kubectl delete -k infra/konfig/
 
-# CRDs are NOT deleted by Helm (to protect data).
-# Delete manually only when you are sure no consumers depend on them:
+# The CRD is NOT deleted by the above (kustomize prune is not enabled).
+# Delete it manually only when you are sure no consumers depend on it:
 kubectl delete crd configs.konfig.io
 ```
 

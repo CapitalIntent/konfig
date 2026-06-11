@@ -7,13 +7,21 @@ receives changes within milliseconds via a gRPC stream. No restarts required.
 ## Install
 
 ```bash
-helm install konfig ./chart \
-  --namespace konfig-system \
-  --create-namespace
+# CRD first — the kube-rs watcher panics at startup if the CRD is not Established.
+kubectl apply -f infra/konfig/crd.yaml
+kubectl wait --for=condition=Established crd/configs.konfig.io --timeout=30s
+
+# Then the rest.
+kubectl apply -k infra/konfig/
 ```
 
-Requires Kubernetes ≥ 1.29 and Helm 3.12+. See [Configuration](docs/configuration.md)
-for all values.
+Requires Kubernetes ≥ 1.29. See [Configuration](docs/configuration.md) for the
+ConfigMap + Deployment args that drive runtime behaviour.
+
+Deployment topology lives in `infra/konfig/`. Customize via a Kustomize
+overlay in your own repo that references this directory as a base — do not
+fork the manifests. See [ADR-0001](docs/adr/0001-deployment-raw-yaml.md) for
+why there is no Helm chart.
 
 ## Quick start
 
@@ -25,10 +33,12 @@ Label it once:
 kubectl label configmap my-app-config konfig.io/managed=true -n default
 ```
 
-Enable ConfigMap watching (off by default):
+Enable ConfigMap watching by adding `--watch-configmaps` to the Deployment
+args (default off):
 
 ```bash
-helm upgrade konfig ./chart --set konfig.watchConfigMaps=true
+kubectl -n konfig-system patch deployment konfig --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--watch-configmaps"}]'
 ```
 
 Subscribe from your app:
@@ -43,12 +53,13 @@ for event in client.subscribe("default", names=["my-app-config"]):
 
 ### Option 2 — use your existing Secret
 
-Label it and enable Secret watching for that namespace:
+Label it and add the namespace to the Deployment's `--secret-namespaces` arg:
 
 ```bash
 kubectl label secret my-app-secret konfig.io/managed=true -n production
-helm upgrade konfig ./chart \
-  --set-string "konfig.secretNamespaces=production"
+
+kubectl -n konfig-system set env deployment/konfig \
+  KONFIG_SECRET_NAMESPACES=konfig-system,production
 ```
 
 Read from your app:
@@ -102,11 +113,12 @@ konfig server is down.
 ## Docs
 
 - [Architecture](docs/architecture.md) — how it works, consistency model, design decisions
-- [Configuration](docs/configuration.md) — all Helm values with descriptions
+- [Configuration](docs/configuration.md) — ConfigMap keys, Deployment args, runtime overrides
 - [Consumer integration](docs/consumer-integration.md) — gRPC client usage, error handling, reconnect
 - [Existing ConfigMaps and Secrets](docs/configmaps-secrets.md) — opt-in label, data formats, migration
 - [konfig-cli reference](docs/cli.md) — all commands and flags
 - [Runbook](docs/runbook.md) — health checks, metrics, partition recovery, upgrading
+- [ADR-0001](docs/adr/0001-deployment-raw-yaml.md) — why raw YAML, not Helm
 
 ## Development
 
