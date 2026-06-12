@@ -17,12 +17,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-// Per-OS allocator pin (memory rule: jemalloc on Linux pods, snmalloc on macOS dev).
-#[cfg(target_os = "linux")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-#[cfg(target_os = "macos")]
+// Gated on the `snmalloc` feature. Bazel `konfig_bin` enables it and pulls
+// the crate from `@snmalloc//snmalloc-rs:snmalloc_rs` (jayakasadev fork).
+// Cargo builds without the feature fall back to the System allocator.
+#[cfg(feature = "snmalloc")]
 #[global_allocator]
 static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 

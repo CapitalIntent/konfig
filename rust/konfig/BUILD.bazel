@@ -70,6 +70,9 @@ rust_library(
 rust_binary(
     name = "konfig_bin",
     srcs = ["main.rs"],
+    # Enables the `#[global_allocator]` block in `main.rs` and pairs with
+    # the `@snmalloc//snmalloc-rs:snmalloc_rs` dep below.
+    crate_features = ["snmalloc"],
     stamp = 1,
     tags = ["konfig", "rust"],
     visibility = ["//visibility:public"],
@@ -84,11 +87,9 @@ rust_binary(
         "@konfig_crates//:tonic-health",
         "@konfig_crates//:tracing",
         "@konfig_crates//:tracing-subscriber",
-    ] + select({
-        # Per-OS allocator pin (memory rule).
-        "@platforms//os:linux": ["@konfig_crates//:tikv-jemallocator"],
-        "@platforms//os:macos": ["@konfig_crates//:snmalloc-rs"],
-    }),
+        # Default allocator (all OS): snmalloc from jayakasadev fork.
+        "@snmalloc//snmalloc-rs:snmalloc_rs",
+    ],
 )
 
 # Opt-in profiling binary — same sources as `:konfig_bin` but built with
@@ -98,7 +99,10 @@ rust_binary(
 rust_binary(
     name = "konfig_bin_profiling",
     srcs = ["main.rs"],
-    crate_features = ["profiling"],
+    crate_features = [
+        "profiling",
+        "snmalloc",
+    ],
     stamp = 1,
     tags = ["konfig", "rust", "profiling"],
     visibility = ["//visibility:public"],
@@ -115,11 +119,9 @@ rust_binary(
         "@konfig_crates//:tonic-health",
         "@konfig_crates//:tracing",
         "@konfig_crates//:tracing-subscriber",
-    ] + select({
-        # Per-OS allocator pin (memory rule).
-        "@platforms//os:linux": ["@konfig_crates//:tikv-jemallocator"],
-        "@platforms//os:macos": ["@konfig_crates//:snmalloc-rs"],
-    }),
+        # Default allocator (all OS): snmalloc from jayakasadev fork.
+        "@snmalloc//snmalloc-rs:snmalloc_rs",
+    ],
 )
 
 rust_test(

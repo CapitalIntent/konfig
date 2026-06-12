@@ -247,15 +247,16 @@ crate.annotation(
     rustc_flags = ["--cfg=tokio_unstable"],
 )
 
-# Per-OS allocator pin (memory rule). Declared as platform-specific via
-# `target_compatible_with` semantics in crate_universe; konfig_bin selects
-# them on the corresponding @platforms//os: target.
-crate.spec(
-    package = "tikv-jemallocator",
-    version = "0.6",
-)
-crate.spec(
-    package = "snmalloc-rs",
-    version = "0.3",
-)
 use_repo(crate, "konfig_crates")
+
+##################################
+# snmalloc (default allocator, all OS) — pulled from jayakasadev fork.
+# Bazel consumers depend on @snmalloc//snmalloc-rs:snmalloc_rs; Cargo
+# users get the same crate via [patch.crates-io] in rust/konfig/Cargo.toml.
+##################################
+bazel_dep(name = "snmalloc", version = "0")
+git_override(
+    module_name = "snmalloc",
+    remote = "https://github.com/jayakasadev/snmalloc.git",
+    commit = "abae9a883431597cc1805d1ae1d427d4cea849ca",
+)
