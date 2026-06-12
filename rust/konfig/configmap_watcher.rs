@@ -87,13 +87,7 @@ fn parse_configmap(cm: &ConfigMap, namespace: &str) -> Option<ConfigSnapshot> {
             if k == "schema_version" {
                 continue;
             }
-            let val = v
-                .parse::<i64>()
-                .map(Value::from)
-                .or_else(|_| v.parse::<f64>().map(|f| serde_json::json!(f)))
-                .or_else(|_| v.parse::<bool>().map(Value::from))
-                .unwrap_or_else(|_| Value::String(v.clone()));
-            map.insert(k.clone(), val);
+            map.insert(k.clone(), crate::value_parse::scalar_value(v));
         }
         Value::Object(map)
     };

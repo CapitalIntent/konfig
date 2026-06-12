@@ -21,6 +21,7 @@ pub mod secret_cache;
 pub mod secret_watcher;
 pub mod sync_util;
 pub mod types;
+pub mod value_parse;
 pub mod watcher;
 
 // Generated protobuf types (via build.rs + tonic-build).

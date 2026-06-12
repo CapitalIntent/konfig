@@ -35,19 +35,14 @@ pub async fn import_configmap(
         .unwrap_or(1);
 
     // Convert string map to JSON object, excluding schema_version (promoted to top level).
+    // Uses the shared `crate::value_parse::scalar_value` cascade so import
+    // and the live ConfigMap watcher stay in lock-step on type coercion.
     let mut content = serde_json::Map::new();
     for (k, v) in &data {
         if k == "schema_version" {
             continue;
         }
-        // Try to parse as number or bool; fall back to string.
-        let val = v
-            .parse::<i64>()
-            .map(serde_json::Value::from)
-            .or_else(|_| v.parse::<f64>().map(|f| json!(f)))
-            .or_else(|_| v.parse::<bool>().map(serde_json::Value::from))
-            .unwrap_or_else(|_| serde_json::Value::String(v.clone()));
-        content.insert(k.clone(), val);
+        content.insert(k.clone(), crate::value_parse::scalar_value(v));
     }
 
     let patch_body = json!({
