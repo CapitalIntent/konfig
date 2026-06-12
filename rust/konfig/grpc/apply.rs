@@ -131,6 +131,32 @@ pub(crate) async fn fetch_current_schema_version(
     }
 }
 
+/// Decision returned by `classify_patch_error` so the (un-mockable) kube I/O
+/// loop stays thin and the (pure) decision logic is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PatchRetryDecision {
+    /// 409 Conflict and we still have budget — sleep `delay_ms` then retry.
+    RetryAfter { delay_ms: u64 },
+    /// 409 Conflict and we are out of retry budget — `Status::aborted`.
+    AbortRetriesExhausted,
+    /// Anything else — `Status::unavailable`.
+    Unavailable,
+}
+
+/// Pure classifier — no I/O, no logging. Tests cover every branch by
+/// constructing `kube::Error::Api(ErrorResponse { code, ... })` directly.
+pub(crate) fn classify_patch_error(err: &kube::Error, attempt: usize) -> PatchRetryDecision {
+    match err {
+        kube::Error::Api(ae) if ae.code == 409 && attempt < RETRY_DELAYS_MS.len() => {
+            PatchRetryDecision::RetryAfter {
+                delay_ms: RETRY_DELAYS_MS[attempt],
+            }
+        }
+        kube::Error::Api(ae) if ae.code == 409 => PatchRetryDecision::AbortRetriesExhausted,
+        _ => PatchRetryDecision::Unavailable,
+    }
+}
+
 async fn patch_with_retry(
     api: &Api<DynamicObject>,
     name: &str,
@@ -142,20 +168,22 @@ async fn patch_with_retry(
     loop {
         match api.patch(name, &pp, &Patch::Apply(body.clone())).await {
             Ok(obj) => return Ok(obj.metadata.resource_version.unwrap_or_default()),
-            Err(kube::Error::Api(ref ae)) if ae.code == 409 && attempt < RETRY_DELAYS_MS.len() => {
-                let delay = RETRY_DELAYS_MS[attempt];
-                warn!(
-                    attempt = attempt + 1,
-                    delay_ms = delay,
-                    "Apply: 409 Conflict — retrying"
-                );
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-                attempt += 1;
-            }
-            Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
-                return Err(Status::aborted("409 Conflict — exceeded max retries"));
-            }
-            Err(e) => return Err(Status::unavailable(format!("kube patch error: {e}"))),
+            Err(e) => match classify_patch_error(&e, attempt) {
+                PatchRetryDecision::RetryAfter { delay_ms } => {
+                    warn!(
+                        attempt = attempt + 1,
+                        delay_ms, "Apply: 409 Conflict — retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                }
+                PatchRetryDecision::AbortRetriesExhausted => {
+                    return Err(Status::aborted("409 Conflict — exceeded max retries"));
+                }
+                PatchRetryDecision::Unavailable => {
+                    return Err(Status::unavailable(format!("kube patch error: {e}")));
+                }
+            },
         }
     }
 }
@@ -191,5 +219,56 @@ mod tests {
         let spec: ConfigSpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(spec.schema_version, 3);
         assert_eq!(spec.content["key"], "value");
+    }
+
+    // ── classify_patch_error: all 4 branches ────────────────────────────────
+
+    fn api_err(code: u16) -> kube::Error {
+        kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "synthetic".to_string(),
+            reason: "synthetic".to_string(),
+            code,
+        })
+    }
+
+    #[test]
+    fn classify_409_with_budget_left_retries() {
+        let d = classify_patch_error(&api_err(409), 0);
+        assert_eq!(d, PatchRetryDecision::RetryAfter { delay_ms: 100 });
+        let d = classify_patch_error(&api_err(409), 1);
+        assert_eq!(d, PatchRetryDecision::RetryAfter { delay_ms: 200 });
+    }
+
+    #[test]
+    fn classify_409_at_budget_exhausts() {
+        // RETRY_DELAYS_MS has 2 entries — `attempt == 2` is the exhausted path.
+        let d = classify_patch_error(&api_err(409), RETRY_DELAYS_MS.len());
+        assert_eq!(d, PatchRetryDecision::AbortRetriesExhausted);
+        // Going further never re-enters retry mode either.
+        let d = classify_patch_error(&api_err(409), RETRY_DELAYS_MS.len() + 5);
+        assert_eq!(d, PatchRetryDecision::AbortRetriesExhausted);
+    }
+
+    #[test]
+    fn classify_non_409_api_error_is_unavailable() {
+        for code in [400u16, 403, 404, 410, 500, 503] {
+            let d = classify_patch_error(&api_err(code), 0);
+            assert_eq!(
+                d,
+                PatchRetryDecision::Unavailable,
+                "code {code} should be Unavailable",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_non_api_error_is_unavailable() {
+        // Build a non-Api kube::Error by going through serde — `LinesCodecError`
+        // isn't exposed, but `kube::Error::SerdeError` is.
+        let serde_err = serde_json::from_str::<serde_json::Value>("{[}").unwrap_err();
+        let err = kube::Error::SerdeError(serde_err);
+        let d = classify_patch_error(&err, 0);
+        assert_eq!(d, PatchRetryDecision::Unavailable);
     }
 }

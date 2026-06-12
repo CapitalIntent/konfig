@@ -142,29 +142,57 @@ async fn patch_secret_with_retry(
             Ok(s) => {
                 return Ok(s.metadata.resource_version.unwrap_or_default());
             }
-            Err(kube::Error::Api(ref ae)) if ae.code == 409 && attempt < RETRY_DELAYS_MS.len() => {
-                let delay_ms = RETRY_DELAYS_MS[attempt];
-                warn!(
-                    attempt = attempt + 1,
-                    delay_ms, "ApplySecret: 409 — retrying"
-                );
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                attempt += 1;
-            }
-            Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
-                return Err(Status::aborted(
-                    "ApplySecret: 409 Conflict — exceeded max retries",
-                ));
-            }
-            Err(e) => {
-                return Err(Status::unavailable(format!("kube patch error: {e}")));
+            Err(e) => match classify_secret_patch_error(&e, attempt) {
+                SecretPatchRetryDecision::RetryAfter { delay_ms } => {
+                    warn!(
+                        attempt = attempt + 1,
+                        delay_ms, "ApplySecret: 409 — retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                }
+                SecretPatchRetryDecision::AbortRetriesExhausted => {
+                    return Err(Status::aborted(
+                        "ApplySecret: 409 Conflict — exceeded max retries",
+                    ));
+                }
+                SecretPatchRetryDecision::Unavailable => {
+                    return Err(Status::unavailable(format!("kube patch error: {e}")));
+                }
+            },
+        }
+    }
+}
+
+/// Pure classifier mirroring `apply::classify_patch_error` but with the
+/// Secret patch's exhausted-error message. Kept in this module so the
+/// Status text and the decision logic stay co-located.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SecretPatchRetryDecision {
+    RetryAfter { delay_ms: u64 },
+    AbortRetriesExhausted,
+    Unavailable,
+}
+
+pub(crate) fn classify_secret_patch_error(
+    err: &kube::Error,
+    attempt: usize,
+) -> SecretPatchRetryDecision {
+    match err {
+        kube::Error::Api(ae) if ae.code == 409 && attempt < RETRY_DELAYS_MS.len() => {
+            SecretPatchRetryDecision::RetryAfter {
+                delay_ms: RETRY_DELAYS_MS[attempt],
             }
         }
+        kube::Error::Api(ae) if ae.code == 409 => SecretPatchRetryDecision::AbortRetriesExhausted,
+        _ => SecretPatchRetryDecision::Unavailable,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn schema_version_downgrade_logic() {
         // incoming <= current → reject
@@ -175,5 +203,39 @@ mod tests {
         assert!(incoming <= current);
         let incoming = 6u32;
         assert!(incoming > current); // accept
+    }
+
+    fn api_err(code: u16) -> kube::Error {
+        kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "synthetic".to_string(),
+            reason: "synthetic".to_string(),
+            code,
+        })
+    }
+
+    #[test]
+    fn classify_409_with_budget_left_retries() {
+        let d = classify_secret_patch_error(&api_err(409), 0);
+        assert_eq!(d, SecretPatchRetryDecision::RetryAfter { delay_ms: 100 });
+        let d = classify_secret_patch_error(&api_err(409), 1);
+        assert_eq!(d, SecretPatchRetryDecision::RetryAfter { delay_ms: 200 });
+    }
+
+    #[test]
+    fn classify_409_at_budget_exhausts() {
+        let d = classify_secret_patch_error(&api_err(409), RETRY_DELAYS_MS.len());
+        assert_eq!(d, SecretPatchRetryDecision::AbortRetriesExhausted);
+    }
+
+    #[test]
+    fn classify_non_409_api_error_is_unavailable() {
+        for code in [403u16, 404, 410, 500, 503] {
+            assert_eq!(
+                classify_secret_patch_error(&api_err(code), 0),
+                SecretPatchRetryDecision::Unavailable,
+                "code {code} should be Unavailable",
+            );
+        }
     }
 }

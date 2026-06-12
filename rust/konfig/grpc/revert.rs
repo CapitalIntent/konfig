@@ -112,30 +112,42 @@ async fn fetch_historical_spec(
                         "Config {name} not found at resource_version={resource_version}"
                     ))
                 })?;
-
-            let spec_value = obj
-                .data
-                .get("spec")
-                .cloned()
-                .ok_or_else(|| Status::data_loss("historical object missing spec"))?;
-
-            serde_json::from_value::<ConfigSpec>(spec_value)
-                .map_err(|e| Status::data_loss(format!("invalid historical spec: {e}")))
+            parse_historical_obj(&obj)
         }
-        Err(kube::Error::Api(ref ae)) if ae.code == 410 => {
+        Err(e) => Err(map_list_error(&e, name, resource_version)),
+    }
+}
+
+/// Extract `spec` from a historical `DynamicObject` and deserialize into
+/// `ConfigSpec`. Pure — directly unit-testable.
+pub(crate) fn parse_historical_obj(obj: &DynamicObject) -> Result<ConfigSpec, Status> {
+    let spec_value = obj
+        .data
+        .get("spec")
+        .cloned()
+        .ok_or_else(|| Status::data_loss("historical object missing spec"))?;
+    serde_json::from_value::<ConfigSpec>(spec_value)
+        .map_err(|e| Status::data_loss(format!("invalid historical spec: {e}")))
+}
+
+/// Pure classifier for a kube `list()` failure on the historical-RV fetch.
+/// Emits the operator-facing `warn!` for 410 (etcd compaction) inline.
+pub(crate) fn map_list_error(err: &kube::Error, name: &str, resource_version: &str) -> Status {
+    match err {
+        kube::Error::Api(ae) if ae.code == 410 => {
             warn!(
                 resource_version,
-                "Revert: requested RV has been compacted by etcd"
+                "Revert: requested RV has been compacted by etcd",
             );
-            Err(Status::failed_precondition(format!(
+            Status::failed_precondition(format!(
                 "resource_version {resource_version} is no longer available (etcd compaction); \
                  K8s only retains history within the compaction window"
-            )))
+            ))
         }
-        Err(kube::Error::Api(ref ae)) if ae.code == 404 => Err(Status::not_found(format!(
+        kube::Error::Api(ae) if ae.code == 404 => Status::not_found(format!(
             "Config {name} not found at resource_version={resource_version}"
-        ))),
-        Err(e) => Err(Status::unavailable(format!("kube list error: {e}"))),
+        )),
+        _ => Status::unavailable(format!("kube list error: {err}")),
     }
 }
 
@@ -173,5 +185,83 @@ mod tests {
         let spec: ConfigSpec = serde_json::from_value(raw).expect("parse");
         assert_eq!(spec.schema_version, 3);
         assert_eq!(spec.content["k"], "v");
+    }
+
+    fn api_err(code: u16) -> kube::Error {
+        kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "synthetic".to_string(),
+            reason: "synthetic".to_string(),
+            code,
+        })
+    }
+
+    /// 410 Gone (etcd compaction) → FAILED_PRECONDITION with the
+    /// compaction-window explanation in the message.
+    #[test]
+    fn map_list_error_410_is_failed_precondition() {
+        let s = map_list_error(&api_err(410), "cfg", "12345");
+        assert_eq!(s.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            s.message().contains("compaction"),
+            "expected message to mention etcd compaction; got {:?}",
+            s.message(),
+        );
+    }
+
+    /// 404 → NOT_FOUND naming the missing RV.
+    #[test]
+    fn map_list_error_404_is_not_found() {
+        let s = map_list_error(&api_err(404), "cfg", "999");
+        assert_eq!(s.code(), tonic::Code::NotFound);
+        assert!(s.message().contains("cfg"));
+        assert!(s.message().contains("999"));
+    }
+
+    /// Everything else → UNAVAILABLE.
+    #[test]
+    fn map_list_error_other_is_unavailable() {
+        for code in [400u16, 403, 500, 503] {
+            assert_eq!(
+                map_list_error(&api_err(code), "cfg", "1").code(),
+                tonic::Code::Unavailable,
+                "code {code} should be Unavailable",
+            );
+        }
+    }
+
+    fn make_obj(spec: Option<serde_json::Value>) -> DynamicObject {
+        let mut obj = DynamicObject::new("cfg", &crate::watcher::config_api_resource());
+        obj.metadata.name = Some("cfg".to_string());
+        obj.data = match spec {
+            Some(s) => json!({ "spec": s }),
+            None => json!({}),
+        };
+        obj
+    }
+
+    #[test]
+    fn parse_historical_obj_ok_for_valid_spec() {
+        let obj = make_obj(Some(json!({"schema_version": 7, "content": {"k": "v"}})));
+        let spec = parse_historical_obj(&obj).expect("must parse");
+        assert_eq!(spec.schema_version, 7);
+        assert_eq!(spec.content["k"], "v");
+    }
+
+    #[test]
+    fn parse_historical_obj_data_loss_when_spec_missing() {
+        let obj = make_obj(None);
+        let s = parse_historical_obj(&obj).unwrap_err();
+        assert_eq!(s.code(), tonic::Code::DataLoss);
+        assert!(s.message().contains("missing spec"));
+    }
+
+    #[test]
+    fn parse_historical_obj_data_loss_when_spec_malformed() {
+        // schema_version typed as string — fails the u32 deserialise.
+        let obj = make_obj(Some(json!({"schema_version": "wrong-type", "content": {}})));
+        let s = parse_historical_obj(&obj).unwrap_err();
+        assert_eq!(s.code(), tonic::Code::DataLoss);
+        assert!(s.message().contains("invalid historical spec"));
     }
 }
