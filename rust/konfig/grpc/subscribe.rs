@@ -69,9 +69,18 @@ const BROADCAST_CAPACITY: usize = 1_024;
 pub const REPLAY_BUFFER_SIZE: usize = 1_000;
 
 /// One entry in the per-namespace replay buffer.
+///
+/// `resource_version_u64` is the parsed numeric value of `resource_version`,
+/// pre-computed at push time so resume lookups can binary-search the buffer
+/// in O(log N) instead of the previous O(N) `position()` scan, and so the
+/// post-snapshot race-window filter does not re-parse every entry per
+/// reconnect.  Entries with a non-numeric `resource_version` are dropped at
+/// push time — kube always emits decimal-string RVs, so a non-numeric value
+/// means the upstream object is malformed and we never want to serve it.
 #[derive(Clone)]
 pub struct ReplayEntry {
     pub resource_version: String,
+    pub resource_version_u64: u64,
     pub event: Arc<ConfigEvent>,
 }
 
@@ -80,13 +89,25 @@ pub struct ReplayEntry {
 pub type ReplayBuffer = Arc<Mutex<VecDeque<ReplayEntry>>>;
 
 /// Push `event` into `buf`, evicting the oldest entry when the buffer is full.
+///
+/// `resource_version` is parsed as `u64` at push time so resume can
+/// binary-search the buffer.  An unparseable RV (kube only emits decimal
+/// strings, so this signals upstream malformation) is logged and dropped.
 fn push_replay(buf: &ReplayBuffer, resource_version: String, event: Arc<ConfigEvent>) {
+    let Ok(resource_version_u64) = resource_version.parse::<u64>() else {
+        warn!(
+            resource_version = %resource_version,
+            "Dropping replay entry with non-numeric resource_version",
+        );
+        return;
+    };
     let mut guard = buf.lock().expect("replay buffer poisoned");
     if guard.len() >= REPLAY_BUFFER_SIZE {
         guard.pop_front();
     }
     guard.push_back(ReplayEntry {
         resource_version,
+        resource_version_u64,
         event,
     });
 }
@@ -213,7 +234,27 @@ async fn run_namespace_watcher(
     let wc = kube_watcher::Config::default();
     let mut stream = kube_watch_stream(api, wc).boxed();
 
-    while let Some(event) = stream.try_next().await.unwrap_or(None) {
+    loop {
+        let event = match stream.try_next().await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                // Clean stream end — emit a `warn!` (not `info!`) so the
+                // outer caller's restart shows up in log search; the
+                // `get_or_create_broadcast` retry will rebuild the watcher
+                // when a fresh subscriber arrives.
+                warn!(namespace = %namespace, "Namespace watcher stream ended cleanly");
+                break;
+            }
+            Err(e) => {
+                // Previously `try_next().await.unwrap_or(None)` collapsed
+                // every stream error into an indistinguishable clean exit,
+                // hiding intermittent k8s API failures.  Surface them so
+                // the operator can correlate against API-server logs.
+                warn!(namespace = %namespace, "Namespace watcher stream error: {e}");
+                break;
+            }
+        };
+
         // Stamp `apply_observed_at` as soon as we have an Apply/Delete event in
         // hand — this is the closest point in the watcher loop to "the apply
         // landed in kube and our watch read it" from a user-perceived latency
@@ -381,12 +422,42 @@ async fn resume_from_buffer(
     tx: mpsc::Sender<Result<ConfigEvent, Status>>,
     drain_notify: Arc<Notify>,
 ) {
+    // Parse the resume RV once.  An empty string falls through as a buffer
+    // miss (used by fresh subscribers); a non-empty non-numeric value is an
+    // operator / client bug and is also treated as a miss so the subscriber
+    // gets a clean cache snapshot instead of silently subscribing at RV 0
+    // (which previously matched every entry in the post-snapshot filter).
+    let resume_rv_u64: Option<u64> = if resume_rv.is_empty() {
+        None
+    } else {
+        match resume_rv.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                warn!(
+                    namespace = %namespace,
+                    resume_rv = %resume_rv,
+                    "Resume: non-numeric resource_version — treating as buffer miss",
+                );
+                None
+            }
+        }
+    };
+
     // Collect the replay slice under the lock, then release before doing I/O.
-    // Also record whether resume_rv was found in the buffer.
     // Arc clones are reference-count increments only — no deep copy of event data.
+    //
+    // The buffer is appended FIFO by `push_replay`, and kube emits events in
+    // monotonically increasing resource_version order, so the buffer is
+    // already sorted by `resource_version_u64`.  Use `binary_search_by_key`
+    // (O(log N)) instead of the prior O(N) `position()` scan.
     let (replay_slice, found_in_buffer): (Vec<Arc<ConfigEvent>>, bool) = {
         let guard = replay_buf.lock().expect("replay buffer poisoned");
-        match guard.iter().position(|e| e.resource_version == resume_rv) {
+        let lookup = resume_rv_u64.and_then(|target| {
+            guard
+                .binary_search_by_key(&target, |e| e.resource_version_u64)
+                .ok()
+        });
+        match lookup {
             Some(idx) => {
                 let slice: Vec<Arc<ConfigEvent>> = guard
                     .iter()
@@ -422,48 +493,40 @@ async fn resume_from_buffer(
             "Resume: RV not in buffer — sending full cache snapshot"
         );
         let mut snapshot_events: Vec<ConfigEvent> = Vec::with_capacity(snapshots.len());
+        // Track the max snapshot RV inline so we don't re-walk + re-parse the
+        // snapshot list to compute it after the send phase.
+        let mut max_snapshot_rv: u64 = 0;
         for snap in &snapshots {
-            let event = ConfigEvent {
+            // K8s emits decimal-string RVs; non-numeric here means we already
+            // logged earlier (cache loaded a malformed CR).  Skip safely.
+            if let Ok(rv) = snap.resource_version.parse::<u64>()
+                && rv > max_snapshot_rv
+            {
+                max_snapshot_rv = rv;
+            }
+            snapshot_events.push(ConfigEvent {
                 event_type: EventType::Snapshot as i32,
                 config: Some(snapshot_to_proto(snap)),
-            };
-            snapshot_events.push(event);
+            });
         }
         crate::metrics::SUBSCRIBE_SNAPSHOT_EMITTED
             .with_label_values(&["config"])
             .inc();
-        for event in &snapshot_events {
-            match tx.try_send(Ok(event.clone())) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    warn!("Subscriber too slow during snapshot — disconnecting");
-                    let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
-                    return;
-                }
-                Err(TrySendError::Closed(_)) => {
-                    info!("Subscriber disconnected during snapshot");
-                    return;
-                }
+        for event in snapshot_events {
+            if try_send_or_disconnect(&tx, event, "snapshot").is_break() {
+                return;
             }
         }
 
         // Close the race window: replay buffer events that arrived after the
         // snapshot was taken but before this subscriber joins the broadcast.
-        // K8s resource versions are u64 decimal strings — parse as u64 for
-        // correct numeric comparison (string comparison is wrong for large values).
-        let max_snapshot_rv: u64 = snapshot_events
-            .iter()
-            .filter_map(|e| e.config.as_ref())
-            .map(|c| c.resource_version.parse::<u64>().unwrap_or(0))
-            .max()
-            .unwrap_or(0);
-
-        // Collect Arc clones under the lock, then release before any await.
+        // RVs are pre-parsed in `ReplayEntry::resource_version_u64`, so this
+        // filter is O(N) loads with no string→u64 work.
         let post_snapshot_events: Vec<Arc<ConfigEvent>> = {
             let guard = replay_buf.lock().expect("replay buffer poisoned");
             guard
                 .iter()
-                .filter(|e| e.resource_version.parse::<u64>().unwrap_or(0) > max_snapshot_rv)
+                .filter(|e| e.resource_version_u64 > max_snapshot_rv)
                 .map(|e| Arc::clone(&e.event))
                 .collect()
         }; // mutex released here
@@ -475,9 +538,12 @@ async fn resume_from_buffer(
         );
 
         for event in post_snapshot_events {
-            // Deref Arc to clone the ConfigEvent for the mpsc send.
-            if tx.send(Ok((*event).clone())).await.is_err() {
-                return; // subscriber disconnected
+            // Use try_send + disconnect-on-Full, matching the buffer-hit path
+            // below.  The previous blocking `.send().await` here was the
+            // last remaining starvation vector: a slow subscriber could hold
+            // the spawned resume task indefinitely.
+            if try_send_or_disconnect(&tx, (*event).clone(), "post-snapshot").is_break() {
+                return;
             }
         }
     } else {
@@ -485,23 +551,41 @@ async fn resume_from_buffer(
         // Arc clones collected above are dereferenced here to produce ConfigEvent
         // values for the per-subscriber mpsc — no extra serialisation.
         for event in replay_slice {
-            match tx.try_send(Ok((*event).clone())) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    warn!("Subscriber too slow during replay — disconnecting");
-                    let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
-                    return;
-                }
-                Err(TrySendError::Closed(_)) => {
-                    info!("Subscriber disconnected during replay");
-                    return;
-                }
+            if try_send_or_disconnect(&tx, (*event).clone(), "replay").is_break() {
+                return;
             }
         }
     }
 
     // Join the live broadcast for future events.
     bridge_broadcast(bcast_rx, tx, namespace, drain_notify).await;
+}
+
+/// Single try_send + disconnect-on-Full helper shared by the resume snapshot,
+/// post-snapshot race-window, and replay-hit paths.  Returns
+/// `ControlFlow::Break(())` when the caller should stop sending and exit the
+/// resume task.
+///
+/// Replaces a previous mix of `try_send` and blocking `.send().await` —
+/// blocking sends starved the spawned resume task when a subscriber was
+/// slow, instead of disconnecting them cleanly.
+fn try_send_or_disconnect(
+    tx: &mpsc::Sender<Result<ConfigEvent, Status>>,
+    event: ConfigEvent,
+    stage: &'static str,
+) -> std::ops::ControlFlow<()> {
+    match tx.try_send(Ok(event)) {
+        Ok(()) => std::ops::ControlFlow::Continue(()),
+        Err(TrySendError::Full(_)) => {
+            warn!(stage, "Subscriber too slow during resume — disconnecting");
+            let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
+            std::ops::ControlFlow::Break(())
+        }
+        Err(TrySendError::Closed(_)) => {
+            info!(stage, "Subscriber disconnected during resume");
+            std::ops::ControlFlow::Break(())
+        }
+    }
 }
 
 /// Forward events from the namespace broadcast to a single subscriber's mpsc.
@@ -677,7 +761,7 @@ mod tests {
             name: "cfg".into(),
             namespace: "default".into(),
             schema_version: 1,
-            resource_version: "rv-001".into(),
+            resource_version: "001".into(),
             ..Default::default()
         });
         assert!(cache.is_populated());
@@ -691,26 +775,19 @@ mod tests {
         for i in 0..REPLAY_BUFFER_SIZE {
             push_replay(
                 &buf,
-                format!("rv-{i}"),
-                Arc::new(make_event(&format!("rv-{i}"), i as u32)),
+                format!("{i}"),
+                Arc::new(make_event(&format!("{i}"), i as u32)),
             );
         }
         // Buffer is exactly full — oldest is rv-0.
-        assert_eq!(
-            buf.lock().unwrap().front().unwrap().resource_version,
-            "rv-0"
-        );
+        assert_eq!(buf.lock().unwrap().front().unwrap().resource_version, "0");
 
         // Push one more — rv-0 must be evicted.
-        push_replay(
-            &buf,
-            "rv-overflow".into(),
-            Arc::new(make_event("rv-overflow", 9999)),
-        );
+        push_replay(&buf, "9999".into(), Arc::new(make_event("9999", 9999)));
         let guard = buf.lock().unwrap();
         assert_eq!(guard.len(), REPLAY_BUFFER_SIZE);
-        assert_eq!(guard.front().unwrap().resource_version, "rv-1");
-        assert_eq!(guard.back().unwrap().resource_version, "rv-overflow");
+        assert_eq!(guard.front().unwrap().resource_version, "1");
+        assert_eq!(guard.back().unwrap().resource_version, "9999");
     }
 
     // ── Async: reconnect with valid resume_rv receives only missed events ────
@@ -719,14 +796,8 @@ mod tests {
     async fn resume_buffer_hit_receives_only_missed_events() {
         // Buffer contains rv-1 .. rv-5.  Client reconnects at rv-2 →
         // should receive rv-3, rv-4, rv-5 (schema versions 3, 4, 5).
-        let replay_buf = make_replay_buf(&[
-            ("rv-1", 1),
-            ("rv-2", 2),
-            ("rv-3", 3),
-            ("rv-4", 4),
-            ("rv-5", 5),
-        ]);
-        let cache = make_cache("default", &[("cfg", "rv-5", 5)]);
+        let replay_buf = make_replay_buf(&[("1", 1), ("2", 2), ("3", 3), ("4", 4), ("5", 5)]);
+        let cache = make_cache("default", &[("cfg", "5", 5)]);
         let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
         let (tx, mut rx) = mpsc::channel(64);
 
@@ -734,7 +805,7 @@ mod tests {
         drop(bcast_tx);
 
         tokio::spawn(resume_from_buffer(
-            "rv-2".into(),
+            "2".into(),
             replay_buf,
             cache,
             "default".into(),
@@ -760,16 +831,16 @@ mod tests {
     #[tokio::test]
     async fn resume_buffer_miss_sends_full_cache_snapshot() {
         // Buffer contains rv-10 .. rv-12.  Client reconnects at rv-1 (not in buffer).
-        let replay_buf = make_replay_buf(&[("rv-10", 10), ("rv-11", 11), ("rv-12", 12)]);
+        let replay_buf = make_replay_buf(&[("10", 10), ("11", 11), ("12", 12)]);
         // Cache has two entries.
-        let cache = make_cache("default", &[("cfg-a", "rv-13", 13), ("cfg-b", "rv-14", 14)]);
+        let cache = make_cache("default", &[("cfg-a", "13", 13), ("cfg-b", "14", 14)]);
         let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
         let (tx, mut rx) = mpsc::channel(64);
 
         drop(bcast_tx); // let bridge_broadcast exit cleanly
 
         tokio::spawn(resume_from_buffer(
-            "rv-1".into(), // stale — not in buffer
+            "1".into(), // stale — not in buffer
             replay_buf,
             cache,
             "default".into(),
@@ -801,8 +872,8 @@ mod tests {
 
     #[tokio::test]
     async fn ten_simultaneous_reconnects_produce_zero_new_watchers() {
-        let replay_buf = make_replay_buf(&[("rv-1", 1), ("rv-2", 2), ("rv-3", 3)]);
-        let cache = make_cache("default", &[("cfg", "rv-3", 3)]);
+        let replay_buf = make_replay_buf(&[("1", 1), ("2", 2), ("3", 3)]);
+        let cache = make_cache("default", &[("cfg", "3", 3)]);
 
         // Pre-create a broadcast channel to simulate an already-running watcher.
         let (bcast_tx, _initial_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
@@ -818,7 +889,7 @@ mod tests {
                 // resume_from_buffer — no kube watch, no new watcher spawned.
                 // bcast_rx will see RecvError::Closed once all senders are gone.
                 resume_from_buffer(
-                    "rv-1".into(),
+                    "1".into(),
                     replay_buf_clone,
                     cache_clone,
                     "default".into(),
@@ -848,8 +919,8 @@ mod tests {
 
     #[tokio::test]
     async fn resume_at_latest_rv_joins_live_broadcast() {
-        let replay_buf = make_replay_buf(&[("rv-5", 5)]);
-        let cache = make_cache("default", &[("cfg", "rv-5", 5)]);
+        let replay_buf = make_replay_buf(&[("5", 5)]);
+        let cache = make_cache("default", &[("cfg", "5", 5)]);
         let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
         let (tx, mut rx) = mpsc::channel(64);
 
@@ -857,12 +928,12 @@ mod tests {
         tokio::spawn(async move {
             // Send one live event after a short delay.
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            let _ = bcast_tx_clone.send(make_frame(make_event("rv-6", 6)));
+            let _ = bcast_tx_clone.send(make_frame(make_event("6", 6)));
             drop(bcast_tx_clone);
         });
 
         tokio::spawn(resume_from_buffer(
-            "rv-5".into(), // latest — nothing to replay
+            "5".into(), // latest — nothing to replay
             replay_buf,
             cache,
             "default".into(),
@@ -966,7 +1037,7 @@ mod tests {
             handles.push(h);
         }
 
-        let event = Arc::new(make_event("rv-1", 1));
+        let event = Arc::new(make_event("1", 1));
         // Record the pointer to the *inner* ConfigEvent allocation before sending.
         let expected_inner_ptr = Arc::as_ptr(&event) as usize;
 
@@ -1130,7 +1201,7 @@ mod tests {
         // Broadcast 5 frames with the send timestamp slightly in the past so
         // each `sent_at.elapsed()` is strictly positive.
         for i in 0..5 {
-            let event = Arc::new(make_event(&format!("rv-{i}"), i as u32 + 1));
+            let event = Arc::new(make_event(&format!("{i}"), i as u32 + 1));
             let frame = Arc::new(BroadcastFrame {
                 sent_at: Instant::now() - Duration::from_millis(1),
                 event,
@@ -1191,7 +1262,7 @@ mod tests {
         ));
 
         for i in 0..3 {
-            let event = Arc::new(make_event(&format!("rv-{i}"), i as u32 + 1));
+            let event = Arc::new(make_event(&format!("{i}"), i as u32 + 1));
             let frame = Arc::new(BroadcastFrame {
                 sent_at: Instant::now() - Duration::from_millis(1),
                 event,
@@ -1238,7 +1309,7 @@ mod tests {
         // Mirror the watcher hot path: stamp apply_observed_at, build the
         // ConfigEvent, observe its encoded size, then observe the stage delta.
         let apply_observed_at = Instant::now();
-        let config_event = Arc::new(make_event("rv-42", 42));
+        let config_event = Arc::new(make_event("42", 42));
         let encoded_len = config_event.encoded_len();
         H2_DATA_FRAME_BYTES.observe(encoded_len as f64);
         let sent_at = Instant::now();
@@ -1289,5 +1360,93 @@ mod tests {
             None => {} // expected: clean close
             Some(other) => panic!("expected clean close (None); got {other:?}"),
         }
+    }
+
+    // ── Unit: push_replay rejects non-numeric resource_version ──────────────
+
+    /// kube only emits decimal-string RVs. If a non-numeric RV ever reaches
+    /// the replay buffer the upstream object is malformed; we want to drop
+    /// it at push time so resume's binary search never sees an entry it
+    /// cannot order. Regression test for the `resource_version.parse::<u64>`
+    /// gate added in PR C.
+    #[test]
+    fn push_replay_drops_non_numeric_rv() {
+        let buf: ReplayBuffer = Arc::new(Mutex::new(VecDeque::new()));
+        push_replay(&buf, "not-a-number".into(), Arc::new(make_event("0", 0)));
+        assert!(
+            buf.lock().unwrap().is_empty(),
+            "push_replay must drop entries with non-numeric resource_version",
+        );
+        // Valid RV still pushes.
+        push_replay(&buf, "42".into(), Arc::new(make_event("42", 42)));
+        assert_eq!(buf.lock().unwrap().len(), 1);
+    }
+
+    // ── Async: resume with non-numeric RV falls back to snapshot path ───────
+
+    /// A malformed resume_resource_version (e.g. a client sending a
+    /// non-numeric value, or a corrupted client-side store) must not
+    /// silently match every buffer entry (the old `unwrap_or(0)` bug).
+    /// PR C drops the value and routes through the snapshot path so the
+    /// subscriber gets a clean known-good state.
+    #[tokio::test]
+    async fn resume_with_non_numeric_rv_takes_snapshot_path() {
+        let replay_buf = make_replay_buf(&[("10", 10), ("11", 11)]);
+        let cache = make_cache("default", &[("cfg-a", "12", 12)]);
+        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
+        let (tx, mut rx) = mpsc::channel(64);
+        drop(bcast_tx); // let bridge exit cleanly
+
+        tokio::spawn(resume_from_buffer(
+            "not-a-number".into(),
+            replay_buf,
+            cache,
+            "default".into(),
+            bcast_rx,
+            tx,
+            Arc::new(Notify::new()),
+        ));
+
+        // Must receive a single SNAPSHOT event for cfg-a (sv 12), not a
+        // replay of the buffer entries.
+        let mut events: Vec<(i32, u32)> = Vec::new();
+        while let Some(Ok(ev)) = rx.recv().await {
+            let sv = ev.config.as_ref().map(|c| c.schema_version).unwrap_or(0);
+            events.push((ev.event_type, sv));
+        }
+        assert_eq!(events, vec![(EventType::Snapshot as i32, 12)]);
+    }
+
+    // ── Unit: try_send_or_disconnect contract ───────────────────────────────
+
+    #[test]
+    fn try_send_or_disconnect_signals_break_on_full() {
+        // Capacity = 2 so the helper can also enqueue its
+        // RESOURCE_EXHAUSTED error frame after the data slot fills.  In
+        // production CHANNEL_CAPACITY is 256, so the error frame always
+        // fits unless the subscriber is jammed beyond that — in which
+        // case dropping the error is also acceptable.
+        let (tx, mut rx) = mpsc::channel::<Result<ConfigEvent, Status>>(2);
+        // Fill both slots.
+        tx.try_send(Ok(make_event("0", 0))).unwrap();
+        tx.try_send(Ok(make_event("1", 1))).unwrap();
+
+        let outcome = try_send_or_disconnect(&tx, make_event("2", 2), "test");
+        assert!(matches!(outcome, std::ops::ControlFlow::Break(())));
+
+        // Drain: must see two data frames then nothing further (the helper
+        // tried to enqueue an error but the channel was already full — that
+        // is correct fallback behaviour).
+        assert!(rx.try_recv().unwrap().is_ok());
+        assert!(rx.try_recv().unwrap().is_ok());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn try_send_or_disconnect_signals_break_on_closed() {
+        let (tx, rx) = mpsc::channel::<Result<ConfigEvent, Status>>(1);
+        drop(rx); // close receiver
+        let outcome = try_send_or_disconnect(&tx, make_event("0", 0), "test");
+        assert!(matches!(outcome, std::ops::ControlFlow::Break(())));
     }
 }
