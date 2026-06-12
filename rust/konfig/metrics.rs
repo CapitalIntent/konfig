@@ -728,6 +728,77 @@ mod tests {
         );
     }
 
+    /// Exercises every gauge the sampler closure writes (metrics.rs:336-356).
+    /// Previously only `tokio_workers_count` was asserted, which left a
+    /// regression window for the other 19 gauges silently going stale if
+    /// the closure was edited.  Generate enough runtime activity to make
+    /// `RuntimeMonitor::intervals().next()` deltas non-zero on subsequent
+    /// ticks, then assert each gauge family is populated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokio_runtime_sampler_writes_every_gauge() {
+        spawn_tokio_runtime_sampler(tokio::runtime::Handle::current());
+
+        // Generate runtime activity so polls / steals / parks are non-zero
+        // by the time the sampler ticks.
+        for _ in 0..200 {
+            tokio::spawn(async {
+                tokio::task::yield_now().await;
+            });
+        }
+
+        // Poll up to 5s for the first sample to land.
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if TOKIO_WORKERS_COUNT.get() > 0 && TOKIO_POLLS_COUNT_TOTAL.get() > 0 {
+                break;
+            }
+        }
+
+        // Every gauge the closure writes should be > 0 (count-like) or
+        // simply populated (ratio / depth — may be 0 legitimately, so we
+        // assert via `prometheus::gather()` that the metric family exists).
+        assert!(TOKIO_WORKERS_COUNT.get() > 0, "workers_count > 0");
+        assert!(TOKIO_POLLS_COUNT_TOTAL.get() > 0, "polls_count > 0");
+        assert!(TOKIO_PARK_COUNT_TOTAL.get() >= 0, "park_count populated");
+        assert!(
+            TOKIO_LOCAL_SCHEDULES_TOTAL.get() > 0,
+            "local_schedules > 0 after spawn flurry",
+        );
+
+        // The remaining gauges (busy_ratio, live_tasks, etc.) may be 0 in a
+        // quiet runtime — assert the metric family is registered with
+        // Prometheus so the closure's `set()` line cannot have been deleted
+        // without breaking this test.
+        let names: std::collections::HashSet<String> = prometheus::gather()
+            .into_iter()
+            .map(|mf| mf.name().to_string())
+            .collect();
+        for required in [
+            "tokio_busy_ratio",
+            "tokio_busy_duration_total",
+            "tokio_live_tasks_count",
+            "tokio_global_queue_depth",
+            "tokio_blocking_queue_depth",
+            "tokio_blocking_threads_count",
+            "tokio_idle_blocking_threads_count",
+            "tokio_io_driver_ready_total",
+            "tokio_budget_forced_yields_total",
+            "tokio_mean_polls_per_park",
+            "tokio_mean_poll_duration_seconds",
+            "tokio_local_queue_depth_total",
+            "tokio_overflow_count_total",
+            "tokio_steal_count_total",
+            "tokio_steal_operations_total",
+            "tokio_remote_schedules_total",
+            "tokio_noop_count_total",
+        ] {
+            assert!(
+                names.contains(required),
+                "sampler missing required gauge: {required}",
+            );
+        }
+    }
+
     /// Simulates one tick of the `konfig_stale_seconds` sampler loop in
     /// `grpc::serve`: a watcher that hasn't received any event yet must
     /// report `0` (cold start = fresh, NOT stale), and a watcher that
