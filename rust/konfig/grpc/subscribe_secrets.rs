@@ -214,24 +214,22 @@ async fn run_raw_watch(
                 let Some(result) = next else { break };
                 match result {
                     Ok(WatchEvent::Added(secret)) | Ok(WatchEvent::Modified(secret)) => {
-                        let ns = secret
+                        let ns: &str = secret
                             .metadata
                             .namespace
                             .as_deref()
-                            .unwrap_or(&namespace)
-                            .to_string();
-                        if !emit_to_mpsc(&tx, EventType::Modified as i32, &secret, &ns).await {
+                            .unwrap_or(&namespace);
+                        if !emit_to_mpsc(&tx, EventType::Modified as i32, &secret, ns).await {
                             break;
                         }
                     }
                     Ok(WatchEvent::Deleted(secret)) => {
-                        let ns = secret
+                        let ns: &str = secret
                             .metadata
                             .namespace
                             .as_deref()
-                            .unwrap_or(&namespace)
-                            .to_string();
-                        if !emit_to_mpsc(&tx, EventType::Deleted as i32, &secret, &ns).await {
+                            .unwrap_or(&namespace);
+                        if !emit_to_mpsc(&tx, EventType::Deleted as i32, &secret, ns).await {
                             break;
                         }
                     }
