@@ -26,6 +26,12 @@ profiling = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
 # default; when enabled, set `RUST_CONSOLE=1` at runtime to install the
 # console gRPC server on the default port (6669) for `tokio-console` clients.
 tokio_console = ["dep:console-subscriber"]
+# Installs snmalloc as the global allocator. The Bazel `rust_binary` for
+# `konfig_bin` sets this feature and pulls the actual crate from
+# `@snmalloc//snmalloc-rs:snmalloc_rs` (jayakasadev/snmalloc fork). Cargo
+# builds do not enable it by default — `cargo build` falls back to the
+# System allocator, which is fine for clippy/test loops.
+snmalloc = ["dep:snmalloc-rs"]
 
 [[test]]
 name = "integration_watcher"
@@ -84,12 +90,11 @@ pyroscope_pprofrs = {version = "0.2", optional = true}
 # client to the running process.
 console-subscriber = {version = "0.4", optional = true}
 
-# Per-OS allocator pin (memory rule: jemalloc on Linux pods, snmalloc on macOS dev).
-[target.'cfg(target_os = "linux")'.dependencies]
-tikv-jemallocator = "0.6"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-snmalloc-rs = "0.3"
+# Optional — pulled in by the `snmalloc` feature. Bazel builds enable the
+# feature and replace this dep with `@snmalloc//snmalloc-rs:snmalloc_rs`
+# at link time. Cargo invocations that need snmalloc (e.g. local profiling
+# runs) can opt in via `cargo build --features snmalloc`.
+snmalloc-rs = {version = "0.3", optional = true}
 
 [build-dependencies]
 tonic-prost-build = {workspace = true}
