@@ -129,7 +129,13 @@ pub struct KonfigServer {
 impl KonfigServer {
     /// Returns `true` once the server has begun draining (post-SIGTERM).
     pub fn is_draining(&self) -> bool {
-        self.draining.load(Ordering::SeqCst)
+        // The drain flag is a standalone boolean — no piggy-backed data
+        // ordering required.  Acquire pairs with the Release store in
+        // `begin_drain` so a thread that observes `true` is guaranteed to
+        // see any writes that happened-before the drain commenced.
+        // Acquire is strictly cheaper than the previous SeqCst on every
+        // RPC entry (`check_drain` calls this load on every gRPC handler).
+        self.draining.load(Ordering::Acquire)
     }
 
     /// Flip the drain flag and wake every active Subscribe stream.  Idempotent
@@ -137,7 +143,7 @@ impl KonfigServer {
     pub fn begin_drain(&self) {
         if self
             .draining
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             info!("Drain begun — closing active subscribers and rejecting new RPCs");
@@ -155,7 +161,10 @@ impl KonfigServer {
 /// Helper used at the top of each RPC handler — returns an `Err(Status::unavailable)`
 /// when the server is draining so the client reconnects to a healthy pod.
 fn check_drain(draining: &AtomicBool) -> Result<(), Status> {
-    if draining.load(Ordering::SeqCst) {
+    // Acquire-only load — pairs with the Release/AcqRel writer in
+    // `begin_drain`/serve.  Runs on every RPC entry, so the cheaper
+    // ordering matters.
+    if draining.load(Ordering::Acquire) {
         Err(Status::unavailable("server draining"))
     } else {
         Ok(())
@@ -361,7 +370,10 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         };
         signal.await;
         info!("Shutdown signal received — beginning drain");
-        draining.store(true, Ordering::SeqCst);
+        // Release store — pairs with Acquire loads in `is_draining` /
+        // `check_drain` so subsequent Subscribe readers see a consistent
+        // happens-before edge with the drain commencement.
+        draining.store(true, Ordering::Release);
         drain_notify.notify_waiters();
 
         if let Some(reporter) = health_reporter_for_drain {
@@ -498,7 +510,7 @@ mod tests {
     fn check_drain_returns_unavailable_when_draining() {
         let flag = AtomicBool::new(false);
         assert!(check_drain(&flag).is_ok());
-        flag.store(true, Ordering::SeqCst);
+        flag.store(true, Ordering::Release);
         let err = check_drain(&flag).expect_err("must error when draining");
         assert_eq!(err.code(), tonic::Code::Unavailable);
     }

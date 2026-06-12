@@ -318,13 +318,36 @@ async fn serve_metrics(addr: SocketAddr) {
         .expect("metrics server error");
 }
 
-async fn metrics_handler() -> String {
+async fn metrics_handler() -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use prometheus::Encoder;
+
     let encoder = prometheus::TextEncoder::new();
     let metric_families = prometheus::gather();
     let mut buf = Vec::new();
-    encoder
-        .encode(&metric_families, &mut buf)
-        .unwrap_or_default();
-    String::from_utf8(buf).unwrap_or_default()
+    if let Err(e) = encoder.encode(&metric_families, &mut buf) {
+        // Previously `.unwrap_or_default()` swallowed encoder errors and
+        // returned an empty 200 OK body, which Prometheus would happily
+        // accept as "no metrics" — masking the failure entirely. Surface
+        // it as a 500 so scrape alerts (absent-target / failed-scrape)
+        // fire on the operator side.
+        tracing::warn!("metrics encode failed: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("metrics encode failed: {e}"),
+        )
+            .into_response();
+    }
+    match String::from_utf8(buf) {
+        Ok(body) => body.into_response(),
+        Err(e) => {
+            tracing::warn!("metrics output not UTF-8: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "metrics output not UTF-8".to_string(),
+            )
+                .into_response()
+        }
+    }
 }

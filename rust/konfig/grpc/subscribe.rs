@@ -373,10 +373,32 @@ pub fn gc_tick(
         .collect();
 
     for ns in to_gc {
+        // Close the TOCTOU window between the `receiver_count == 0` check
+        // above and removal here: a subscriber could have called
+        // `get_or_create_broadcast` (and `sender.subscribe()`) in the
+        // interim, bumping receiver_count > 0.  If we removed unconditionally
+        // we'd orphan that subscriber's stream (the sender we drop is the
+        // one their `Receiver` was subscribed to).
+        //
+        // `DashMap::remove_if` re-checks the predicate under the per-shard
+        // write lock — receiver_count is read atomically inside the lock,
+        // so no new subscriber can race in.  If it now sees a non-zero
+        // count, the entry stays and we skip the rest of the teardown.
+        let removed = namespace_broadcasts
+            .remove_if(&ns, |_k, v| v.receiver_count() == 0)
+            .is_some();
+        if !removed {
+            debug!(
+                namespace = %ns,
+                "GC: namespace re-subscribed between scan and remove — skipping",
+            );
+            // Reset the idle timer so the next sweep re-evaluates from now.
+            idle_since.remove(&ns);
+            continue;
+        }
         if let Some((_, handle)) = watcher_handles.remove(&ns) {
             handle.abort();
         }
-        namespace_broadcasts.remove(&ns);
         namespace_replay_buffers.remove(&ns);
         idle_since.remove(&ns);
         info!(namespace = %ns, "GC: removed idle namespace watcher");
