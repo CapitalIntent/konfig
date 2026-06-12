@@ -40,6 +40,10 @@ pub async fn handle_get(
     result
 }
 
+/// Per-RPC mpsc buffer for `GetAll` / `GetAllSecrets`. Sized to a typical
+/// per-namespace snapshot count so the spawned encoder rarely blocks.
+const GET_ALL_CHANNEL_CAPACITY: usize = 256;
+
 pub async fn handle_get_all(
     cache: Arc<ConfigCache>,
     req: GetAllRequest,
@@ -47,12 +51,18 @@ pub async fn handle_get_all(
     debug!(namespace = %req.namespace, "GetAll RPC");
     let started = Instant::now();
 
-    let (tx, rx) = mpsc::channel(16);
+    let (tx, rx) = mpsc::channel(GET_ALL_CHANNEL_CAPACITY);
     let entries = cache.all_in_namespace(&req.namespace);
 
     tokio::spawn(async move {
         for snap in entries {
-            let _ = tx.send(Ok(snapshot_to_proto(&snap))).await;
+            // tx.send returns Err(_) only when the receiver is dropped (client
+            // disconnected). Stop iterating instead of pointlessly serialising
+            // the rest of the namespace into a dead channel.
+            if tx.send(Ok(snapshot_to_proto(&snap))).await.is_err() {
+                debug!("GetAll: subscriber disconnected — stopping early");
+                return;
+            }
         }
     });
 
@@ -167,5 +177,46 @@ mod tests {
         let resp = handle_get_all(cache, req).await.expect("must succeed");
         let mut stream = resp.into_inner();
         assert!(stream.next().await.is_none());
+    }
+
+    /// Dropping the receiver mid-stream must short-circuit the spawned
+    /// encoder rather than serialising the rest of the namespace into a
+    /// dead channel. Regression test for the prior `let _ = tx.send(...)`
+    /// fire-and-forget pattern.
+    #[tokio::test]
+    async fn get_all_stops_when_receiver_dropped() {
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        // Capacity = 256 in the handler, so to make the test deterministic
+        // we count *receiver drop visibility*, not channel occupancy: load
+        // far more than capacity, then drop the receiver and confirm the
+        // task ends rather than spinning forever.
+        for i in 0..1_000u32 {
+            cache.update(ConfigSnapshot {
+                namespace: "ns".into(),
+                name: format!("cfg-{i}"),
+                schema_version: i,
+                content: json!({}),
+                resource_version: format!("rv-{i}"),
+                ..Default::default()
+            });
+        }
+        let req = GetAllRequest {
+            namespace: "ns".into(),
+        };
+        let resp = handle_get_all(cache, req).await.expect("must succeed");
+        let stream = resp.into_inner();
+        // Immediately drop without polling — receiver gone → next `tx.send`
+        // returns Err and the spawned task must exit on its own.
+        drop(stream);
+        // If the encoder ignored the close, we'd see a stuck `JoinHandle`
+        // here; instead, `yield_now` is enough for the spawn to observe the
+        // drop and return. Use a generous timeout to keep the test stable.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("encoder must terminate after receiver dropped");
     }
 }

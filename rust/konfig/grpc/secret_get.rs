@@ -24,18 +24,27 @@ pub async fn handle_get_secret(
     Ok(Response::new(secret_snapshot_to_proto(&snap)))
 }
 
+/// Per-RPC mpsc buffer for `GetAllSecrets`. Mirrors `get::GET_ALL_CHANNEL_CAPACITY`
+/// — sized to a typical per-namespace snapshot count.
+const GET_ALL_SECRETS_CHANNEL_CAPACITY: usize = 256;
+
 pub async fn handle_get_all_secrets(
     cache: Arc<SecretCache>,
     req: GetAllSecretsRequest,
 ) -> Result<Response<ReceiverStream<Result<SecretResponse, Status>>>, Status> {
     debug!(namespace = %req.namespace, "GetAllSecrets RPC");
 
-    let (tx, rx) = mpsc::channel(16);
+    let (tx, rx) = mpsc::channel(GET_ALL_SECRETS_CHANNEL_CAPACITY);
     let entries = cache.all_in_namespace(&req.namespace);
 
     tokio::spawn(async move {
         for snap in entries {
-            let _ = tx.send(Ok(secret_snapshot_to_proto(&snap))).await;
+            // Stop encoding once the client has disconnected — see
+            // `handle_get_all` in `grpc/get.rs` for rationale.
+            if tx.send(Ok(secret_snapshot_to_proto(&snap))).await.is_err() {
+                debug!("GetAllSecrets: subscriber disconnected — stopping early");
+                return;
+            }
         }
     });
 
@@ -46,7 +55,24 @@ pub fn secret_snapshot_to_proto(snap: &SecretSnapshot) -> SecretResponse {
     let data_map: std::collections::HashMap<&str, &str> = snap
         .data
         .iter()
-        .map(|(k, v)| (k.as_str(), std::str::from_utf8(v).unwrap_or("")))
+        .map(|(k, v)| {
+            // kube secret data is base64 on the wire — `secret_watcher::parse_secret`
+            // re-encodes to base64 into `Bytes`, so every byte here is ASCII (a
+            // strict UTF-8 subset). If `from_utf8` ever fails the upstream bytes
+            // were tampered with somehow; surface "" + a `warn!` rather than
+            // silently shipping garbled JSON.
+            match std::str::from_utf8(v) {
+                Ok(s) => (k.as_str(), s),
+                Err(e) => {
+                    tracing::warn!(
+                        key = %k,
+                        err = %e,
+                        "secret value is not valid UTF-8 — emitting empty string",
+                    );
+                    (k.as_str(), "")
+                }
+            }
+        })
         .collect();
     SecretResponse {
         namespace: snap.namespace.clone(),
