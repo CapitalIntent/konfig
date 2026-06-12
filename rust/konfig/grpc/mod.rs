@@ -387,6 +387,25 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
 
 // ── Shared helper ─────────────────────────────────────────────────────────────
 
+/// Apply ±25% jitter to a base retry delay (ms) to break lockstep retries
+/// across N clients racing on the same Config / Secret resourceVersion.
+///
+/// Uses `SystemTime` nanos for the jitter entropy source — fine for retry
+/// spread, no extra dep, no shared state.
+pub(crate) fn jittered_retry_ms(base_ms: u64) -> u64 {
+    if base_ms == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    let jitter_range = base_ms / 4; // ±25%
+    let span = 2u64.saturating_mul(jitter_range).saturating_add(1);
+    let offset = nanos % span;
+    base_ms.saturating_sub(jitter_range).saturating_add(offset)
+}
+
 /// Build a `Config` proto message from a `ConfigSnapshot`.
 pub(crate) fn snapshot_to_proto(snap: &crate::types::ConfigSnapshot) -> Config {
     Config {
@@ -406,6 +425,26 @@ pub(crate) fn snapshot_to_proto(snap: &crate::types::ConfigSnapshot) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Jitter must keep the output within ±25 % of the input base.
+    #[test]
+    fn jittered_retry_ms_stays_within_band() {
+        let base = 200u64;
+        // 16 samples to give the SystemTime entropy a chance to vary.
+        for _ in 0..16 {
+            let v = jittered_retry_ms(base);
+            assert!(
+                (150..=250).contains(&v),
+                "jittered_retry_ms({base}) = {v} outside ±25 % band",
+            );
+            std::thread::sleep(std::time::Duration::from_micros(1));
+        }
+    }
+
+    #[test]
+    fn jittered_retry_ms_zero_passthrough() {
+        assert_eq!(jittered_retry_ms(0), 0);
+    }
 
     /// `is_draining` flips after `begin_drain` and the notify wakes waiters.
     #[tokio::test]

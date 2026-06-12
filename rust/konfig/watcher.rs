@@ -28,8 +28,17 @@ pub const PLURAL: &str = "configs";
 /// Used by the watcher loop; exported for unit tests.
 pub const BACKOFF_STEPS_SECS: &[u64] = &[1, 2, 4, 8, 16, 30];
 
+// Compile-time guarantee that the `.last().unwrap()` below cannot trip.
+// If anyone ever edits `BACKOFF_STEPS_SECS` to be empty, the build fails
+// here instead of at runtime.
+const _BACKOFF_STEPS_NON_EMPTY: () = assert!(
+    !BACKOFF_STEPS_SECS.is_empty(),
+    "BACKOFF_STEPS_SECS must contain at least one entry",
+);
+
 /// Compute the next reconnect delay given the attempt index (0-based).
-/// Caps at the last element in `BACKOFF_STEPS_SECS`.
+/// Caps at the last element in `BACKOFF_STEPS_SECS` — guaranteed non-empty
+/// by `_BACKOFF_STEPS_NON_EMPTY` above.
 pub fn backoff_delay(attempt: usize) -> std::time::Duration {
     let secs = BACKOFF_STEPS_SECS
         .get(attempt)

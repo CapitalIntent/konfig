@@ -16,6 +16,7 @@ use serde_json::json;
 use tonic::{Response, Status};
 use tracing::{debug, info, warn};
 
+use crate::grpc::jittered_retry_ms;
 use crate::metrics::{APPLY_DURATION, APPLY_TOTAL};
 use crate::proto::{ApplyRequest, ApplyResponse};
 use crate::types::ConfigSpec;
@@ -143,7 +144,9 @@ async fn patch_with_retry(
         match api.patch(name, &pp, &Patch::Apply(body.clone())).await {
             Ok(obj) => return Ok(obj.metadata.resource_version.unwrap_or_default()),
             Err(kube::Error::Api(ref ae)) if ae.code == 409 && attempt < RETRY_DELAYS_MS.len() => {
-                let delay = RETRY_DELAYS_MS[attempt];
+                // Add ±25% jitter to avoid lockstep retries from N clients
+                // hitting the same Config racing on the same resourceVersion.
+                let delay = jittered_retry_ms(RETRY_DELAYS_MS[attempt]);
                 warn!(
                     attempt = attempt + 1,
                     delay_ms = delay,

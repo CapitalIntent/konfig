@@ -143,7 +143,8 @@ async fn patch_secret_with_retry(
                 return Ok(s.metadata.resource_version.unwrap_or_default());
             }
             Err(kube::Error::Api(ref ae)) if ae.code == 409 && attempt < RETRY_DELAYS_MS.len() => {
-                let delay_ms = RETRY_DELAYS_MS[attempt];
+                // ±25% jitter — see `crate::grpc::jittered_retry_ms`.
+                let delay_ms = crate::grpc::jittered_retry_ms(RETRY_DELAYS_MS[attempt]);
                 warn!(
                     attempt = attempt + 1,
                     delay_ms, "ApplySecret: 409 — retrying"

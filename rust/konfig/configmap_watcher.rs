@@ -70,7 +70,17 @@ fn parse_configmap(cm: &ConfigMap, namespace: &str) -> Option<ConfigSnapshot> {
     // If data["content"] key exists, parse it as JSON/YAML.
     // Otherwise treat the entire data map (minus schema_version) as content.
     let content = if let Some(content_str) = data.get("content") {
-        serde_yaml::from_str(content_str).unwrap_or(Value::Object(Default::default()))
+        match serde_yaml::from_str(content_str) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    name = %name,
+                    err = %e,
+                    "ConfigMap content key failed to parse as YAML — defaulting to empty object",
+                );
+                Value::Object(Default::default())
+            }
+        }
     } else {
         let mut map = serde_json::Map::new();
         for (k, v) in data {
