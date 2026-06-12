@@ -22,6 +22,7 @@ use crate::metrics::{LastEventAt, LastEventAtMap, last_event_at_for};
 use crate::proto::{SecretEvent, secret_event::EventType};
 use crate::secret_cache::SecretCache;
 use crate::types::SecretSnapshot;
+use crate::watcher::run_with_reconnect;
 
 pub const MANAGED_LABEL: &str = "konfig.io/managed";
 pub const SCHEMA_VERSION_ANNOTATION: &str = "konfig.io/schema-version";
@@ -61,12 +62,26 @@ impl SecretWatcher {
             let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
             broadcasts.insert(namespace.clone(), tx.clone());
             let last_event_at = last_event_at_for(&last_event_at_map, &namespace);
+            // Outer reconnect loop — `run_namespace_watcher` returns on clean
+            // stream end (Ok) or any stream error (Err). Either way, retry
+            // with backoff so a single failure does not silently kill secret
+            // delivery for the namespace.
             tokio::spawn(async move {
-                if let Err(e) =
-                    run_namespace_watcher(client, cache, namespace.clone(), tx, last_event_at).await
-                {
-                    warn!(namespace = %namespace, "Secret watcher error: {e}");
-                }
+                run_with_reconnect(
+                    "secret",
+                    namespace.clone(),
+                    || {},
+                    |_attempt| {
+                        run_namespace_watcher(
+                            client.clone(),
+                            Arc::clone(&cache),
+                            namespace.clone(),
+                            tx.clone(),
+                            Arc::clone(&last_event_at),
+                        )
+                    },
+                )
+                .await;
             });
         }
     }

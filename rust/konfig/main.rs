@@ -41,7 +41,7 @@ use konfig::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
 use konfig::secret_cache::SecretCache;
 use konfig::secret_watcher::SecretWatcher;
 use konfig::types::ConfigSnapshot;
-use konfig::watcher::Watcher;
+use konfig::watcher::{Watcher, run_with_reconnect};
 #[cfg(feature = "profiling")]
 use pyroscope::PyroscopeAgent;
 #[cfg(feature = "profiling")]
@@ -191,17 +191,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Per-namespace freshness map shared by all watchers and the konfig_stale_seconds sampler.
     let last_event_at_map: LastEventAtMap = Arc::new(DashMap::new());
 
-    // Spawn Config CRD watcher.
+    // Spawn Config CRD watcher.  The inner `Watcher::run` already retries on
+    // transient stream errors; `run_with_reconnect` covers the cases where
+    // `Watcher::run` returns at all (clean stream end or terminal Err) so a
+    // single failure can never crash the process.
     let watcher_cache = Arc::clone(&cache);
     let watcher_client = kube_client.clone();
     let namespace = args.namespace.clone();
     let name = args.name.clone();
     let watcher_last_event_at = last_event_at_for(&last_event_at_map, &namespace);
     tokio::spawn(async move {
-        Watcher::new(watcher_client)
-            .run(watcher_cache, namespace, name, watcher_last_event_at)
-            .await
-            .expect("watcher exited with error");
+        let on_disconnect = {
+            let cache = Arc::clone(&watcher_cache);
+            move || cache.mark_all_stale()
+        };
+        run_with_reconnect("config", namespace.clone(), on_disconnect, |_attempt| {
+            Watcher::new(watcher_client.clone()).run(
+                Arc::clone(&watcher_cache),
+                namespace.clone(),
+                name.clone(),
+                Arc::clone(&watcher_last_event_at),
+            )
+        })
+        .await;
     });
 
     // Spawn Secret namespace watchers.  Each watcher feeds both the SecretCache

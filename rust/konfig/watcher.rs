@@ -38,6 +38,50 @@ pub fn backoff_delay(attempt: usize) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Run `f` in an infinite reconnect loop. Each invocation runs to completion;
+/// any return (Ok = clean stream end, Err = stream error) is logged with the
+/// supplied `label` + `namespace` and followed by a `backoff_delay(attempt)`
+/// sleep before the next call.
+///
+/// `on_disconnect` runs after each return BEFORE the sleep — used by callers
+/// that need to side-effect on disconnect (e.g. mark cache stale).
+///
+/// This function never returns. Callers spawn it on its own task; any panic
+/// inside `f` will tear down only that task, not the binary.
+pub async fn run_with_reconnect<F, Fut, E, D>(
+    label: &'static str,
+    namespace: String,
+    mut on_disconnect: D,
+    mut f: F,
+) -> !
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+    D: FnMut(),
+{
+    let mut attempt: usize = 0;
+    loop {
+        match f(attempt).await {
+            Ok(()) => warn!(
+                label,
+                namespace = %namespace,
+                attempt,
+                "watcher stream ended cleanly — reconnecting",
+            ),
+            Err(e) => warn!(
+                label,
+                namespace = %namespace,
+                attempt,
+                "watcher error: {e} — reconnecting",
+            ),
+        }
+        on_disconnect();
+        tokio::time::sleep(backoff_delay(attempt)).await;
+        attempt = attempt.saturating_add(1);
+    }
+}
+
 pub fn config_api_resource() -> ApiResource {
     ApiResource {
         group: GROUP.to_string(),
@@ -243,5 +287,65 @@ mod tests {
                 "attempt {attempt}: expected {want_secs}s got {got:?}"
             );
         }
+    }
+
+    /// `run_with_reconnect` must keep restarting the inner future after both
+    /// clean-end (Ok) and error returns, and must call `on_disconnect` after
+    /// each.  This is the safety net that prevents a panicked watcher from
+    /// crashing the binary (see `main.rs` spawn site and the original
+    /// `.expect("watcher exited with error")` regression).
+    #[tokio::test(start_paused = true)]
+    async fn run_with_reconnect_loops_on_clean_end_and_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let disconnects = Arc::new(AtomicUsize::new(0));
+
+        let calls_inner = Arc::clone(&calls);
+        let disconnects_inner = Arc::clone(&disconnects);
+
+        // Drive the helper on a spawned task — it never returns, so we abort
+        // after observing the desired number of restarts.
+        let handle = tokio::spawn(async move {
+            run_with_reconnect(
+                "test",
+                "ns".to_string(),
+                move || {
+                    disconnects_inner.fetch_add(1, Ordering::SeqCst);
+                },
+                move |attempt| {
+                    let calls = Arc::clone(&calls_inner);
+                    async move {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        // Attempt 0: Err.  Attempt 1: Ok (clean end).
+                        // Attempt 2+: Ok forever (we abort first).
+                        if attempt == 0 {
+                            Err::<(), &'static str>("simulated stream error")
+                        } else {
+                            let _ = n;
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .await
+        });
+
+        // Auto-advance virtual time past two backoff sleeps (1s + 2s).
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        handle.abort();
+
+        // Must have run at least 3 times (Err, Ok, Ok…) and disconnected
+        // after each return.
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "expected ≥3 invocations, got {}",
+            calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            disconnects.load(Ordering::SeqCst),
+            "on_disconnect must run once per return",
+        );
     }
 }
