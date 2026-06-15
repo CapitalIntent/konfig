@@ -55,7 +55,7 @@ impl ConfigCache {
     /// `HashMap` via the `Borrow<dyn KeyRef>` impl on [`OwnedKey`].
     pub fn get(&self, namespace: &str, name: &str) -> Option<Arc<ConfigSnapshot>> {
         let q = BorrowedKey::new(namespace, name);
-        self.inner.load().get(&q as &dyn KeyRef).cloned()
+        self.inner.load().get(&q as &dyn KeyRef).map(Arc::clone)
     }
 
     /// Insert or replace the entry for `snap.namespace` / `snap.name`.
@@ -83,12 +83,14 @@ impl ConfigCache {
     /// Return all snapshots whose namespace matches `namespace`.
     /// Zero locking — atomic pointer load only.
     pub fn all_in_namespace(&self, namespace: &str) -> Vec<Arc<ConfigSnapshot>> {
-        self.inner
-            .load()
-            .iter()
-            .filter(|(k, _)| k.namespace == namespace)
-            .map(|(_, v)| Arc::clone(v))
-            .collect()
+        let guard = self.inner.load();
+        let mut out = Vec::with_capacity(guard.len());
+        for (k, v) in guard.iter() {
+            if k.namespace == namespace {
+                out.push(Arc::clone(v));
+            }
+        }
+        out
     }
 
     /// Return `true` when the cache contains at least one entry.

@@ -171,7 +171,13 @@ fn get_or_create_broadcast(
     watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
 ) -> (broadcast::Receiver<Arc<BroadcastFrame>>, ReplayBuffer) {
     // Fast path: namespace already has a running watcher.
-    if let Some(sender) = namespace_broadcasts.get(&namespace) {
+    if let Some(sender_ref) = namespace_broadcasts.get(&namespace) {
+        // Clone the sender out and drop the shard ref before calling
+        // .subscribe() so we don't hold a DashMap shard lock across the
+        // broadcast-receiver allocation (would serialise concurrent
+        // Subscribe RPCs that hash to the same shard).
+        let sender = sender_ref.clone();
+        drop(sender_ref);
         let buf = namespace_replay_buffers
             .entry(namespace.clone())
             .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
@@ -682,6 +688,13 @@ async fn bridge_broadcast(
     // Decrement on every exit path — including early returns from break.
     let _guard = SubGauge(namespace.clone());
 
+    // Hoist label-set lookups out of the per-event hot loop. `with_label_values`
+    // hashes the labels and looks up the metric child on each call; doing it
+    // once per subscriber instead of once per event eliminates a label hash
+    // + HashMap probe per delivered frame.
+    let subscribe_e2e = SUBSCRIBE_E2E_LATENCY.with_label_values(&[&namespace]);
+    let broadcast_lag = BROADCAST_LAG.with_label_values(&[&namespace]);
+
     loop {
         tokio::select! {
             // Drain signal — close the stream cleanly so the client reconnects
@@ -703,9 +716,7 @@ async fn bridge_broadcast(
                     BROADCAST_TO_ENCODE_SECONDS.observe(broadcast_to_recv);
                     // Existing e2e histogram — kept for backward compat with
                     // dashboards that already reference it.
-                    SUBSCRIBE_E2E_LATENCY
-                        .with_label_values(&[&namespace])
-                        .observe(broadcast_to_recv);
+                    subscribe_e2e.observe(broadcast_to_recv);
 
                     match tx.try_send(Ok((*frame.event).clone())) {
                         Ok(()) => {
@@ -734,7 +745,7 @@ async fn bridge_broadcast(
                 },
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(missed = n, "Subscriber lagged — disconnecting");
-                    BROADCAST_LAG.with_label_values(&[&namespace]).inc();
+                    broadcast_lag.inc();
                     let _ = tx.try_send(Err(Status::resource_exhausted("subscriber lagged")));
                     break;
                 }
