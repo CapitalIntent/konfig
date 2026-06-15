@@ -88,19 +88,24 @@ pub async fn apply_secret_inner(
 
 async fn fetch_current_secret_version(secrets: &Api<Secret>, name: &str) -> Result<u32, Status> {
     match secrets.get(name).await {
-        Ok(s) => {
-            let version = s
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|a| a.get(SCHEMA_VERSION_ANNOTATION))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            Ok(version)
-        }
+        Ok(s) => Ok(parse_secret_schema_version(&s)),
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => Ok(0),
         Err(e) => Err(Status::unavailable(format!("kube API error: {e}"))),
     }
+}
+
+/// Pure parser — read the `konfig.io/schema-version` annotation from a
+/// `Secret`, or `0` when the annotation is missing/non-numeric. Separated
+/// from the async kube call so its branches are unit-testable without a
+/// kube mock.
+pub(crate) fn parse_secret_schema_version(secret: &Secret) -> u32 {
+    secret
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(SCHEMA_VERSION_ANNOTATION))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 async fn patch_secret_with_retry(
@@ -240,5 +245,51 @@ mod tests {
                 "code {code} should be Unavailable",
             );
         }
+    }
+
+    fn secret_with_annotation(value: Option<&str>) -> Secret {
+        let mut meta = kube::core::ObjectMeta::default();
+        if let Some(v) = value {
+            let mut a = BTreeMap::new();
+            a.insert(SCHEMA_VERSION_ANNOTATION.to_string(), v.to_string());
+            meta.annotations = Some(a);
+        }
+        Secret {
+            metadata: meta,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parse_secret_schema_version_well_formed() {
+        let s = secret_with_annotation(Some("7"));
+        assert_eq!(parse_secret_schema_version(&s), 7);
+    }
+
+    #[test]
+    fn parse_secret_schema_version_no_annotations() {
+        let s = secret_with_annotation(None);
+        assert_eq!(parse_secret_schema_version(&s), 0);
+    }
+
+    #[test]
+    fn parse_secret_schema_version_missing_key() {
+        let mut s = secret_with_annotation(None);
+        let mut a = BTreeMap::new();
+        a.insert("unrelated".to_string(), "v1".to_string());
+        s.metadata.annotations = Some(a);
+        assert_eq!(parse_secret_schema_version(&s), 0);
+    }
+
+    #[test]
+    fn parse_secret_schema_version_non_numeric() {
+        let s = secret_with_annotation(Some("not-a-number"));
+        assert_eq!(parse_secret_schema_version(&s), 0);
+    }
+
+    #[test]
+    fn parse_secret_schema_version_empty_string() {
+        let s = secret_with_annotation(Some(""));
+        assert_eq!(parse_secret_schema_version(&s), 0);
     }
 }
