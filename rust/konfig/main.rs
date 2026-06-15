@@ -12,10 +12,10 @@
 //! 9. Install SIGTERM / Ctrl-C handler — feeds the shutdown signal that
 //!    `grpc::serve` consumes to begin graceful drain
 //! 10. Start gRPC server (port 50051) — blocks until shutdown completes
-
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
+//!
+//! Steps 2-10 live in [`konfig::startup::run`] (in the library crate) so
+//! they're reachable from tests. This binary entry point covers step 1
+//! plus tracing setup, then delegates.
 
 // Gated on the `snmalloc` feature. Bazel `konfig_bin` enables it and pulls
 // the crate from `@snmalloc//snmalloc-rs:snmalloc_rs` (jayakasadev fork).
@@ -25,140 +25,19 @@ use std::sync::Arc;
 static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 use clap::Parser;
-use dashmap::DashMap;
-use kube::Client;
-use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{broadcast, oneshot};
-use tracing::info;
-
-use konfig::cache::ConfigCache;
-use konfig::grpc::tls::{TlsPaths, build_server_tls_config, warn_tls_disabled};
-use konfig::grpc::{ServerConfig, serve};
-use konfig::metrics::{LastEventAtMap, last_event_at_for, spawn_tokio_runtime_sampler};
-use konfig::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
-use konfig::secret_cache::SecretCache;
-use konfig::secret_watcher::SecretWatcher;
-use konfig::types::ConfigSnapshot;
-use konfig::watcher::{Watcher, run_with_reconnect};
+use konfig::startup::{Args, run};
 #[cfg(feature = "profiling")]
 use pyroscope::PyroscopeAgent;
 #[cfg(feature = "profiling")]
 use pyroscope_pprofrs::{PprofConfig, pprof_backend};
-
-#[derive(Parser)]
-#[command(name = "konfig", about = "Konfig config distribution service")]
-struct Args {
-    /// gRPC listen address
-    #[arg(long, env = "KONFIG_GRPC_ADDR", default_value = "0.0.0.0:50051")]
-    grpc_addr: SocketAddr,
-
-    /// Prometheus metrics listen address
-    #[arg(long, env = "KONFIG_METRICS_ADDR", default_value = "0.0.0.0:9090")]
-    metrics_addr: SocketAddr,
-
-    /// K8s namespace to watch for Config CRDs
-    #[arg(long, env = "KONFIG_NAMESPACE", default_value = "default")]
-    namespace: String,
-
-    /// Config CRD name to watch.
-    /// KONFIG_NAME must be set — no default config name; konfig is domain-agnostic.
-    #[arg(long, env = "KONFIG_NAME")]
-    name: String,
-
-    /// K8s namespaces to watch for managed Secrets (konfig.io/managed=true).
-    /// Comma-separated or repeated flag, e.g. --secret-namespaces trading,risk
-    #[arg(
-        long,
-        env = "KONFIG_SECRET_NAMESPACES",
-        value_delimiter = ',',
-        default_value = ""
-    )]
-    secret_namespaces: Vec<String>,
-
-    /// Enable mutual-TLS on the gRPC server. Default ON. Pass `--tls=false`
-    /// only for local dev / integration tests — never in production.
-    #[arg(
-        long,
-        env = "KONFIG_TLS",
-        default_value_t = true,
-        action = clap::ArgAction::Set,
-    )]
-    tls: bool,
-
-    /// PEM-encoded server certificate (presented on handshake). Required when
-    /// `--tls=true`. Ignored when `--tls=false`.
-    #[arg(long, env = "KONFIG_TLS_CERT")]
-    tls_cert: Option<PathBuf>,
-
-    /// PEM-encoded server private key. Required when `--tls=true`.
-    #[arg(long, env = "KONFIG_TLS_KEY")]
-    tls_key: Option<PathBuf>,
-
-    /// PEM-encoded CA bundle used to verify client certificates. Required
-    /// when `--tls=true`. Every client must present a cert signed by this CA.
-    #[arg(long, env = "KONFIG_TLS_CLIENT_CA")]
-    tls_client_ca: Option<PathBuf>,
-}
+#[cfg(any(feature = "profiling", feature = "tokio_console"))]
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // tokio-console: only installed when both compiled in (`--features tokio_console`)
-    // AND `RUST_CONSOLE=1` at runtime. `console_subscriber::init()` installs its
-    // own tracing layer, so skip the plain fmt subscriber on that path.
-    #[cfg(feature = "tokio_console")]
-    let console_enabled = matches!(std::env::var("RUST_CONSOLE").as_deref(), Ok("1"));
-    #[cfg(not(feature = "tokio_console"))]
-    let console_enabled = false;
-
-    if console_enabled {
-        #[cfg(feature = "tokio_console")]
-        {
-            console_subscriber::init();
-            info!("tokio-console subscriber installed (RUST_CONSOLE=1)");
-        }
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive("konfig=info".parse()?),
-            )
-            .init();
-    }
+    init_tracing()?;
 
     let args = Args::parse();
-
-    // Resolve TLS configuration up-front so a missing flag fails startup before
-    // we touch the kube API or spawn any watcher. Default is mTLS-on; the
-    // `--tls=false` escape hatch is for local dev + integration tests only.
-    let tls_config = if args.tls {
-        let cert = args.tls_cert.clone().ok_or(
-            "TLS enabled but --tls-cert/KONFIG_TLS_CERT not set. \
-             Pass --tls=false to disable (local dev only).",
-        )?;
-        let key = args.tls_key.clone().ok_or(
-            "TLS enabled but --tls-key/KONFIG_TLS_KEY not set. \
-             Pass --tls=false to disable (local dev only).",
-        )?;
-        let client_ca = args.tls_client_ca.clone().ok_or(
-            "TLS enabled but --tls-client-ca/KONFIG_TLS_CLIENT_CA not set. \
-             Pass --tls=false to disable (local dev only).",
-        )?;
-        Some(
-            build_server_tls_config(&TlsPaths {
-                cert,
-                key,
-                client_ca,
-            })
-            .map_err(|e| -> Box<dyn std::error::Error> { e })?,
-        )
-    } else {
-        warn_tls_disabled();
-        None
-    };
-
-    // Spawn tokio runtime-metrics sampler — publishes `tokio_*` gauges every
-    // 5 s on the same `/metrics` endpoint as the Prometheus app metrics.
-    spawn_tokio_runtime_sampler(tokio::runtime::Handle::current());
 
     // Pyroscope agent — only compiled into the `konfig-profiling` image
     // variant (`--features profiling`).  Started if PYROSCOPE_SERVER_ADDRESS
@@ -181,171 +60,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
-    let kube_client = Client::try_default().await?;
+    run(args).await
+}
 
-    let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
-    let secret_cache = Arc::new(SecretCache::new());
+/// Install the tracing subscriber. Uses `console-subscriber` when the
+/// `tokio_console` feature is compiled in AND `RUST_CONSOLE=1` at runtime;
+/// otherwise installs the plain `tracing_subscriber::fmt` layer with the
+/// `konfig=info` filter.
+fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "tokio_console")]
+    let console_enabled = matches!(std::env::var("RUST_CONSOLE").as_deref(), Ok("1"));
+    #[cfg(not(feature = "tokio_console"))]
+    let console_enabled = false;
 
-    // Per-namespace freshness map shared by all watchers and the konfig_stale_seconds sampler.
-    let last_event_at_map: LastEventAtMap = Arc::new(DashMap::new());
-
-    // Spawn Config CRD watcher.  The inner `Watcher::run` already retries on
-    // transient stream errors; `run_with_reconnect` covers the cases where
-    // `Watcher::run` returns at all (clean stream end or terminal Err) so a
-    // single failure can never crash the process.
-    let watcher_cache = Arc::clone(&cache);
-    let watcher_client = kube_client.clone();
-    let namespace = args.namespace.clone();
-    let name = args.name.clone();
-    let watcher_last_event_at = last_event_at_for(&last_event_at_map, &namespace);
-    tokio::spawn(async move {
-        let on_disconnect = {
-            let cache = Arc::clone(&watcher_cache);
-            move || cache.mark_all_stale()
-        };
-        run_with_reconnect("config", namespace.clone(), on_disconnect, |_attempt| {
-            Watcher::new(watcher_client.clone()).run(
-                Arc::clone(&watcher_cache),
-                namespace.clone(),
-                name.clone(),
-                Arc::clone(&watcher_last_event_at),
-            )
-        })
-        .await;
-    });
-
-    // Spawn Secret namespace watchers.  Each watcher feeds both the SecretCache
-    // and a shared broadcast::Sender so SubscribeSecrets uses a single kube
-    // watch stream per namespace instead of one per subscriber.
-    let secret_namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>> =
-        Arc::new(DashMap::new());
-    let secret_namespaces: Vec<String> = args
-        .secret_namespaces
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !secret_namespaces.is_empty() {
-        info!(namespaces = ?secret_namespaces, "Starting secret namespace watchers");
-        SecretWatcher::new(kube_client.clone()).spawn_all(
-            Arc::clone(&secret_cache),
-            secret_namespaces,
-            Arc::clone(&secret_namespace_broadcasts),
-            Arc::clone(&last_event_at_map),
-        );
-    }
-
-    // Health reporter: NOT_SERVING until cache is populated.
-    let (health_reporter, _health_server) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_not_serving::<KonfigServiceServer<konfig::grpc::KonfigServer>>()
-        .await;
-
-    // Wait for cache to be populated (at least one entry).
-    {
-        let cache_ref = Arc::clone(&cache);
-        let health_ref = health_reporter.clone();
-        tokio::spawn(async move {
-            loop {
-                if cache_ref.is_populated() {
-                    health_ref
-                        .set_serving::<KonfigServiceServer<konfig::grpc::KonfigServer>>()
-                        .await;
-                    info!("Cache populated — health: SERVING");
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
-        });
-    }
-
-    // Metrics HTTP server.
-    let metrics_addr = args.metrics_addr;
-    tokio::spawn(async move {
-        serve_metrics(metrics_addr).await;
-    });
-
-    // Install SIGTERM + Ctrl-C handlers.  Either signal triggers a single
-    // `oneshot` send into the gRPC server's shutdown channel.  `serve` then
-    // flips the drain flag, closes active Subscribe streams, marks the health
-    // endpoint NOT_SERVING, and waits up to DRAIN_TIMEOUT before stopping.
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        tokio::select! {
-            _ = sigterm.recv() => info!("Received SIGTERM"),
-            _ = tokio::signal::ctrl_c() => info!("Received Ctrl-C (SIGINT)"),
+    if console_enabled {
+        #[cfg(feature = "tokio_console")]
+        {
+            console_subscriber::init();
+            info!("tokio-console subscriber installed (RUST_CONSOLE=1)");
         }
-        // `send` returns Err only if the receiver was already dropped — fine.
-        let _ = shutdown_tx.send(());
-    });
+        return Ok(());
+    }
 
-    // gRPC server (blocks until shutdown completes).
-    info!(addr = %args.grpc_addr, "starting gRPC server");
-    serve(ServerConfig {
-        addr: args.grpc_addr,
-        cache,
-        secret_cache,
-        kube_client,
-        health_reporter: Some(health_reporter),
-        secret_namespace_broadcasts,
-        last_event_at_map,
-        shutdown_signal: Some(Box::pin(async move {
-            // Resolve when the signal handler fires.  If `shutdown_tx` was
-            // dropped (signal task panicked) treat that as a drain request
-            // too — better than hanging forever.
-            let _ = shutdown_rx.await;
-        })),
-        tls_config,
-    })
-    .await?;
-
-    info!("gRPC server stopped cleanly");
-    Ok(())
-}
-
-async fn serve_metrics(addr: SocketAddr) {
-    use axum::{Router, routing::get};
-
-    let app = Router::new().route("/metrics", get(metrics_handler));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("bind metrics");
-    info!(addr = %addr, "metrics server starting");
-    axum::serve(listener, app)
-        .await
-        .expect("metrics server error");
-}
-
-async fn metrics_handler() -> axum::response::Response {
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-    use prometheus::Encoder;
-
-    let encoder = prometheus::TextEncoder::new();
-    let metric_families = prometheus::gather();
-    let mut buf = Vec::new();
-    if let Err(e) = encoder.encode(&metric_families, &mut buf) {
-        // Previously `.unwrap_or_default()` swallowed encoder errors and
-        // returned an empty 200 OK body, which Prometheus would happily
-        // accept as "no metrics" — masking the failure entirely. Surface
-        // it as a 500 so scrape alerts (absent-target / failed-scrape)
-        // fire on the operator side.
-        tracing::warn!("metrics encode failed: {e}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("metrics encode failed: {e}"),
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("konfig=info".parse()?),
         )
-            .into_response();
-    }
-    match String::from_utf8(buf) {
-        Ok(body) => body.into_response(),
-        Err(e) => {
-            tracing::warn!("metrics output not UTF-8: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "metrics output not UTF-8".to_string(),
-            )
-                .into_response()
-        }
-    }
+        .init();
+    Ok(())
 }
