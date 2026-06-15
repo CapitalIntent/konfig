@@ -128,6 +128,16 @@ rust_test(
     name = "test",
     size = "small",
     crate = ":konfig",
+    # Serialise test execution within the `:konfig` rust_test target.
+    # Several metric tests share the process-global `prometheus::default_registry`
+    # (e.g. `bridge_broadcast_records_obs2_stage_histograms`, the
+    # `metrics::tests::*` family); concurrent observation/increment by parallel
+    # tests races on the same counter and produces non-deterministic
+    # `left: N right: M` assertion failures (see CU-86aj23ttp). Forcing
+    # single-threaded execution within the target eliminates that race
+    # without touching the prod code path. Bazel still runs different
+    # `rust_test` targets in parallel.
+    env = {"RUST_TEST_THREADS": "1"},
     tags = ["konfig", "rust", "unit"],
 )
 
