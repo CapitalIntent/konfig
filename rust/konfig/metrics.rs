@@ -4,7 +4,8 @@
 //! via `lazy_static!`.  The `/metrics` HTTP endpoint (port 9090) in `main.rs`
 //! calls `prometheus::gather()` to serialise them for scraping.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -374,31 +375,55 @@ impl Drop for SubGauge {
 
 /// Shared per-namespace timestamp of the most recent watcher event.
 ///
-/// `None` = cold start (no event received yet).  The watcher loops call
+/// `0` = cold start (no event received yet).  The watcher loops call
 /// [`LastEventAt::touch`] on every event; the metric sampler in `grpc::serve`
 /// reads via [`LastEventAt::elapsed_secs`] every 5 s and updates the
 /// `konfig_stale_seconds` gauge.
 ///
-/// Implementation: `Mutex<Option<Instant>>` rather than a lock-free atomic
-/// because the write rate is bounded by the kube event rate (low) and the
-/// read rate is bounded by the 5 s sampler — contention is negligible.
+/// Implementation: `AtomicU64` of nanoseconds since process start.
+/// A high-burst watcher can call `touch` at >10k events/sec/namespace;
+/// the prior `Mutex<Option<Instant>>` serialised every such write.
+/// `Relaxed` ordering is sufficient — the freshness gauge is sampled
+/// every 5 s, so a single-event reorder window is invisible to consumers.
 #[derive(Default, Debug)]
-pub struct LastEventAt(Mutex<Option<Instant>>);
+pub struct LastEventAt(AtomicU64);
+
+/// Lazy process-start anchor for `LastEventAt`'s nanosecond timestamps.
+/// `Instant`s aren't `Copy + 'static`-friendly, so we anchor a single
+/// monotonic reference on first use and store `(Instant::now -
+/// proc_start).as_nanos()` in each `LastEventAt`.
+fn proc_start() -> Instant {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
 
 impl LastEventAt {
     pub fn new() -> Self {
-        Self(Mutex::new(None))
+        Self(AtomicU64::new(0))
     }
 
     /// Record that an event was just received.
     pub fn touch(&self) {
-        *crate::sync_util::lock_recovered(&self.0) = Some(Instant::now());
+        let nanos = Instant::now()
+            .saturating_duration_since(proc_start())
+            .as_nanos() as u64;
+        // 0 is reserved as the "no event yet" sentinel; saturate the
+        // first-nanosecond-of-process edge case to 1.
+        self.0.store(nanos.max(1), Ordering::Relaxed);
     }
 
     /// Seconds since the last event, or `None` if no event has been received
     /// yet (cold start — the sampler treats this as "fresh" / `0.0`).
     pub fn elapsed_secs(&self) -> Option<f64> {
-        crate::sync_util::lock_recovered(&self.0).map(|t| t.elapsed().as_secs_f64())
+        let prev = self.0.load(Ordering::Relaxed);
+        if prev == 0 {
+            return None;
+        }
+        let now = Instant::now()
+            .saturating_duration_since(proc_start())
+            .as_nanos() as u64;
+        let delta = now.saturating_sub(prev);
+        Some(delta as f64 / 1_000_000_000.0)
     }
 }
 
