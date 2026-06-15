@@ -118,18 +118,22 @@ pub(crate) async fn fetch_current_schema_version(
     name: &str,
 ) -> Result<u32, Status> {
     match api.get(name).await {
-        Ok(obj) => {
-            let v = obj
-                .data
-                .get("spec")
-                .and_then(|s| s.get("schema_version"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            Ok(v)
-        }
+        Ok(obj) => Ok(parse_schema_version_from_object(&obj)),
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => Ok(0),
         Err(e) => Err(Status::unavailable(format!("kube error: {e}"))),
     }
+}
+
+/// Pure parser — extract `spec.schema_version` from a DynamicObject, or `0`
+/// when the field is missing, non-numeric, or exceeds `u32::MAX`. Separated
+/// from the async kube call so its branches are unit-testable without a
+/// kube mock.
+pub(crate) fn parse_schema_version_from_object(obj: &DynamicObject) -> u32 {
+    obj.data
+        .get("spec")
+        .and_then(|s| s.get("schema_version"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32
 }
 
 /// Decision returned by `classify_patch_error` so the (un-mockable) kube I/O
@@ -275,5 +279,52 @@ mod tests {
         let err = kube::Error::SerdeError(serde_err);
         let d = classify_patch_error(&err, 0);
         assert_eq!(d, PatchRetryDecision::Unavailable);
+    }
+
+    fn dyn_obj(spec: serde_json::Value) -> DynamicObject {
+        let mut data = serde_json::Map::new();
+        data.insert("spec".to_string(), spec);
+        DynamicObject {
+            types: None,
+            metadata: Default::default(),
+            data: serde_json::Value::Object(data),
+        }
+    }
+
+    #[test]
+    fn parse_schema_version_well_formed() {
+        let obj = dyn_obj(serde_json::json!({"schema_version": 42}));
+        assert_eq!(parse_schema_version_from_object(&obj), 42);
+    }
+
+    #[test]
+    fn parse_schema_version_missing_spec() {
+        let obj = DynamicObject {
+            types: None,
+            metadata: Default::default(),
+            data: serde_json::json!({}),
+        };
+        assert_eq!(parse_schema_version_from_object(&obj), 0);
+    }
+
+    #[test]
+    fn parse_schema_version_missing_field() {
+        let obj = dyn_obj(serde_json::json!({"content": {}}));
+        assert_eq!(parse_schema_version_from_object(&obj), 0);
+    }
+
+    #[test]
+    fn parse_schema_version_non_numeric() {
+        let obj = dyn_obj(serde_json::json!({"schema_version": "v3"}));
+        assert_eq!(parse_schema_version_from_object(&obj), 0);
+    }
+
+    #[test]
+    fn parse_schema_version_exceeds_u32_truncates() {
+        let obj = dyn_obj(serde_json::json!({"schema_version": (u32::MAX as u64) + 5}));
+        // `as u32` wraps; documents the current behaviour so future changes
+        // are explicit rather than accidental.
+        let got = parse_schema_version_from_object(&obj);
+        assert_eq!(got, 4);
     }
 }
