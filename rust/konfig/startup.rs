@@ -1,0 +1,451 @@
+//! Startup wiring for the `konfig` server binary.
+//!
+//! Lives in the library crate (not `main.rs`) so the orchestration steps
+//! 2-10 from `main.rs`'s startup sequence are reachable from tests. The
+//! binary entry point (`konfig_bin`) keeps only the tracing init + `Args`
+//! parse and immediately defers to [`run`].
+//!
+//! Startup sequence (`main.rs` doc comment is the source of truth):
+//! 1. Parse CLI args / env vars                                  ← in `main.rs`
+//! 2. Init kube::Client
+//! 3. Spawn Config CRD watcher task
+//! 4. Spawn Secret namespace watchers (cache + broadcast)
+//! 5. Register gRPC health as NOT_SERVING for KonfigService
+//! 6. Wait until cache has at least one populated entry
+//! 7. Register gRPC health as SERVING
+//! 8. Start /metrics HTTP server (port 9090) in background
+//! 9. Install SIGTERM / Ctrl-C handler — feeds the shutdown signal that
+//!    `grpc::serve` consumes to begin graceful drain
+//! 10. Start gRPC server (port 50051) — blocks until shutdown completes
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use clap::Parser;
+use dashmap::DashMap;
+use kube::Client;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{broadcast, oneshot};
+use tonic::transport::ServerTlsConfig;
+use tracing::info;
+
+use crate::cache::ConfigCache;
+use crate::grpc::tls::{TlsPaths, build_server_tls_config, warn_tls_disabled};
+use crate::grpc::{ServerConfig, serve};
+use crate::metrics::{LastEventAtMap, last_event_at_for, spawn_tokio_runtime_sampler};
+use crate::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
+use crate::secret_cache::SecretCache;
+use crate::secret_watcher::SecretWatcher;
+use crate::types::ConfigSnapshot;
+use crate::watcher::{Watcher, run_with_reconnect};
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "konfig", about = "Konfig config distribution service")]
+pub struct Args {
+    /// gRPC listen address
+    #[arg(long, env = "KONFIG_GRPC_ADDR", default_value = "0.0.0.0:50051")]
+    pub grpc_addr: SocketAddr,
+
+    /// Prometheus metrics listen address
+    #[arg(long, env = "KONFIG_METRICS_ADDR", default_value = "0.0.0.0:9090")]
+    pub metrics_addr: SocketAddr,
+
+    /// K8s namespace to watch for Config CRDs
+    #[arg(long, env = "KONFIG_NAMESPACE", default_value = "default")]
+    pub namespace: String,
+
+    /// Config CRD name to watch.
+    /// KONFIG_NAME must be set — no default config name; konfig is domain-agnostic.
+    #[arg(long, env = "KONFIG_NAME")]
+    pub name: String,
+
+    /// K8s namespaces to watch for managed Secrets (konfig.io/managed=true).
+    /// Comma-separated or repeated flag, e.g. --secret-namespaces trading,risk
+    #[arg(
+        long,
+        env = "KONFIG_SECRET_NAMESPACES",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub secret_namespaces: Vec<String>,
+
+    /// Enable mutual-TLS on the gRPC server. Default ON. Pass `--tls=false`
+    /// only for local dev / integration tests — never in production.
+    #[arg(
+        long,
+        env = "KONFIG_TLS",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub tls: bool,
+
+    /// PEM-encoded server certificate (presented on handshake). Required when
+    /// `--tls=true`. Ignored when `--tls=false`.
+    #[arg(long, env = "KONFIG_TLS_CERT")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM-encoded server private key. Required when `--tls=true`.
+    #[arg(long, env = "KONFIG_TLS_KEY")]
+    pub tls_key: Option<PathBuf>,
+
+    /// PEM-encoded CA bundle used to verify client certificates. Required
+    /// when `--tls=true`. Every client must present a cert signed by this CA.
+    #[arg(long, env = "KONFIG_TLS_CLIENT_CA")]
+    pub tls_client_ca: Option<PathBuf>,
+}
+
+/// Resolve a `ServerTlsConfig` from the TLS-related fields on `args`, or
+/// `Ok(None)` when `--tls=false` (local dev escape hatch). Fails fast — before
+/// any kube API call — when `--tls=true` but a required file path was
+/// omitted.
+///
+/// Extracted so the TLS-resolution branches are unit-testable without
+/// invoking the kube client or the full startup.
+pub fn resolve_tls_config(
+    args: &Args,
+) -> Result<Option<ServerTlsConfig>, Box<dyn std::error::Error>> {
+    if !args.tls {
+        warn_tls_disabled();
+        return Ok(None);
+    }
+    let cert = args.tls_cert.clone().ok_or(
+        "TLS enabled but --tls-cert/KONFIG_TLS_CERT not set. \
+         Pass --tls=false to disable (local dev only).",
+    )?;
+    let key = args.tls_key.clone().ok_or(
+        "TLS enabled but --tls-key/KONFIG_TLS_KEY not set. \
+         Pass --tls=false to disable (local dev only).",
+    )?;
+    let client_ca = args.tls_client_ca.clone().ok_or(
+        "TLS enabled but --tls-client-ca/KONFIG_TLS_CLIENT_CA not set. \
+         Pass --tls=false to disable (local dev only).",
+    )?;
+    let cfg = build_server_tls_config(&TlsPaths {
+        cert,
+        key,
+        client_ca,
+    })
+    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+    Ok(Some(cfg))
+}
+
+/// Filter out empty secret-namespace entries left behind by `--secret-namespaces=`
+/// or a trailing comma in `KONFIG_SECRET_NAMESPACES`.
+///
+/// Pure helper — extracted so the filter behaviour is unit-testable.
+pub fn normalize_secret_namespaces(raw: Vec<String>) -> Vec<String> {
+    raw.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+/// Run the konfig server end-to-end. Blocks until the gRPC server stops
+/// (drain completes, SIGTERM/Ctrl-C delivered).
+///
+/// Steps 2-10 of the startup sequence in `main.rs`'s module docs. Step 1
+/// (CLI parse) and tracing init stay in the binary entry point so this
+/// helper is reachable from tests with a synthetic [`Args`].
+pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve TLS up-front so a misconfig fails startup before we touch
+    // the kube API or spawn any watcher.
+    let tls_config = resolve_tls_config(&args)?;
+
+    // Spawn tokio runtime-metrics sampler — publishes `tokio_*` gauges every
+    // 5 s on the same `/metrics` endpoint as the Prometheus app metrics.
+    spawn_tokio_runtime_sampler(tokio::runtime::Handle::current());
+
+    let kube_client = Client::try_default().await?;
+
+    let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+    let secret_cache = Arc::new(SecretCache::new());
+
+    // Per-namespace freshness map shared by all watchers and the
+    // konfig_stale_seconds sampler.
+    let last_event_at_map: LastEventAtMap = Arc::new(DashMap::new());
+
+    // Spawn Config CRD watcher.  The inner `Watcher::run` already retries on
+    // transient stream errors; `run_with_reconnect` covers the cases where
+    // `Watcher::run` returns at all (clean stream end or terminal Err) so a
+    // single failure can never crash the process.
+    let watcher_cache = Arc::clone(&cache);
+    let watcher_client = kube_client.clone();
+    let namespace = args.namespace.clone();
+    let name = args.name.clone();
+    let watcher_last_event_at = last_event_at_for(&last_event_at_map, &namespace);
+    tokio::spawn(async move {
+        let on_disconnect = {
+            let cache = Arc::clone(&watcher_cache);
+            move || cache.mark_all_stale()
+        };
+        run_with_reconnect("config", namespace.clone(), on_disconnect, |_attempt| {
+            Watcher::new(watcher_client.clone()).run(
+                Arc::clone(&watcher_cache),
+                namespace.clone(),
+                name.clone(),
+                Arc::clone(&watcher_last_event_at),
+            )
+        })
+        .await;
+    });
+
+    // Spawn Secret namespace watchers.
+    let secret_namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>> =
+        Arc::new(DashMap::new());
+    let secret_namespaces = normalize_secret_namespaces(args.secret_namespaces);
+    if !secret_namespaces.is_empty() {
+        info!(namespaces = ?secret_namespaces, "Starting secret namespace watchers");
+        SecretWatcher::new(kube_client.clone()).spawn_all(
+            Arc::clone(&secret_cache),
+            secret_namespaces,
+            Arc::clone(&secret_namespace_broadcasts),
+            Arc::clone(&last_event_at_map),
+        );
+    }
+
+    // Health reporter: NOT_SERVING until cache is populated.
+    let (health_reporter, _health_server) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_not_serving::<KonfigServiceServer<crate::grpc::KonfigServer>>()
+        .await;
+
+    // Cache-populated → SERVING gate.
+    {
+        let cache_ref = Arc::clone(&cache);
+        let health_ref = health_reporter.clone();
+        tokio::spawn(async move {
+            loop {
+                if cache_ref.is_populated() {
+                    health_ref
+                        .set_serving::<KonfigServiceServer<crate::grpc::KonfigServer>>()
+                        .await;
+                    info!("Cache populated — health: SERVING");
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        });
+    }
+
+    // Metrics HTTP server.
+    let metrics_addr = args.metrics_addr;
+    tokio::spawn(async move {
+        serve_metrics(metrics_addr).await;
+    });
+
+    // Install SIGTERM + Ctrl-C handlers.
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = sigterm.recv() => info!("Received SIGTERM"),
+            _ = tokio::signal::ctrl_c() => info!("Received Ctrl-C (SIGINT)"),
+        }
+        // `send` returns Err only if the receiver was already dropped — fine.
+        let _ = shutdown_tx.send(());
+    });
+
+    // gRPC server (blocks until shutdown completes).
+    info!(addr = %args.grpc_addr, "starting gRPC server");
+    serve(ServerConfig {
+        addr: args.grpc_addr,
+        cache,
+        secret_cache,
+        kube_client,
+        health_reporter: Some(health_reporter),
+        secret_namespace_broadcasts,
+        last_event_at_map,
+        shutdown_signal: Some(Box::pin(async move {
+            let _ = shutdown_rx.await;
+        })),
+        tls_config,
+    })
+    .await?;
+
+    info!("gRPC server stopped cleanly");
+    Ok(())
+}
+
+async fn serve_metrics(addr: SocketAddr) {
+    use axum::{Router, routing::get};
+
+    let app = Router::new().route("/metrics", get(metrics_handler));
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind metrics");
+    info!(addr = %addr, "metrics server starting");
+    axum::serve(listener, app)
+        .await
+        .expect("metrics server error");
+}
+
+async fn metrics_handler() -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use prometheus::Encoder;
+
+    let encoder = prometheus::TextEncoder::new();
+    let metric_families = prometheus::gather();
+    let mut buf = Vec::new();
+    if let Err(e) = encoder.encode(&metric_families, &mut buf) {
+        // Surface encoder errors as 500 so scrape alerts (absent-target /
+        // failed-scrape) fire on the operator side instead of accepting an
+        // empty 200 body as "no metrics".
+        tracing::warn!("metrics encode failed: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("metrics encode failed: {e}"),
+        )
+            .into_response();
+    }
+    match String::from_utf8(buf) {
+        Ok(body) => body.into_response(),
+        Err(e) => {
+            tracing::warn!("metrics output not UTF-8: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "metrics output not UTF-8".to_string(),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_with_tls_off() -> Args {
+        Args {
+            grpc_addr: "0.0.0.0:50051".parse().unwrap(),
+            metrics_addr: "0.0.0.0:9090".parse().unwrap(),
+            namespace: "default".to_string(),
+            name: "cfg".to_string(),
+            secret_namespaces: vec![],
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
+            tls_client_ca: None,
+        }
+    }
+
+    #[test]
+    fn resolve_tls_disabled_returns_none_and_warns() {
+        let cfg = resolve_tls_config(&args_with_tls_off()).expect("ok");
+        assert!(cfg.is_none(), "--tls=false yields no ServerTlsConfig");
+    }
+
+    #[test]
+    fn resolve_tls_enabled_but_no_cert_errors() {
+        let mut args = args_with_tls_off();
+        args.tls = true;
+        // Intentionally leave tls_cert / tls_key / tls_client_ca = None.
+        let err = resolve_tls_config(&args).err().expect("must error");
+        let msg = err.to_string();
+        assert!(msg.contains("tls-cert") || msg.contains("KONFIG_TLS_CERT"));
+    }
+
+    #[test]
+    fn resolve_tls_enabled_but_no_key_errors() {
+        let mut args = args_with_tls_off();
+        args.tls = true;
+        args.tls_cert = Some(PathBuf::from("/nonexistent/cert.pem"));
+        let err = resolve_tls_config(&args).err().expect("must error");
+        let msg = err.to_string();
+        assert!(msg.contains("tls-key") || msg.contains("KONFIG_TLS_KEY"));
+    }
+
+    #[test]
+    fn resolve_tls_enabled_but_no_client_ca_errors() {
+        let mut args = args_with_tls_off();
+        args.tls = true;
+        args.tls_cert = Some(PathBuf::from("/nonexistent/cert.pem"));
+        args.tls_key = Some(PathBuf::from("/nonexistent/key.pem"));
+        let err = resolve_tls_config(&args).err().expect("must error");
+        let msg = err.to_string();
+        assert!(msg.contains("tls-client-ca") || msg.contains("KONFIG_TLS_CLIENT_CA"));
+    }
+
+    #[test]
+    fn normalize_secret_namespaces_drops_empty_entries() {
+        let raw = vec![
+            "".to_string(),
+            "trading".to_string(),
+            "".to_string(),
+            "risk".to_string(),
+        ];
+        let out = normalize_secret_namespaces(raw);
+        assert_eq!(out, vec!["trading".to_string(), "risk".to_string()]);
+    }
+
+    #[test]
+    fn normalize_secret_namespaces_preserves_order() {
+        let raw = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let out = normalize_secret_namespaces(raw);
+        assert_eq!(out, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn normalize_secret_namespaces_empty_input_is_empty() {
+        assert!(normalize_secret_namespaces(vec![]).is_empty());
+    }
+
+    #[test]
+    fn normalize_secret_namespaces_all_empty_is_empty() {
+        assert!(normalize_secret_namespaces(vec!["".to_string(), "".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn args_parse_from_minimum_required_env() {
+        // `KONFIG_NAME` has no default — every other field has one.
+        let args = Args::try_parse_from(["konfig", "--name", "my-config"])
+            .expect("must parse with --name");
+        assert_eq!(args.name, "my-config");
+        assert_eq!(args.namespace, "default");
+        assert!(args.tls, "TLS defaults ON");
+        // clap's `default_value = ""` yields a single empty-string entry —
+        // `normalize_secret_namespaces` is what strips it before use.
+        assert!(normalize_secret_namespaces(args.secret_namespaces).is_empty());
+    }
+
+    #[test]
+    fn args_parse_tls_off_does_not_require_cert_paths() {
+        let args =
+            Args::try_parse_from(["konfig", "--name", "cfg", "--tls=false"]).expect("must parse");
+        assert!(!args.tls);
+        assert!(args.tls_cert.is_none());
+    }
+
+    #[test]
+    fn args_parse_secret_namespaces_comma_split() {
+        let args = Args::try_parse_from([
+            "konfig",
+            "--name",
+            "cfg",
+            "--tls=false",
+            "--secret-namespaces",
+            "trading,risk,ops",
+        ])
+        .expect("must parse");
+        assert_eq!(args.secret_namespaces, vec!["trading", "risk", "ops"]);
+    }
+
+    #[test]
+    fn args_parse_missing_name_fails() {
+        // No --name + no KONFIG_NAME env → clap rejects.
+        // Note: env vars are read by clap so we explicitly clear KONFIG_NAME
+        // via the OS env in case the test runner has it set.
+        let prev = std::env::var("KONFIG_NAME").ok();
+        // SAFETY: tests in this module are gated to single-thread via
+        // RUST_TEST_THREADS=1 (BUILD.bazel), so racing on env is impossible.
+        unsafe {
+            std::env::remove_var("KONFIG_NAME");
+        }
+        let result = Args::try_parse_from(["konfig", "--tls=false"]);
+        // Restore env regardless of assertion outcome.
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("KONFIG_NAME", v);
+            }
+        }
+        assert!(result.is_err(), "missing required --name must error");
+    }
+}
