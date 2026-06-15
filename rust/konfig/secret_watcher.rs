@@ -96,54 +96,79 @@ async fn run_namespace_watcher(
 ) -> Result<(), kube_watcher::Error> {
     let api: Api<Secret> = Api::namespaced(client, &namespace);
     let wc = kube_watcher::Config::default().labels(&format!("{MANAGED_LABEL}=true"));
-    let mut stream = kube_watch_stream(api, wc).boxed();
+    let stream = kube_watch_stream(api, wc).boxed();
 
     info!(namespace = %namespace, "Secret watcher started");
 
-    while let Some(event) = stream.try_next().await? {
-        // Touch freshness on every event — including Init/InitDone — so the
-        // konfig_stale_seconds gauge reflects "still connected to the API".
-        last_event_at.touch();
-        match event {
-            Event::Apply(secret) | Event::InitApply(secret) => {
-                if let Some(snap) = parse_secret(&secret, &namespace) {
-                    info!(
-                        name = %snap.name,
-                        schema_version = snap.schema_version,
-                        "Secret applied",
-                    );
-                    // Build the broadcast event from `&snap` first, then move
-                    // `snap` into the cache.  Previously the cache was
-                    // updated with `snap.clone()` and the event borrowed
-                    // `&snap`, doubling the per-event clone work (cache
-                    // owns its own Arc + we cloned the SecretSnapshot
-                    // upfront just to keep the value around for the proto
-                    // build).
-                    let secret_event = SecretEvent {
-                        event_type: EventType::Modified as i32,
-                        secret: Some(secret_snapshot_to_proto(&snap)),
-                    };
-                    cache.update(snap);
-                    // Ignore Err — means zero receivers at the moment.
-                    let _ = broadcast_tx.send(secret_event);
-                }
+    pump_secret_events(stream, &cache, &namespace, &broadcast_tx, &last_event_at).await
+}
+
+/// Apply one Secret watcher event to the cache + broadcast channel.
+/// Extracted so [`pump_secret_events`] stays a thin event loop and the
+/// per-event behaviour is unit-testable.
+pub(crate) fn handle_secret_event(
+    event: Event<Secret>,
+    cache: &Arc<SecretCache>,
+    namespace: &str,
+    broadcast_tx: &broadcast::Sender<SecretEvent>,
+) {
+    match event {
+        Event::Apply(secret) | Event::InitApply(secret) => {
+            if let Some(snap) = parse_secret(&secret, namespace) {
+                info!(
+                    name = %snap.name,
+                    schema_version = snap.schema_version,
+                    "Secret applied",
+                );
+                let secret_event = SecretEvent {
+                    event_type: EventType::Modified as i32,
+                    secret: Some(secret_snapshot_to_proto(&snap)),
+                };
+                cache.update(snap);
+                // Ignore Err — means zero receivers at the moment.
+                let _ = broadcast_tx.send(secret_event);
             }
-            Event::Delete(secret) => {
-                let name = secret.metadata.name.as_deref().unwrap_or("<unknown>");
-                // Intentionally not removing from cache on delete — CP behavior:
-                // serve stale secret rather than returning NotFound during a partition.
-                // Tracked in W4 (86ahpgaw3).
-                warn!(name, "Secret deleted — cache retains last-known-good");
-                if let Some(snap) = parse_secret(&secret, &namespace) {
-                    let secret_event = SecretEvent {
-                        event_type: EventType::Deleted as i32,
-                        secret: Some(secret_snapshot_to_proto(&snap)),
-                    };
-                    let _ = broadcast_tx.send(secret_event);
-                }
-            }
-            Event::Init | Event::InitDone => debug!("Secret watch stream: init"),
         }
+        Event::Delete(secret) => {
+            let name = secret.metadata.name.as_deref().unwrap_or("<unknown>");
+            // Intentionally not removing from cache on delete — CP behavior:
+            // serve stale secret rather than returning NotFound during a
+            // partition. Tracked in W4 (86ahpgaw3).
+            warn!(name, "Secret deleted — cache retains last-known-good");
+            if let Some(snap) = parse_secret(&secret, namespace) {
+                let secret_event = SecretEvent {
+                    event_type: EventType::Deleted as i32,
+                    secret: Some(secret_snapshot_to_proto(&snap)),
+                };
+                let _ = broadcast_tx.send(secret_event);
+            }
+        }
+        Event::Init | Event::InitDone => debug!("Secret watch stream: init"),
+    }
+}
+
+/// Drive a Secret watcher stream to completion or first error.
+///
+/// On every event: `last_event_at` is touched (including Init/InitDone — the
+/// freshness signal reflects API connectivity, not parse validity), then the
+/// event is dispatched via [`handle_secret_event`].
+///
+/// Extracted from [`run_namespace_watcher`] so the per-event behaviour is
+/// unit-testable against a synthetic stream — no kube API connection
+/// required.
+pub(crate) async fn pump_secret_events<S>(
+    mut stream: S,
+    cache: &Arc<SecretCache>,
+    namespace: &str,
+    broadcast_tx: &broadcast::Sender<SecretEvent>,
+    last_event_at: &Arc<LastEventAt>,
+) -> Result<(), kube_watcher::Error>
+where
+    S: futures_util::stream::TryStream<Ok = Event<Secret>, Error = kube_watcher::Error> + Unpin,
+{
+    while let Some(event) = stream.try_next().await? {
+        last_event_at.touch();
+        handle_secret_event(event, cache, namespace, broadcast_tx);
     }
     Ok(())
 }
@@ -240,5 +265,126 @@ mod tests {
         s.metadata.name = Some("no-version".to_string());
         let snap = parse_secret(&s, "ns").unwrap();
         assert_eq!(snap.schema_version, 0);
+    }
+
+    // ── pump_secret_events ───────────────────────────────────────────────────
+
+    fn secret_with_data(name: &str, key: &str, value: &[u8], schema_version: u32) -> Secret {
+        let mut data = BTreeMap::new();
+        data.insert(key.to_string(), ByteString(value.to_vec()));
+        make_secret_obj(name, data, schema_version)
+    }
+
+    fn watcher_err() -> kube_watcher::Error {
+        kube_watcher::Error::WatchFailed(kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "synthetic".to_string(),
+            reason: "synthetic".to_string(),
+            code: 500,
+        }))
+    }
+
+    #[tokio::test]
+    async fn pump_apply_event_updates_cache_and_broadcasts_modified() {
+        use futures_util::stream;
+        let cache = Arc::new(SecretCache::new());
+        let (tx, mut rx) = broadcast::channel(8);
+        let lea = Arc::new(LastEventAt::new());
+        let events: Vec<Result<Event<Secret>, kube_watcher::Error>> =
+            vec![Ok(Event::Apply(secret_with_data("s-a", "k", b"v1", 1)))];
+
+        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        assert!(res.is_ok());
+        assert_eq!(cache.get("ns", "s-a").unwrap().schema_version, 1);
+        let evt = rx.try_recv().expect("must broadcast Modified");
+        assert_eq!(evt.event_type, EventType::Modified as i32);
+        assert!(rx.try_recv().is_err(), "exactly one broadcast");
+    }
+
+    #[tokio::test]
+    async fn pump_delete_event_broadcasts_deleted_but_retains_cache() {
+        use futures_util::stream;
+        let cache = Arc::new(SecretCache::new());
+        let (tx, mut rx) = broadcast::channel(8);
+        let lea = Arc::new(LastEventAt::new());
+        let s = secret_with_data("s-a", "k", b"v", 7);
+        let events: Vec<Result<Event<Secret>, kube_watcher::Error>> =
+            vec![Ok(Event::Apply(s.clone())), Ok(Event::Delete(s))];
+
+        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        assert!(res.is_ok());
+        // Cache retains last-known-good (documented CP behaviour).
+        assert_eq!(cache.get("ns", "s-a").unwrap().schema_version, 7);
+        let first = rx.try_recv().expect("apply broadcast");
+        assert_eq!(first.event_type, EventType::Modified as i32);
+        let second = rx.try_recv().expect("delete broadcast");
+        assert_eq!(second.event_type, EventType::Deleted as i32);
+    }
+
+    #[tokio::test]
+    async fn pump_propagates_stream_error_and_halts() {
+        use futures_util::stream;
+        let cache = Arc::new(SecretCache::new());
+        let (tx, mut rx) = broadcast::channel(8);
+        let lea = Arc::new(LastEventAt::new());
+        let events: Vec<Result<Event<Secret>, kube_watcher::Error>> = vec![
+            Ok(Event::Apply(secret_with_data("s-a", "k", b"v", 1))),
+            Err(watcher_err()),
+            // Must NOT be observed — pump returns on first Err.
+            Ok(Event::Apply(secret_with_data("s-c", "k", b"v", 99))),
+        ];
+
+        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        assert!(res.is_err());
+        assert_eq!(cache.get("ns", "s-a").unwrap().schema_version, 1);
+        assert!(cache.get("ns", "s-c").is_none());
+        let _ = rx.try_recv().expect("pre-error broadcast lands");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pump_touches_last_event_at_on_every_event_including_init() {
+        use futures_util::stream;
+        let cache = Arc::new(SecretCache::new());
+        let (tx, _rx) = broadcast::channel(8);
+        let lea = Arc::new(LastEventAt::new());
+        assert!(lea.elapsed_secs().is_none());
+
+        let events: Vec<Result<Event<Secret>, kube_watcher::Error>> = vec![Ok(Event::Init)];
+        let _ = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        assert!(
+            lea.elapsed_secs().is_some(),
+            "Init must touch freshness — gauge reflects connectivity",
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_broadcast_send_with_zero_receivers_is_silently_dropped() {
+        use futures_util::stream;
+        let cache = Arc::new(SecretCache::new());
+        let (tx, rx) = broadcast::channel(8);
+        // Drop receiver immediately so the channel reports zero subscribers.
+        drop(rx);
+        let lea = Arc::new(LastEventAt::new());
+        let events: Vec<Result<Event<Secret>, kube_watcher::Error>> =
+            vec![Ok(Event::Apply(secret_with_data("s-a", "k", b"v", 4)))];
+
+        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        assert!(res.is_ok());
+        // Cache still updates even when no subscribers — broadcast errs only get logged.
+        assert_eq!(cache.get("ns", "s-a").unwrap().schema_version, 4);
+    }
+
+    #[tokio::test]
+    async fn pump_empty_stream_is_ok() {
+        use futures_util::stream;
+        let cache = Arc::new(SecretCache::new());
+        let (tx, _rx) = broadcast::channel(8);
+        let lea = Arc::new(LastEventAt::new());
+        let events: Vec<Result<Event<Secret>, kube_watcher::Error>> = vec![];
+
+        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        assert!(res.is_ok());
+        assert!(lea.elapsed_secs().is_none());
     }
 }
