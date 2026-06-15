@@ -241,8 +241,42 @@ async fn run_namespace_watcher(
     let ar = crate::watcher::config_api_resource();
     let api: Api<DynamicObject> = Api::namespaced_with(kube_client, &namespace, &ar);
     let wc = kube_watcher::Config::default();
-    let mut stream = kube_watch_stream(api, wc).boxed();
+    let stream = kube_watch_stream(api, wc).boxed();
 
+    pump_subscribe_namespace_events(stream, &namespace, &tx, &replay_buf).await;
+
+    // Watcher stream ended — remove from maps so next Subscribe recreates them.
+    namespace_broadcasts.remove(&namespace);
+    namespace_replay_buffers.remove(&namespace);
+    info!(namespace = %namespace, "Namespace watcher ended — removed from broadcast map");
+}
+
+/// Drive a single connection of the per-namespace Config watcher to
+/// completion (or first error). For every Apply/Delete event:
+///
+/// - stamp the apply→broadcast clock,
+/// - serialise the proto once, wrap it in an `Arc<ConfigEvent>`, share it
+///   between replay-buffer push and broadcast fan-out,
+/// - observe `H2_DATA_FRAME_BYTES` (bit-exact wire size) and
+///   `APPLY_TO_BROADCAST_SECONDS` (stage 1 latency),
+/// - increment `EVENTS_BROADCAST{namespace}` only when at least one
+///   subscriber was on the channel at send time.
+///
+/// `Init` / `InitDone` are skipped (no apply happened — would skew the
+/// stage-1 latency histogram). Returns on first stream end OR error so
+/// the caller can clean up the namespace maps in either case.
+///
+/// Extracted from [`run_namespace_watcher`] so this hot loop is unit-testable
+/// against a synthetic stream — no kube API connection required.
+pub(crate) async fn pump_subscribe_namespace_events<S>(
+    mut stream: S,
+    namespace: &str,
+    tx: &broadcast::Sender<Arc<BroadcastFrame>>,
+    replay_buf: &ReplayBuffer,
+) where
+    S: futures_util::stream::TryStream<Ok = Event<DynamicObject>, Error = kube_watcher::Error>
+        + Unpin,
+{
     loop {
         let event = match stream.try_next().await {
             Ok(Some(event)) => event,
@@ -252,7 +286,7 @@ async fn run_namespace_watcher(
                 // `get_or_create_broadcast` retry will rebuild the watcher
                 // when a fresh subscriber arrives.
                 warn!(namespace = %namespace, "Namespace watcher stream ended cleanly");
-                break;
+                return;
             }
             Err(e) => {
                 // Previously `try_next().await.unwrap_or(None)` collapsed
@@ -260,15 +294,10 @@ async fn run_namespace_watcher(
                 // hiding intermittent k8s API failures.  Surface them so
                 // the operator can correlate against API-server logs.
                 warn!(namespace = %namespace, "Namespace watcher stream error: {e}");
-                break;
+                return;
             }
         };
 
-        // Stamp `apply_observed_at` as soon as we have an Apply/Delete event in
-        // hand — this is the closest point in the watcher loop to "the apply
-        // landed in kube and our watch read it" from a user-perceived latency
-        // standpoint.  Init / InitDone control events are filtered out below
-        // and do NOT touch the apply→broadcast histogram.
         let apply_observed_at = Instant::now();
 
         let (event_type, obj) = match event {
@@ -280,51 +309,29 @@ async fn run_namespace_watcher(
             continue;
         };
         let rv = snap.resource_version.clone();
-        // Serialise once, wrap in Arc — all broadcast receivers share the same
-        // allocation; each clone is just a reference-count increment (O(1)).
         let config_event = Arc::new(ConfigEvent {
             event_type,
             config: Some(snapshot_to_proto(&snap)),
         });
 
-        // OBS-2: encoded frame size — proxy for the h2 DATA frame payload that
-        // tonic eventually writes for this event.  `encoded_len` is the
-        // identical value tonic's Codec::encode uses to size its scratch
-        // buffer, so this is bit-exact, not an estimate.
         H2_DATA_FRAME_BYTES.observe(config_event.encoded_len() as f64);
 
         // Push into replay buffer before broadcasting so a subscriber that
         // races to read the buffer after receiving the live event will find it.
-        // Replay path is decoupled from the broadcast envelope — it only needs
-        // the inner Arc<ConfigEvent>.
-        push_replay(&replay_buf, rv, Arc::clone(&config_event));
+        push_replay(replay_buf, rv, Arc::clone(&config_event));
 
-        // Wrap the event in a BroadcastFrame and stamp the send time *as
-        // close to broadcast::send as possible* so the latency histogram
-        // measures the broadcast-to-receive path, not upstream work.
         let sent_at = Instant::now();
         let frame = Arc::new(BroadcastFrame {
             sent_at,
             event: config_event,
         });
 
-        // OBS-2 stage 1: time from "apply event observed by watcher" to
-        // "broadcast::send called".  Captures proto serialisation +
-        // BroadcastFrame allocation + replay-buffer push.  Observed
-        // unconditionally — even when `send` fails (zero receivers) the work
-        // still happened.
         APPLY_TO_BROADCAST_SECONDS.observe(sent_at.duration_since(apply_observed_at).as_secs_f64());
 
-        // `send` returns Err only when there are zero receivers — drop the event.
         if tx.send(frame).is_ok() {
-            EVENTS_BROADCAST.with_label_values(&[&namespace]).inc();
+            EVENTS_BROADCAST.with_label_values(&[namespace]).inc();
         }
     }
-
-    // Watcher stream ended — remove from maps so next Subscribe recreates them.
-    namespace_broadcasts.remove(&namespace);
-    namespace_replay_buffers.remove(&namespace);
-    info!(namespace = %namespace, "Namespace watcher ended — removed from broadcast map");
 }
 
 /// Grace period before an idle namespace watcher is collected.
@@ -1550,5 +1557,139 @@ mod tests {
         assert!(result.is_err(), "panic must be captured, not propagated");
         let payload = result.unwrap_err();
         assert_eq!(panic_message(&payload), "synthetic gc_tick panic");
+    }
+
+    // ── pump_subscribe_namespace_events ──────────────────────────────────────
+
+    fn dyn_config(name: &str, namespace: &str, schema_version: u32, rv: &str) -> DynamicObject {
+        let mut obj = DynamicObject::new(name, &crate::watcher::config_api_resource());
+        obj.metadata.name = Some(name.to_string());
+        obj.metadata.namespace = Some(namespace.to_string());
+        obj.metadata.resource_version = Some(rv.to_string());
+        obj.data = json!({
+            "spec": {
+                "schema_version": schema_version,
+                "content": {"k": rv},
+            }
+        });
+        obj
+    }
+
+    fn ns_watcher_err() -> kube_watcher::Error {
+        kube_watcher::Error::WatchFailed(kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "synthetic".to_string(),
+            reason: "synthetic".to_string(),
+            code: 500,
+        }))
+    }
+
+    #[tokio::test]
+    async fn ns_pump_broadcasts_apply_and_pushes_replay_entry() {
+        use futures_util::stream;
+        let (tx, mut rx) = broadcast::channel(8);
+        let replay = Arc::new(Mutex::new(VecDeque::new()));
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
+            vec![Ok(Event::Apply(dyn_config("cfg", "ns", 1, "100")))];
+
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+
+        let frame = rx.try_recv().expect("must broadcast Modified");
+        assert_eq!(frame.event.event_type, EventType::Modified as i32);
+        let buf = crate::sync_util::lock_recovered(&replay);
+        assert_eq!(buf.len(), 1, "replay buffer must hold the event");
+        assert_eq!(buf.front().unwrap().resource_version_u64, 100);
+    }
+
+    #[tokio::test]
+    async fn ns_pump_init_and_initdone_are_skipped() {
+        use futures_util::stream;
+        let (tx, mut rx) = broadcast::channel(8);
+        let replay = Arc::new(Mutex::new(VecDeque::new()));
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
+            vec![Ok(Event::Init), Ok(Event::InitDone)];
+
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "Init/InitDone must not broadcast — they have no apply latency"
+        );
+        let buf = crate::sync_util::lock_recovered(&replay);
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ns_pump_delete_event_broadcasts_deleted() {
+        use futures_util::stream;
+        let (tx, mut rx) = broadcast::channel(8);
+        let replay = Arc::new(Mutex::new(VecDeque::new()));
+        let obj = dyn_config("cfg", "ns", 5, "200");
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
+            vec![Ok(Event::Delete(obj))];
+
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+
+        let frame = rx.try_recv().expect("must broadcast Deleted");
+        assert_eq!(frame.event.event_type, EventType::Deleted as i32);
+    }
+
+    #[tokio::test]
+    async fn ns_pump_returns_on_stream_error_and_drops_subsequent_events() {
+        use futures_util::stream;
+        let (tx, mut rx) = broadcast::channel(8);
+        let replay = Arc::new(Mutex::new(VecDeque::new()));
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> = vec![
+            Ok(Event::Apply(dyn_config("cfg-a", "ns", 1, "10"))),
+            Err(ns_watcher_err()),
+            // Must not be observed.
+            Ok(Event::Apply(dyn_config("cfg-z", "ns", 99, "99"))),
+        ];
+
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+
+        let first = rx.try_recv().expect("pre-error event landed");
+        assert_eq!(first.event.event_type, EventType::Modified as i32);
+        assert!(rx.try_recv().is_err(), "post-error events dropped");
+        let buf = crate::sync_util::lock_recovered(&replay);
+        assert_eq!(buf.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ns_pump_unparseable_object_is_skipped_without_broadcast() {
+        use futures_util::stream;
+        let (tx, mut rx) = broadcast::channel(8);
+        let replay = Arc::new(Mutex::new(VecDeque::new()));
+        // DynamicObject with no `spec` field — parse_config_object returns None.
+        let mut bad = DynamicObject::new("bad", &crate::watcher::config_api_resource());
+        bad.data = json!({});
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
+            vec![Ok(Event::Apply(bad))];
+
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "unparseable object must not broadcast"
+        );
+        let buf = crate::sync_util::lock_recovered(&replay);
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ns_pump_with_zero_receivers_still_pushes_replay() {
+        use futures_util::stream;
+        let (tx, rx) = broadcast::channel::<Arc<BroadcastFrame>>(8);
+        drop(rx);
+        let replay = Arc::new(Mutex::new(VecDeque::new()));
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
+            vec![Ok(Event::Apply(dyn_config("cfg", "ns", 1, "1")))];
+
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+
+        // Replay buffer is populated even when there are no live subscribers
+        // so a subscriber that arrives mid-event-burst can resume cleanly.
+        let buf = crate::sync_util::lock_recovered(&replay);
+        assert_eq!(buf.len(), 1);
     }
 }
