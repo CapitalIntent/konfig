@@ -146,7 +146,7 @@ impl Watcher {
                 Api::namespaced_with(self.client.clone(), &namespace, &ar);
             let wc =
                 kube_watcher::Config::default().fields(&format!("metadata.name={config_name}"));
-            let mut stream = kube_watch_stream(api, wc).boxed();
+            let stream = kube_watch_stream(api, wc).boxed();
 
             info!(
                 namespace = %namespace,
@@ -155,29 +155,57 @@ impl Watcher {
                 "Config watcher started"
             );
 
-            loop {
-                match stream.try_next().await {
-                    Ok(Some(event)) => {
-                        // Touch BEFORE handle_event so the freshness signal is
-                        // updated even for events that fail to parse downstream.
-                        last_event_at.touch();
-                        handle_event(event, &cache);
-                        attempt = 0;
-                    }
-                    Ok(None) => {
-                        info!("Config watcher stream ended cleanly");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!(attempt, "Config watcher error: {e} — marking cache stale");
-                        cache.mark_all_stale();
-                        let delay = backoff_delay(attempt);
-                        tokio::time::sleep(delay).await;
-                        attempt = attempt.saturating_add(1);
-                        break;
-                    }
+            match pump_config_events(stream, &cache, &last_event_at).await {
+                PumpOutcome::StreamEnded => {
+                    info!("Config watcher stream ended cleanly");
+                    return Ok(());
+                }
+                PumpOutcome::StreamErrored(e) => {
+                    warn!(attempt, "Config watcher error: {e} — marking cache stale");
+                    cache.mark_all_stale();
+                    let delay = backoff_delay(attempt);
+                    tokio::time::sleep(delay).await;
+                    attempt = attempt.saturating_add(1);
                 }
             }
+        }
+    }
+}
+
+/// Outcome of pumping a single connection of a watcher stream. The outer
+/// reconnect loop maps `StreamErrored` to "mark stale + back off + retry"
+/// and `StreamEnded` to "exit cleanly".
+#[derive(Debug)]
+pub(crate) enum PumpOutcome {
+    StreamEnded,
+    StreamErrored(kube_watcher::Error),
+}
+
+/// Drive a Config watcher stream to completion or first error.
+///
+/// On every successfully-received event: `last_event_at` is touched (so the
+/// freshness gauge reflects connectivity even when `handle_event` discards
+/// a malformed object) and `handle_event` updates the cache.
+///
+/// Extracted from [`Watcher::run`] so the per-event behaviour is unit-testable
+/// against a synthetic stream — no kube API connection required.
+pub(crate) async fn pump_config_events<S>(
+    mut stream: S,
+    cache: &Arc<ConfigCache>,
+    last_event_at: &Arc<LastEventAt>,
+) -> PumpOutcome
+where
+    S: futures_util::stream::TryStream<Ok = Event<DynamicObject>, Error = kube_watcher::Error>
+        + Unpin,
+{
+    loop {
+        match stream.try_next().await {
+            Ok(Some(event)) => {
+                last_event_at.touch();
+                handle_event(event, cache);
+            }
+            Ok(None) => return PumpOutcome::StreamEnded,
+            Err(e) => return PumpOutcome::StreamErrored(e),
         }
     }
 }
@@ -356,5 +384,97 @@ mod tests {
             disconnects.load(Ordering::SeqCst),
             "on_disconnect must run once per return",
         );
+    }
+
+    // ── pump_config_events ───────────────────────────────────────────────────
+
+    fn watcher_err() -> kube_watcher::Error {
+        kube_watcher::Error::WatchFailed(kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "synthetic".to_string(),
+            reason: "synthetic".to_string(),
+            code: 500,
+        }))
+    }
+
+    #[tokio::test]
+    async fn pump_applies_events_to_cache_and_returns_ended_on_stream_close() {
+        use futures_util::stream;
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let lea = Arc::new(LastEventAt::new());
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> = vec![
+            Ok(Event::InitApply(make_obj("cfg-a", 1, json!({"a": 1})))),
+            Ok(Event::Apply(make_obj("cfg-a", 2, json!({"a": 2})))),
+            Ok(Event::Apply(make_obj("cfg-b", 3, json!({"b": "x"})))),
+        ];
+        let stream = stream::iter(events);
+
+        let outcome = pump_config_events(stream, &cache, &lea).await;
+        assert!(matches!(outcome, PumpOutcome::StreamEnded));
+        assert_eq!(cache.get("default", "cfg-a").unwrap().schema_version, 2);
+        assert_eq!(cache.get("default", "cfg-b").unwrap().schema_version, 3);
+    }
+
+    #[tokio::test]
+    async fn pump_propagates_stream_error_with_partial_state() {
+        use futures_util::stream;
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let lea = Arc::new(LastEventAt::new());
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> = vec![
+            Ok(Event::Apply(make_obj("cfg-a", 1, json!({"a": 1})))),
+            Err(watcher_err()),
+            // Anything past the error must be ignored — pump returns on first Err.
+            Ok(Event::Apply(make_obj("cfg-c", 99, json!({"c": 0})))),
+        ];
+        let stream = stream::iter(events);
+
+        let outcome = pump_config_events(stream, &cache, &lea).await;
+        assert!(matches!(outcome, PumpOutcome::StreamErrored(_)));
+        // Pre-error event landed; post-error event did not.
+        assert_eq!(cache.get("default", "cfg-a").unwrap().schema_version, 1);
+        assert!(cache.get("default", "cfg-c").is_none());
+    }
+
+    #[tokio::test]
+    async fn pump_touches_last_event_at_per_received_event() {
+        use futures_util::stream;
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let lea = Arc::new(LastEventAt::new());
+        assert!(lea.elapsed_secs().is_none(), "cold start: None");
+
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> = vec![Ok(Event::Init)];
+        let _ = pump_config_events(stream::iter(events), &cache, &lea).await;
+
+        assert!(
+            lea.elapsed_secs().is_some(),
+            "touch must run on Init events too — freshness reflects connectivity, not parse validity",
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_delete_event_does_not_remove_from_cache() {
+        use futures_util::stream;
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let lea = Arc::new(LastEventAt::new());
+        let obj = make_obj("cfg-a", 7, json!({"k": 1}));
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
+            vec![Ok(Event::Apply(obj.clone())), Ok(Event::Delete(obj))];
+        let _ = pump_config_events(stream::iter(events), &cache, &lea).await;
+        // Delete intentionally retains the last-known-good entry — this
+        // documents the audit's accepted design (CU-86aj0jfu5 deferred items).
+        assert_eq!(cache.get("default", "cfg-a").unwrap().schema_version, 7);
+    }
+
+    #[tokio::test]
+    async fn pump_empty_stream_returns_ended_without_touching_anything() {
+        use futures_util::stream;
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let lea = Arc::new(LastEventAt::new());
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> = vec![];
+
+        let outcome = pump_config_events(stream::iter(events), &cache, &lea).await;
+        assert!(matches!(outcome, PumpOutcome::StreamEnded));
+        assert!(lea.elapsed_secs().is_none());
+        assert!(!cache.is_populated());
     }
 }

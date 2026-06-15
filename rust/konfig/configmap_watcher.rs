@@ -33,27 +33,55 @@ impl ConfigMapWatcher {
     ) -> Result<(), kube_watcher::Error> {
         let api: Api<ConfigMap> = Api::namespaced(self.client, &namespace);
         let wc = kube_watcher::Config::default().labels(&format!("{MANAGED_LABEL}=true"));
-        let mut stream = kube_watch_stream(api, wc).boxed();
+        let stream = kube_watch_stream(api, wc).boxed();
 
         info!(namespace = %namespace, "ConfigMap watcher started (konfig.io/managed=true)");
 
-        while let Some(event) = stream.try_next().await? {
-            match event {
-                Event::Apply(cm) | Event::InitApply(cm) => {
-                    if let Some(snap) = parse_configmap(&cm, &namespace) {
-                        info!(name = %snap.name, "ConfigMap applied → cache updated");
-                        cache.update(snap);
-                    }
-                }
-                Event::Delete(cm) => {
-                    let name = cm.metadata.name.as_deref().unwrap_or("<unknown>");
-                    warn!(name, "ConfigMap deleted — cache retains last-known-good");
-                }
-                Event::Init | Event::InitDone => debug!("ConfigMap watch stream: init phase"),
+        pump_configmap_events(stream, &cache, &namespace).await
+    }
+}
+
+/// Handle a single ConfigMap watcher event by updating the cache accordingly.
+/// `Apply`/`InitApply` insert (or replace) the parsed snapshot; `Delete`
+/// leaves the cache's last-known-good entry in place; `Init`/`InitDone` log
+/// only. Extracted so [`pump_configmap_events`] stays a thin event loop.
+pub(crate) fn handle_configmap_event(
+    event: Event<ConfigMap>,
+    cache: &Arc<ConfigCache>,
+    namespace: &str,
+) {
+    match event {
+        Event::Apply(cm) | Event::InitApply(cm) => {
+            if let Some(snap) = parse_configmap(&cm, namespace) {
+                info!(name = %snap.name, "ConfigMap applied → cache updated");
+                cache.update(snap);
             }
         }
-        Ok(())
+        Event::Delete(cm) => {
+            let name = cm.metadata.name.as_deref().unwrap_or("<unknown>");
+            warn!(name, "ConfigMap deleted — cache retains last-known-good");
+        }
+        Event::Init | Event::InitDone => debug!("ConfigMap watch stream: init phase"),
     }
+}
+
+/// Drive a ConfigMap watcher stream to completion or first error.
+///
+/// Extracted from [`ConfigMapWatcher::run`] so the per-event behaviour is
+/// unit-testable against a synthetic stream — no kube API connection
+/// required.
+pub(crate) async fn pump_configmap_events<S>(
+    mut stream: S,
+    cache: &Arc<ConfigCache>,
+    namespace: &str,
+) -> Result<(), kube_watcher::Error>
+where
+    S: futures_util::stream::TryStream<Ok = Event<ConfigMap>, Error = kube_watcher::Error> + Unpin,
+{
+    while let Some(event) = stream.try_next().await? {
+        handle_configmap_event(event, cache, namespace);
+    }
+    Ok(())
 }
 
 fn parse_configmap(cm: &ConfigMap, namespace: &str) -> Option<ConfigSnapshot> {
@@ -156,5 +184,95 @@ mod tests {
         let cm = make_cm("cfg", BTreeMap::new());
         let snap = parse_configmap(&cm, "ns").unwrap();
         assert_eq!(snap.resource_version, "rv-001");
+    }
+
+    // ── pump_configmap_events ────────────────────────────────────────────────
+
+    fn cm(name: &str, schema_version: u32) -> ConfigMap {
+        let mut data = BTreeMap::new();
+        data.insert("schema_version".to_string(), schema_version.to_string());
+        data.insert("k".to_string(), format!("v{schema_version}"));
+        make_cm(name, data)
+    }
+
+    fn watcher_err() -> kube_watcher::Error {
+        // The runtime watcher wraps stream errors in `Error::WatchFailed`.
+        kube_watcher::Error::WatchFailed(kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "synthetic".to_string(),
+            reason: "synthetic".to_string(),
+            code: 500,
+        }))
+    }
+
+    #[tokio::test]
+    async fn pump_applies_events_to_cache_and_completes_on_stream_close() {
+        use futures_util::stream;
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let events: Vec<Result<Event<ConfigMap>, kube_watcher::Error>> = vec![
+            Ok(Event::InitApply(cm("cm-a", 1))),
+            Ok(Event::Apply(cm("cm-a", 2))),
+            Ok(Event::Apply(cm("cm-b", 3))),
+        ];
+
+        let res = pump_configmap_events(stream::iter(events), &cache, "default").await;
+        assert!(res.is_ok(), "clean stream end is Ok");
+        assert_eq!(cache.get("default", "cm-a").unwrap().schema_version, 2);
+        assert_eq!(cache.get("default", "cm-b").unwrap().schema_version, 3);
+    }
+
+    #[tokio::test]
+    async fn pump_propagates_stream_error_and_halts_processing() {
+        use futures_util::stream;
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let events: Vec<Result<Event<ConfigMap>, kube_watcher::Error>> = vec![
+            Ok(Event::Apply(cm("cm-a", 1))),
+            Err(watcher_err()),
+            // Post-error events must not be consumed.
+            Ok(Event::Apply(cm("cm-c", 99))),
+        ];
+
+        let res = pump_configmap_events(stream::iter(events), &cache, "default").await;
+        assert!(res.is_err(), "stream error must propagate");
+        assert_eq!(cache.get("default", "cm-a").unwrap().schema_version, 1);
+        assert!(cache.get("default", "cm-c").is_none());
+    }
+
+    #[tokio::test]
+    async fn pump_delete_event_retains_last_known_good() {
+        use futures_util::stream;
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let events: Vec<Result<Event<ConfigMap>, kube_watcher::Error>> = vec![
+            Ok(Event::Apply(cm("cm-a", 7))),
+            Ok(Event::Delete(cm("cm-a", 7))),
+        ];
+
+        let _ = pump_configmap_events(stream::iter(events), &cache, "default").await;
+        // Delete intentionally retains the cached entry (documented design
+        // for fail-static behaviour during cluster churn).
+        assert_eq!(cache.get("default", "cm-a").unwrap().schema_version, 7);
+    }
+
+    #[tokio::test]
+    async fn pump_init_events_advance_stream_but_skip_cache_writes() {
+        use futures_util::stream;
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let events: Vec<Result<Event<ConfigMap>, kube_watcher::Error>> =
+            vec![Ok(Event::Init), Ok(Event::InitDone)];
+
+        let res = pump_configmap_events(stream::iter(events), &cache, "default").await;
+        assert!(res.is_ok());
+        assert!(!cache.is_populated());
+    }
+
+    #[tokio::test]
+    async fn pump_empty_stream_is_ok_no_writes() {
+        use futures_util::stream;
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let events: Vec<Result<Event<ConfigMap>, kube_watcher::Error>> = vec![];
+
+        let res = pump_configmap_events(stream::iter(events), &cache, "default").await;
+        assert!(res.is_ok());
+        assert!(!cache.is_populated());
     }
 }
