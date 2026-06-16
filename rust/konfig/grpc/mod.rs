@@ -94,6 +94,18 @@ pub struct ServerConfig {
     /// present a cert signed by the configured CA. `None` runs in plaintext
     /// (integration tests + `--tls=false` local dev).
     pub tls_config: Option<tonic::transport::ServerTlsConfig>,
+    /// Optional HTTP/2 `SETTINGS_INITIAL_WINDOW_SIZE` override (bench knob
+    /// for CU-86aj37q7a). `None` = leave tonic default (65,535). Raising
+    /// reduces `h2::Prioritize::poll_complete` self-CPU on large Subscribe
+    /// fan-outs but increases per-stream RAM — sweep before changing the
+    /// default.
+    pub h2_initial_window_bytes: Option<u32>,
+    /// Optional HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` override (bench
+    /// knob for CU-86aj37q7a). `None` = leave tonic default (unlimited).
+    /// Lower caps protect the server from a single client hogging streams;
+    /// raising can help when many Subscribe RPCs multiplex on one
+    /// connection. Sweep before changing the default.
+    pub h2_max_concurrent_streams: Option<u32>,
 }
 
 /// Type-erased shutdown future.  Boxed so the field doesn't push a generic
@@ -278,6 +290,26 @@ impl KonfigService for KonfigServer {
 
 // ── Startup ───────────────────────────────────────────────────────────────────
 
+/// Apply optional HTTP/2 `SETTINGS` overrides to the tonic server builder
+/// (bench knob for CU-86aj37q7a). Each argument is `None` by default — only
+/// the values the operator passed on the CLI are pushed through; tonic /
+/// h2 keep their own defaults otherwise. Raising these reduces
+/// `h2::Prioritize::poll_complete` self-CPU on large Subscribe fan-outs but
+/// increases per-stream RAM — sweep before changing the default.
+fn apply_h2_overrides(
+    mut builder: tonic::transport::Server,
+    initial_window_bytes: Option<u32>,
+    max_concurrent_streams: Option<u32>,
+) -> tonic::transport::Server {
+    if let Some(window) = initial_window_bytes {
+        builder = builder.initial_stream_window_size(Some(window));
+    }
+    if let Some(max_streams) = max_concurrent_streams {
+        builder = builder.max_concurrent_streams(Some(max_streams));
+    }
+    builder
+}
+
 pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
     info!(addr = %cfg.addr, "KonfigService gRPC server starting");
 
@@ -358,6 +390,12 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
     let mut builder = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)));
+
+    builder = apply_h2_overrides(
+        builder,
+        cfg.h2_initial_window_bytes,
+        cfg.h2_max_concurrent_streams,
+    );
 
     if let Some(tls) = cfg.tls_config {
         builder = builder.tls_config(tls)?;
@@ -463,6 +501,24 @@ pub(crate) fn snapshot_to_proto(snap: &crate::types::ConfigSnapshot) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `apply_h2_overrides` is a pure builder pass-through — it must be safe
+    /// to call with both arguments `None` (the default startup path) and with
+    /// only one set (partial bench override). The tonic `Server` builder has
+    /// no public getters for the SETTINGS values, so this test exercises the
+    /// signature + compile contract only — we just verify it returns a usable
+    /// builder that we can chain further calls on.
+    #[test]
+    fn apply_h2_overrides_compiles_and_chains() {
+        let b = tonic::transport::Server::builder();
+        let _ = apply_h2_overrides(b, None, None);
+        let b = tonic::transport::Server::builder();
+        let _ = apply_h2_overrides(b, Some(1_048_576), None);
+        let b = tonic::transport::Server::builder();
+        let _ = apply_h2_overrides(b, None, Some(2048));
+        let b = tonic::transport::Server::builder();
+        let _ = apply_h2_overrides(b, Some(1_048_576), Some(2048));
+    }
 
     /// Jitter must keep the output within ±25 % of the input base.
     #[test]
