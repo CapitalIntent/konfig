@@ -32,6 +32,14 @@ tokio_console = ["dep:console-subscriber"]
 # builds do not enable it by default — `cargo build` falls back to the
 # System allocator, which is fine for clippy/test loops.
 snmalloc = ["dep:snmalloc-rs"]
+# Enables the `/debug/heap-profile.pprof` endpoint which calls
+# `snmalloc_rs::SnMalloc.snapshot().write_pprof_gz()`. The required API
+# lives in the jayakasadev/snmalloc fork's `profiling` cargo feature
+# (not in the upstream snmalloc-rs 0.3 surface), so this feature is
+# wired only by the Bazel `:konfig_bin_heapprof` target — which pulls
+# `@snmalloc//snmalloc-rs:snmalloc_rs_profiling` (fork-built with
+# `profiling`). Cargo builds never enable this feature.
+snmalloc_profiling = ["snmalloc"]
 
 [[test]]
 name = "integration_watcher"
