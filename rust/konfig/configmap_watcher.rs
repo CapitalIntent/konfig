@@ -110,7 +110,11 @@ fn parse_configmap(cm: &ConfigMap, namespace: &str) -> Option<ConfigSnapshot> {
             }
         }
     } else {
-        let mut map = serde_json::Map::new();
+        // Pre-size: `data` is a BTreeMap and we'll insert at most `data.len()`
+        // entries (minus the optional `schema_version` key).  Pre-sizing the
+        // JSON Map eliminates the per-event `RawTable::reserve_rehash`
+        // observed in pyroscope (CU-86aj37pwx).
+        let mut map = serde_json::Map::with_capacity(data.len());
         for (k, v) in data {
             if k == "schema_version" {
                 continue;

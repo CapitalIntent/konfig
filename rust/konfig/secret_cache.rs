@@ -17,6 +17,14 @@ use crate::types::SecretSnapshot;
 
 type Inner = HashMap<OwnedKey, Arc<SecretSnapshot>>;
 
+/// Initial capacity for the inner [`HashMap`].  Typical 10–100 secrets per
+/// namespace × ~10–50 namespaces ⇒ 128 is the next power of two that
+/// covers the common single-namespace pod and amortises rehashes on
+/// multi-namespace pods.  Capacity propagates across the per-write
+/// `.clone()` so this single pre-size avoids `RawTable::reserve_rehash`
+/// on early Apply events (CU-86aj37pwx).
+pub const INITIAL_CAPACITY: usize = 128;
+
 pub struct SecretCache {
     inner: ArcSwap<Inner>,
     /// Serialises the 1-2 concurrent writers — never held during reads.
@@ -26,7 +34,7 @@ pub struct SecretCache {
 impl SecretCache {
     pub fn new() -> Self {
         Self {
-            inner: ArcSwap::from_pointee(Inner::new()),
+            inner: ArcSwap::from_pointee(Inner::with_capacity(INITIAL_CAPACITY)),
             write_lock: Mutex::new(()),
         }
     }

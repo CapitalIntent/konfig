@@ -40,6 +40,12 @@ use crate::secret_watcher::SecretWatcher;
 use crate::types::ConfigSnapshot;
 use crate::watcher::{Watcher, run_with_reconnect};
 
+/// Initial capacity for per-namespace `DashMap`s allocated during startup.
+/// Typical pod fans out across 10–50 namespaces; 64 is the next power of two
+/// and eliminates early `RawTable::reserve_rehash` calls before the maps
+/// reach steady state (CU-86aj37pwx).
+const NAMESPACE_MAP_INITIAL_CAPACITY: usize = 64;
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "konfig", about = "Konfig config distribution service")]
 pub struct Args {
@@ -160,7 +166,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Per-namespace freshness map shared by all watchers and the
     // konfig_stale_seconds sampler.
-    let last_event_at_map: LastEventAtMap = Arc::new(DashMap::new());
+    let last_event_at_map: LastEventAtMap =
+        Arc::new(DashMap::with_capacity(NAMESPACE_MAP_INITIAL_CAPACITY));
 
     // Spawn Config CRD watcher.  The inner `Watcher::run` already retries on
     // transient stream errors; `run_with_reconnect` covers the cases where
@@ -189,7 +196,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn Secret namespace watchers.
     let secret_namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>> =
-        Arc::new(DashMap::new());
+        Arc::new(DashMap::with_capacity(NAMESPACE_MAP_INITIAL_CAPACITY));
     let secret_namespaces = normalize_secret_namespaces(args.secret_namespaces);
     if !secret_namespaces.is_empty() {
         info!(namespaces = ?secret_namespaces, "Starting secret namespace watchers");

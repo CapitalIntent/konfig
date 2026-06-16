@@ -18,6 +18,14 @@ use crate::types::ConfigSnapshot;
 
 type Inner = HashMap<OwnedKey, Arc<ConfigSnapshot>>;
 
+/// Initial capacity for the inner [`HashMap`].  Typical 10–100 configs per
+/// namespace × ~10–50 namespaces ⇒ 128 is the next power of two that
+/// covers the common single-namespace pod and amortises rehashes on
+/// multi-namespace pods.  Capacity propagates across the per-write
+/// `.clone()` so this single pre-size avoids `RawTable::reserve_rehash`
+/// on early Apply events (CU-86aj37pwx).
+pub const INITIAL_CAPACITY: usize = 128;
+
 /// Shared, lock-free multi-key cache for [`ConfigSnapshot`].
 ///
 /// Keyed by `(namespace, name)`.  Reads pay only an atomic pointer load;
@@ -36,7 +44,7 @@ impl ConfigCache {
     /// non-empty `namespace` + `name`, it is pre-inserted; otherwise it is
     /// discarded (default snapshots have no key to insert under).
     pub fn new(initial: ConfigSnapshot) -> Self {
-        let mut map = Inner::new();
+        let mut map = Inner::with_capacity(INITIAL_CAPACITY);
         if !initial.namespace.is_empty() && !initial.name.is_empty() {
             let key = OwnedKey::new(initial.namespace.clone(), initial.name.clone());
             map.insert(key, Arc::new(initial));
