@@ -1,9 +1,16 @@
 name: Publish images
 on:
-  push:
-    branches: [main]
+  # DISABLED on push: the required Docker Hub + release secrets are not
+  # provisioned on this repo (`gh secret list` shows only BUILDBUDDY_API_KEY).
+  # Every prior auto-run failed at the docker/login-action step with
+  # "Username and password required". Re-enable the push trigger after
+  # provisioning:
+  #   gh secret set DOCKERHUB_USERNAME   --repo CapitalIntent/konfig
+  #   gh secret set DOCKERHUB_TOKEN      --repo CapitalIntent/konfig
+  #   gh secret set KONFIG_RELEASE_TOKEN --repo CapitalIntent/konfig
+  workflow_dispatch:
 
-# Required repository secrets:
+# Required repository secrets (must be set before the workflow can succeed):
 #   DOCKERHUB_USERNAME      — Docker Hub user for push.
 #   DOCKERHUB_TOKEN         — Docker Hub PAT with write:packages on the
 #                             kasa288/konfig* repositories.
