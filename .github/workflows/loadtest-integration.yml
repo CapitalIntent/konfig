@@ -60,9 +60,46 @@ jobs:
           wait: 120s
 
       - name: Load images into kind
+        # `kind load docker-image` returns once the image tarball has been
+        # piped into the node, but containerd's image store can lag behind
+        # by a beat — the image is on disk but `crictl images` (and therefore
+        # kubelet's image-resolve path) doesn't see it yet. If the konfig
+        # Deployment lands in that window, the pod hits ImagePullBackOff or,
+        # worse with IfNotPresent + a partial layer, a CrashLoopBackOff with
+        # zero log output (container created → exits before main runs).
+        # See CU-86aj3872a for the symptom history. Poll containerd's CRI
+        # view inside the kind node until both tags resolve before moving on.
+        # TODO(CU-86aj3872a follow-up): if this + node Ready wait don't fully
+        # eliminate the first-run flake, add a pre-main eprintln! in main.rs
+        # so future crashes surface a log line before any allocator init.
         run: |
           kind load docker-image kasa288/konfig:latest --name konfig-loadtest
           kind load docker-image kasa288/konfig-loadtest:latest --name konfig-loadtest
+          # `crictl images` columns are REPO TAG IMAGE-ID SIZE; containerd
+          # prefixes the registry as `docker.io/`. Match on
+          # "<repo> <tag>" anchored to the start of the line so a partial
+          # name (e.g. `konfig` matching `konfig-loadtest`) cannot false-pass.
+          for img in kasa288/konfig:latest kasa288/konfig-loadtest:latest; do
+            repo="${img%:*}"
+            tag="${img##*:}"
+            echo "Waiting for $img to appear in kind containerd image store..."
+            ok=0
+            for i in $(seq 1 60); do
+              if docker exec konfig-loadtest-control-plane crictl images 2>/dev/null \
+                   | awk -v r="docker.io/$repo" -v t="$tag" \
+                       '$1 == r && $2 == t { found=1 } END { exit !found }'; then
+                echo "  -> $img visible in containerd after ${i}s"
+                ok=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "::error::Timeout waiting for $img in containerd image store"
+              docker exec konfig-loadtest-control-plane crictl images || true
+              exit 1
+            fi
+          done
 
       - name: Apply CRDs (Config) and wait for establishment
         run: |
@@ -115,6 +152,18 @@ jobs:
             fi
           done
 
+      - name: Wait for node Ready (CNI plugin posted Ready condition)
+        # `helm/kind-action` returns once the API server is up, but the CNI
+        # plugin (kindnet) may still be installing its pod network when we
+        # reach this point. Scheduling the konfig Deployment before CNI is
+        # Ready means the pod sandbox is created without functional pod
+        # networking — gRPC bind succeeds but health probes can't reach
+        # the pod IP, manifesting as a fast crashloop with no logs. Block
+        # here on the node's Ready condition, which kubelet only sets true
+        # after the CNI plugin reports healthy. See CU-86aj3872a.
+        run: |
+          kubectl wait --for=condition=Ready node --all --timeout=120s
+
       - name: Apply konfig Deployment (force IfNotPresent, disable TLS for loadtest)
         # `infra/konfig/deployment.yaml` references `kasa288/konfig:latest`
         # (post-PR-#31 sha-pinning rewrites this to a short SHA on main pushes,
@@ -139,11 +188,22 @@ jobs:
         # We strip the four --tls* args, replace with --tls=false, and drop
         # the konfig-tls volume mount + Secret volume so the pod can start
         # without cert-manager.
+        #
+        # Also bump readiness/liveness `initialDelaySeconds` from 5 → 15 for
+        # the kind gate only. On the blacksmith-8vcpu runner the konfig
+        # process can take longer than 5s to reach the listener bind under
+        # heavy I/O contention (image-store + cluster init still settling),
+        # and a single missed TCP probe inside the failureThreshold window
+        # can race the pod into CrashLoopBackOff before it ever serves.
+        # Prod manifests stay tight (5s) — this is workflow-scoped only.
+        # Refs CU-86aj3872a.
         run: |
           yq '
             (.spec.template.spec.containers[] | select(.name == "konfig")).imagePullPolicy = "IfNotPresent"
             | (.spec.template.spec.containers[] | select(.name == "konfig")).args |=
                 ([.[] | select(test("^--tls") | not)] + ["--tls=false"])
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).readinessProbe.initialDelaySeconds = 15
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).livenessProbe.initialDelaySeconds = 15
             | del(.spec.template.spec.containers[] | select(.name == "konfig").volumeMounts[] | select(.name == "konfig-tls"))
             | del(.spec.template.spec.volumes[] | select(.name == "konfig-tls"))
           ' infra/konfig/deployment.yaml \
