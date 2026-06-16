@@ -85,6 +85,11 @@ tonic = {workspace = true}
 tonic-health = "0.14.6"
 tracing = {workspace = true}
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}
+# Non-blocking stdout writer for the tracing subscriber — moves the
+# `LineWriterShim<StdoutRaw>::write_all` work off the runtime threads onto a
+# dedicated background worker, eliminating a 30 ms / 1.6% self-CPU hot path
+# observed on the synchronous writer (CU-86aj360ae pyroscope capture).
+tracing-appender = "0.2.5"
 thiserror = {workspace = true}
 # Tokio runtime metrics — exported via the existing /metrics Prometheus
 # endpoint. Requires `--cfg tokio_unstable` (set in .bazelrc + .cargo/config.toml).

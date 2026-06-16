@@ -55,6 +55,7 @@ rust_library(
         "@konfig_crates//:tonic-health",
         "@konfig_crates//:tonic-prost",
         "@konfig_crates//:tracing",
+        "@konfig_crates//:tracing-appender",
         "@konfig_crates//:tracing-subscriber",
     ],
     proc_macro_deps = ["@konfig_crates//:async-trait"],
@@ -109,6 +110,7 @@ rust_library(
         "@konfig_crates//:tonic-health",
         "@konfig_crates//:tonic-prost",
         "@konfig_crates//:tracing",
+        "@konfig_crates//:tracing-appender",
         "@konfig_crates//:tracing-subscriber",
         # Profiling-build allocator (jayakasadev fork) — required by the
         # `/debug/heap-profile.pprof` handler. The C archive carries
@@ -151,6 +153,7 @@ rust_binary(
         "@konfig_crates//:tokio",
         "@konfig_crates//:tonic-health",
         "@konfig_crates//:tracing",
+        "@konfig_crates//:tracing-appender",
         "@konfig_crates//:tracing-subscriber",
         # Default allocator (all OS): snmalloc from jayakasadev fork.
         "@snmalloc//snmalloc-rs:snmalloc_rs",
@@ -183,6 +186,7 @@ rust_binary(
         "@konfig_crates//:tokio",
         "@konfig_crates//:tonic-health",
         "@konfig_crates//:tracing",
+        "@konfig_crates//:tracing-appender",
         "@konfig_crates//:tracing-subscriber",
         # Default allocator (all OS): snmalloc from jayakasadev fork.
         "@snmalloc//snmalloc-rs:snmalloc_rs",
@@ -220,6 +224,7 @@ rust_binary(
         "@konfig_crates//:tokio",
         "@konfig_crates//:tonic-health",
         "@konfig_crates//:tracing",
+        "@konfig_crates//:tracing-appender",
         "@konfig_crates//:tracing-subscriber",
         # Profiling-build allocator from jayakasadev fork. Symbolicated
         # variant: `profiling` + `symbolicate` Cargo features both on,
