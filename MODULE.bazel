@@ -258,15 +258,5 @@ bazel_dep(name = "snmalloc", version = "0")
 git_override(
     module_name = "snmalloc",
     remote = "https://github.com/jayakasadev/snmalloc.git",
-    commit = "54cf4c43a2465d6510335b6122373002cf4845c2",
-    # The fork's crate_universe extension (which registers `@crates`
-    # with `flate2`, required by `:snmalloc_rs_profiling`) is declared
-    # `dev_dependency = True`. Bazel skips dev_dependencies of non-root
-    # modules, so without this patch every consumer of
-    # `:snmalloc_rs_profiling` fails analysis with
-    #   No repository visible as '@crates' from repository '@@snmalloc+'
-    # The patch flips the flag to False. Upstream-fix follow-up tracked
-    # in CU-86aj2dujv on the fork milestone.
-    patches = ["//third_party/patches:snmalloc-crates-visible.patch"],
-    patch_strip = 1,
+    commit = "78fd4056676540e3a91ffa9fd7b1e6124f8a2f55",
 )
