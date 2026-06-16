@@ -99,6 +99,23 @@ pub struct Args {
     /// when `--tls=true`. Every client must present a cert signed by this CA.
     #[arg(long, env = "KONFIG_TLS_CLIENT_CA")]
     pub tls_client_ca: Option<PathBuf>,
+
+    /// HTTP/2 `SETTINGS_INITIAL_WINDOW_SIZE` override for the gRPC server
+    /// (bench knob for CU-86aj37q7a). `None` (default) = leave the tonic
+    /// default (65,535). Raising reduces `h2::Prioritize::poll_complete`
+    /// self-CPU on large Subscribe fan-outs but increases per-stream RAM —
+    /// sweep before changing the default.
+    #[arg(long, env = "KONFIG_H2_INITIAL_WINDOW_BYTES")]
+    pub h2_initial_window_bytes: Option<u32>,
+
+    /// HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` override for the gRPC
+    /// server (bench knob for CU-86aj37q7a). `None` (default) = leave the
+    /// tonic default (unlimited). Lower caps protect the server from a
+    /// single client monopolising streams; raising can help when many
+    /// Subscribe RPCs multiplex on one connection — sweep before changing
+    /// the default.
+    #[arg(long, env = "KONFIG_H2_MAX_CONCURRENT_STREAMS")]
+    pub h2_max_concurrent_streams: Option<u32>,
 }
 
 /// Resolve a `ServerTlsConfig` from the TLS-related fields on `args`, or
@@ -264,6 +281,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let _ = shutdown_rx.await;
         })),
         tls_config,
+        h2_initial_window_bytes: args.h2_initial_window_bytes,
+        h2_max_concurrent_streams: args.h2_max_concurrent_streams,
     })
     .await?;
 
@@ -389,6 +408,8 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             tls_client_ca: None,
+            h2_initial_window_bytes: None,
+            h2_max_concurrent_streams: None,
         }
     }
 
@@ -477,6 +498,35 @@ mod tests {
             Args::try_parse_from(["konfig", "--name", "cfg", "--tls=false"]).expect("must parse");
         assert!(!args.tls);
         assert!(args.tls_cert.is_none());
+    }
+
+    /// `--h2-initial-window-bytes` and `--h2-max-concurrent-streams`
+    /// default to `None` (bench knobs for CU-86aj37q7a) and parse the
+    /// value when supplied. `None` means "leave the tonic default" — no
+    /// builder method is called downstream.
+    #[test]
+    fn args_parse_h2_flags_default_none() {
+        let args =
+            Args::try_parse_from(["konfig", "--name", "cfg", "--tls=false"]).expect("must parse");
+        assert!(args.h2_initial_window_bytes.is_none());
+        assert!(args.h2_max_concurrent_streams.is_none());
+    }
+
+    #[test]
+    fn args_parse_h2_flags_explicit() {
+        let args = Args::try_parse_from([
+            "konfig",
+            "--name",
+            "cfg",
+            "--tls=false",
+            "--h2-initial-window-bytes",
+            "1048576",
+            "--h2-max-concurrent-streams",
+            "2048",
+        ])
+        .expect("must parse");
+        assert_eq!(args.h2_initial_window_bytes, Some(1_048_576));
+        assert_eq!(args.h2_max_concurrent_streams, Some(2048));
     }
 
     #[test]
