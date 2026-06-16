@@ -1,4 +1,0 @@
-exports_files(
-    ["snmalloc-crates-visible.patch"],
-    visibility = ["//visibility:public"],
-)
