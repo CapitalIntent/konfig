@@ -24,6 +24,8 @@
 #[global_allocator]
 static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
+use std::sync::OnceLock;
+
 use clap::Parser;
 use konfig::startup::{Args, run};
 #[cfg(feature = "profiling")]
@@ -32,6 +34,13 @@ use pyroscope::PyroscopeAgent;
 use pyroscope_pprofrs::{PprofConfig, pprof_backend};
 #[cfg(any(feature = "profiling", feature = "tokio_console"))]
 use tracing::info;
+use tracing_appender::non_blocking::WorkerGuard;
+
+// Holds the `tracing_appender::non_blocking` worker guard for the lifetime
+// of the process. Dropping the guard flushes any pending log lines and
+// stops the background writer thread; pinning it in a `OnceLock` keeps it
+// alive until process exit so we never tear the worker down mid-run.
+static TRACING_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -67,6 +76,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `tokio_console` feature is compiled in AND `RUST_CONSOLE=1` at runtime;
 /// otherwise installs the plain `tracing_subscriber::fmt` layer with the
 /// `konfig=info` filter.
+///
+/// The fmt layer writes through `tracing_appender::non_blocking`, which
+/// offloads the actual `StdoutRaw::write_all` syscalls onto a dedicated
+/// background worker thread. Pyroscope captures (CU-86aj360ae) showed
+/// the synchronous `LineWriterShim<StdoutRaw>::write_all` path burning
+/// ~30 ms / 1.6% of self-CPU on the runtime workers; the non-blocking
+/// writer eliminates that hot path entirely. The returned `WorkerGuard`
+/// is stashed in [`TRACING_GUARD`] so it lives for the process lifetime
+/// — dropping the guard would shut the worker down and stall logs.
 fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "tokio_console")]
     let console_enabled = matches!(std::env::var("RUST_CONSOLE").as_deref(), Ok("1"));
@@ -82,10 +100,16 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    if TRACING_GUARD.set(guard).is_err() {
+        return Err("init_tracing called more than once: TRACING_GUARD already populated".into());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("konfig=info".parse()?),
         )
+        .with_writer(writer)
         .init();
     Ok(())
 }
