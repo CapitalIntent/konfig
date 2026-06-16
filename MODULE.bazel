@@ -258,5 +258,5 @@ bazel_dep(name = "snmalloc", version = "0")
 git_override(
     module_name = "snmalloc",
     remote = "https://github.com/jayakasadev/snmalloc.git",
-    commit = "78fd4056676540e3a91ffa9fd7b1e6124f8a2f55",
+    commit = "8d8e777b83559911dff0baf9f41a6965c9d1854f",
 )
