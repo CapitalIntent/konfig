@@ -45,8 +45,10 @@ jobs:
           EOF
 
       - name: Build konfig + konfig-loadtest OCI images (linux/amd64)
-        # The :load target on the macro builds arm64 for Apple Silicon dev
-        # hosts; :load_amd64 builds the matching arch for ubuntu-latest.
+        # `:load_amd64` builds the amd64 image natively on this runner.
+        # The macro also exposes `:load_arm64` for Apple Silicon dev hosts.
+        # No multi-arch `:load`/`:image` target is built — each arch is its
+        # own native build (no Bazel sysroot wiring after 2026-06-16).
         run: |
           bazel run //docker/konfig:load_amd64
           bazel run //docker/konfig-loadtest:load_amd64

@@ -13,25 +13,35 @@ on:
 #
 # Skips itself when the commit message contains `[skip publish]` so the
 # pin-back commit doesn't loop into another publish run.
+#
+# Native-matrix per-arch build: each arch's image is built + pushed on its
+# own native runner (no Bazel sysroot / cross-compile wiring). The final
+# manifest fan-in step uses `docker buildx imagetools create` to assemble
+# the multi-arch tag from the per-arch tags pushed in the matrix jobs.
 
 concurrency:
   group: publish-images-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Push multi-arch images + pin manifest SHAs
+  build_push_per_arch:
+    name: Build + push ${{ matrix.arch }}
     if: "!contains(github.event.head_commit.message, '[skip publish]')"
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    permissions:
-      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: blacksmith-8vcpu-ubuntu-2404
+          - arch: arm64
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
+    runs-on: ${{ matrix.runner }}
     env:
       BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.KONFIG_RELEASE_TOKEN }}
 
       - uses: bazelbuild/setup-bazelisk@v3
 
@@ -49,6 +59,34 @@ jobs:
           build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
           EOF
 
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push konfig (${{ matrix.arch }})
+        run: bazel run --stamp //docker/konfig:push_${{ matrix.arch }}
+
+      - name: Push konfig-cli (${{ matrix.arch }})
+        run: bazel run --stamp //docker/konfig-cli:push_${{ matrix.arch }}
+
+      - name: Push konfig-loadtest (${{ matrix.arch }})
+        run: bazel run --stamp //docker/konfig-loadtest:push_${{ matrix.arch }}
+
+  assemble_manifests_and_pin:
+    name: Assemble multi-arch manifests + pin SHAs
+    needs: build_push_per_arch
+    if: "!contains(github.event.head_commit.message, '[skip publish]')"
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.KONFIG_RELEASE_TOKEN }}
+
       - name: Resolve short SHA
         id: sha
         run: echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
@@ -59,14 +97,23 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Push konfig image
-        run: bazel run --stamp //docker/konfig:push
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Push konfig-cli image
-        run: bazel run --stamp //docker/konfig-cli:push
-
-      - name: Push konfig-loadtest image
-        run: bazel run --stamp //docker/konfig-loadtest:push
+      - name: Assemble multi-arch manifests
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.sha.outputs.short }}"
+          # For each repo, combine the per-arch tags pushed above into a
+          # multi-arch index tagged both <sha> and latest.
+          for repo in kasa288/konfig kasa288/konfig-cli kasa288/konfig-loadtest; do
+            for target in "$SHA" "latest"; do
+              docker buildx imagetools create \
+                --tag "$repo:$target" \
+                "$repo:$SHA-amd64" \
+                "$repo:$SHA-arm64"
+            done
+          done
 
       - name: Pin manifest tags to short SHA
         run: ./tools/pin-image-tags.sh "${{ steps.sha.outputs.short }}"

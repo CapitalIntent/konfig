@@ -79,17 +79,6 @@ bazel_dep(name = "protobuf", version = "29.3")
 bazel_dep(name = "rules_shell", version = "0.3.0")
 
 ##################################
-# Linux sysroots for cross-compilation from macOS
-# Extracted from ubuntu:22.04 via Docker (runs once per arch, cached by Bazel).
-##################################
-sysroot_ext = use_extension(
-    "//tools/sysroot:extensions.bzl",
-    "sysroot_ext",
-    dev_dependency = True,
-)
-use_repo(sysroot_ext, "linux_amd64_sysroot", "linux_arm64_sysroot")
-
-##################################
 # OCI images (dev only — used for building/pushing the server image)
 ##################################
 bazel_dep(name = "rules_oci", version = "2.3.0")
@@ -147,6 +136,14 @@ llvm = use_extension(
     "llvm",
     dev_dependency = True,
 )
+# Enable cross-compilation to Linux targets from macOS via LLVM's bundled
+# libc++ — no glibc sysroot wired. The previous setup extracted Ubuntu 22.04
+# `libstdc++-12-dev` via Docker into per-arch sysroots, but the libstdc++
+# header include path was never propagated to clang during foreign_cc cmake
+# builds, so cross-compile from darwin failed with `'atomic' file not found`
+# inside `external/snmalloc+/src/snmalloc/stl/cxx/atomic.h`. Dropping the
+# sysroot and letting LLVM provide its own C++ runtime headers matches the
+# capitalintent monorepo setup and makes cross-compile work out of the box.
 llvm.toolchain(
     name = "konfig_llvm_toolchain",
     cxx_standard = {"": "c++23"},
@@ -158,16 +155,6 @@ llvm.toolchain(
         "aarch64-unknown-linux-gnu": "libc++",
         "x86_64-unknown-linux-gnu": "libc++",
     },
-)
-llvm.sysroot(
-    name = "konfig_llvm_toolchain",
-    label = "@linux_arm64_sysroot//:sysroot",
-    targets = ["linux-aarch64"],
-)
-llvm.sysroot(
-    name = "konfig_llvm_toolchain",
-    label = "@linux_amd64_sysroot//:sysroot",
-    targets = ["linux-x86_64"],
 )
 use_repo(llvm, "konfig_llvm_toolchain", "konfig_llvm_toolchain_llvm")
 
