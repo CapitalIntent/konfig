@@ -120,7 +120,7 @@ rust_library(
         # Pulls `backtrace` (+ `addr2line` + `gimli` + `object`)
         # transitively; ~600 KB live set cost is acceptable for the
         # opt-in heap-profiling image.
-        "@snmalloc//snmalloc-rs:snmalloc_rs_profiling_symbolicated",
+        "@snmalloc//snmalloc-rs:snmalloc_rs_profiling",
     ],
     proc_macro_deps = ["@konfig_crates//:async-trait"],
 )
@@ -225,7 +225,7 @@ rust_binary(
         # variant: `profiling` + `symbolicate` Cargo features both on,
         # so pprof bodies emitted by `HeapProfile::write_pprof_gz`
         # carry resolved function names instead of raw hex addresses.
-        "@snmalloc//snmalloc-rs:snmalloc_rs_profiling_symbolicated",
+        "@snmalloc//snmalloc-rs:snmalloc_rs_profiling",
     ],
 )
 
