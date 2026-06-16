@@ -60,6 +60,65 @@ rust_library(
     proc_macro_deps = ["@konfig_crates//:async-trait"],
 )
 
+# Heap-profiling library variant — same sources as `:konfig` but built
+# with `--cfg feature="snmalloc_profiling"`, which compiles in the
+# `/debug/heap-profile.pprof` handler in `startup::serve_metrics` and
+# adds `snmalloc-rs` as a direct library dep so the handler can call
+# `SnMalloc.snapshot().write_pprof_gz(...)`. Renames to `konfig` via
+# `crate_name` so binaries that depend on this target keep using the
+# unmodified `use konfig::startup::run` import.
+rust_library(
+    name = "konfig_heapprof",
+    srcs = glob(
+        ["**/*.rs"],
+        exclude = [
+            "main.rs",
+            "build.rs",
+            "tests/**",
+        ],
+    ),
+    crate_features = [
+        "snmalloc",
+        "snmalloc_profiling",
+    ],
+    crate_name = "konfig",
+    tags = ["konfig", "rust", "heapprof"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":konfig_bs",
+        "@konfig_crates//:arc-swap",
+        "@konfig_crates//:axum",
+        "@konfig_crates//:base64",
+        "@konfig_crates//:bytes",
+        "@konfig_crates//:clap",
+        "@konfig_crates//:dashmap",
+        "@konfig_crates//:futures-util",
+        "@konfig_crates//:k8s-openapi",
+        "@konfig_crates//:kube",
+        "@konfig_crates//:lazy_static",
+        "@konfig_crates//:prometheus",
+        "@konfig_crates//:prost",
+        "@konfig_crates//:serde",
+        "@konfig_crates//:serde_json",
+        "@konfig_crates//:serde_yaml",
+        "@konfig_crates//:thiserror",
+        "@konfig_crates//:tokio",
+        "@konfig_crates//:tokio-metrics",
+        "@konfig_crates//:tokio-stream",
+        "@konfig_crates//:tonic",
+        "@konfig_crates//:tonic-health",
+        "@konfig_crates//:tonic-prost",
+        "@konfig_crates//:tracing",
+        "@konfig_crates//:tracing-subscriber",
+        # Profiling-build allocator (jayakasadev fork) — required by the
+        # `/debug/heap-profile.pprof` handler. The C archive carries
+        # `SNMALLOC_PROFILE=ON` and the Rust surface exposes
+        # `HeapProfile::write_pprof_gz`.
+        "@snmalloc//snmalloc-rs:snmalloc_rs_profiling",
+    ],
+    proc_macro_deps = ["@konfig_crates//:async-trait"],
+)
+
 # Server binary — standalone konfig server entry point.
 # Direct crate deps required: standard rust_binary does not inherit library deps.
 #
@@ -124,6 +183,43 @@ rust_binary(
     ],
 )
 
+# Opt-in heap-profiling binary — same sources as `:konfig_bin` but built
+# with `--cfg feature="snmalloc_profiling"`, which compiles in the
+# `/debug/heap-profile.pprof` endpoint in `startup::serve_metrics`. The
+# snmalloc dep swaps to `:snmalloc_rs_profiling` (fork-built with the
+# `profiling` Cargo feature on snmalloc-rs + the matching
+# `SNMALLOC_PROFILE=ON` C archive), which exposes
+# `SnMalloc.snapshot()` and `HeapProfile::write_pprof_gz`. Packaged
+# separately as the `konfig-heapprof` image; the default `konfig` image
+# stays slim.
+rust_binary(
+    name = "konfig_bin_heapprof",
+    srcs = ["main.rs"],
+    crate_features = [
+        "snmalloc",
+        "snmalloc_profiling",
+    ],
+    stamp = 1,
+    tags = ["konfig", "rust", "heapprof"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":konfig_heapprof",
+        "@konfig_crates//:axum",
+        "@konfig_crates//:clap",
+        "@konfig_crates//:dashmap",
+        "@konfig_crates//:kube",
+        "@konfig_crates//:prometheus",
+        "@konfig_crates//:tokio",
+        "@konfig_crates//:tonic-health",
+        "@konfig_crates//:tracing",
+        "@konfig_crates//:tracing-subscriber",
+        # Profiling-build allocator from jayakasadev fork. Exposes the
+        # `HeapProfile` / `write_pprof_gz` API that the
+        # `/debug/heap-profile.pprof` endpoint depends on.
+        "@snmalloc//snmalloc-rs:snmalloc_rs_profiling",
+    ],
+)
+
 rust_test(
     name = "test",
     size = "small",
@@ -139,6 +235,19 @@ rust_test(
     # `rust_test` targets in parallel.
     env = {"RUST_TEST_THREADS": "1"},
     tags = ["konfig", "rust", "unit"],
+)
+
+# Heap-profiling test variant — same source set as `:test` but built
+# against `:konfig_heapprof` (snmalloc_profiling feature on). Catches
+# API breakage in the `#[cfg(feature = "snmalloc_profiling")]` arm of
+# `startup::heap_profile_handler` even though the default `:test`
+# target never compiles that branch. Wired into CI alongside `:test`.
+rust_test(
+    name = "test_heapprof",
+    size = "small",
+    crate = ":konfig_heapprof",
+    env = {"RUST_TEST_THREADS": "1"},
+    tags = ["konfig", "rust", "heapprof", "unit"],
 )
 
 # Rustdoc — `bazel build //rust/konfig:doc` to produce HTML docs.

@@ -1,0 +1,27 @@
+From: konfig <konfig@local>
+Subject: [PATCH] snmalloc MODULE.bazel: drop dev_dependency on crate_universe
+
+The fork's BUILD files reference `@crates//:flate2` unconditionally
+(see snmalloc-rs/BUILD.bazel for the `:snmalloc_rs_profiling` target),
+but the matching crate_universe extension is registered with
+`dev_dependency = True`. Bazel skips dev_dependencies of non-root
+modules, so consumers depending on `:snmalloc_rs_profiling` analyze-
+fail with `No repository visible as '@crates' from repository
+'@@snmalloc+'`.
+
+Flip the flag so `@crates` is visible to downstream consumers.
+
+This patch is applied locally via `git_override(patches=...)` in
+konfig's MODULE.bazel; the upstream fix is tracked in CU-86aj2dujv.
+
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -45,7 +45,7 @@
+ crate = use_extension(
+     "@rules_rust//crate_universe:extension.bzl",
+     "crate",
+-    dev_dependency = True,
++    dev_dependency = False,
+ )
+ crate.spec(
+     package = "flate2",

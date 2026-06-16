@@ -267,7 +267,9 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 async fn serve_metrics(addr: SocketAddr) {
     use axum::{Router, routing::get};
 
-    let app = Router::new().route("/metrics", get(metrics_handler));
+    let app = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route("/debug/heap-profile.pprof", get(heap_profile_handler));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind metrics");
@@ -307,6 +309,62 @@ async fn metrics_handler() -> axum::response::Response {
                 .into_response()
         }
     }
+}
+
+// `/debug/heap-profile.pprof` — gzipped pprof-format heap snapshot from
+// snmalloc's sampling profiler. Two variants:
+//
+// * `snmalloc_profiling` ON  (Bazel `:konfig_bin_heapprof`, library
+//   `:konfig_heapprof`, snmalloc-rs built with the `profiling` Cargo
+//   feature + C archive `SNMALLOC_PROFILE=ON`):
+//     `SnMalloc.snapshot()` returns a live `HeapProfile`;
+//     `write_pprof_gz(Weight::Allocated)` streams the gzipped pprof
+//     body. Operator can `curl -s host:9090/debug/heap-profile.pprof
+//     | go tool pprof -http=:8080 -`.
+//
+// * `snmalloc_profiling` OFF (default `:konfig_bin` / `:konfig`):
+//     Return 404 with a body explaining the rebuild needed. We choose
+//     404 (not 501) so scrape rules that conditionally probe the
+//     endpoint treat it as "not present on this build" rather than
+//     "transient server error"; the body distinguishes the cause for
+//     human operators inspecting `curl -v`.
+#[cfg(feature = "snmalloc_profiling")]
+async fn heap_profile_handler() -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    let profile = snmalloc_rs::SnMalloc.snapshot();
+    let mut buf = Vec::new();
+    if let Err(e) = profile.write_pprof_gz(&mut buf, snmalloc_rs::Weight::Allocated) {
+        tracing::warn!("heap-profile encode failed: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("heap-profile encode failed: {e}"),
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"heap-profile.pprof.gz\"",
+            ),
+        ],
+        buf,
+    )
+        .into_response()
+}
+
+#[cfg(not(feature = "snmalloc_profiling"))]
+async fn heap_profile_handler() -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    (
+        StatusCode::NOT_FOUND,
+        "heap profiling not compiled in; rebuild with Bazel target //rust/konfig:konfig_bin_heapprof to enable",
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -447,5 +505,55 @@ mod tests {
             }
         }
         assert!(result.is_err(), "missing required --name must error");
+    }
+
+    // Default (no `snmalloc_profiling` feature) build of the metrics
+    // server must answer `/debug/heap-profile.pprof` with a 404 carrying
+    // a body that points operators at the heapprof Bazel target. We
+    // exercise the handler directly so the test covers the stub on the
+    // default `:konfig` rust_library — Bazel `:test` runs against that
+    // crate and never has `snmalloc_profiling` on (the heapprof variant
+    // has its own opt-in target with no test entry).
+    #[cfg(not(feature = "snmalloc_profiling"))]
+    #[tokio::test]
+    async fn heap_profile_handler_default_build_returns_404_with_rebuild_hint() {
+        use axum::body::to_bytes;
+        use axum::http::StatusCode;
+        let resp = heap_profile_handler().await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("body collects");
+        let text = std::str::from_utf8(&body).expect("body utf-8");
+        assert!(
+            text.contains("konfig_bin_heapprof"),
+            "404 body must name the rebuild target, got: {text}"
+        );
+    }
+
+    // Enabled-path smoke. Compiled only when the `snmalloc_profiling`
+    // feature is set (i.e. when the test target depends on
+    // `:snmalloc_rs_profiling`). Today the in-tree `:test` rust_test
+    // target is wired against the default `:konfig` library and won't
+    // exercise this branch, but the gate guarantees the enabled
+    // surface still compiles in CI follow-ups that flip on the
+    // feature for coverage.
+    #[cfg(feature = "snmalloc_profiling")]
+    #[tokio::test]
+    async fn heap_profile_handler_profiling_build_returns_octet_stream() {
+        use axum::http::{StatusCode, header};
+        let resp = heap_profile_handler().await;
+        // Snapshot may legitimately be empty when SNMALLOC_PROFILE was
+        // built off at C link time; in that case the writer still
+        // emits a valid (empty-sample) gzipped pprof body and we
+        // expect 200. The 5xx branch only fires on real encoder
+        // failure.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(ct, "application/octet-stream");
     }
 }
