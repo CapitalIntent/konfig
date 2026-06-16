@@ -113,8 +113,14 @@ rust_library(
         # Profiling-build allocator (jayakasadev fork) — required by the
         # `/debug/heap-profile.pprof` handler. The C archive carries
         # `SNMALLOC_PROFILE=ON` and the Rust surface exposes
-        # `HeapProfile::write_pprof_gz`.
-        "@snmalloc//snmalloc-rs:snmalloc_rs_profiling",
+        # `HeapProfile::write_pprof_gz`. The `_symbolicated` variant
+        # also enables snmalloc-rs's `symbolicate` Cargo feature so
+        # `write_pprof_gz` emits function-name / file / line metadata
+        # in the pprof body — no operator-side `atos` step needed.
+        # Pulls `backtrace` (+ `addr2line` + `gimli` + `object`)
+        # transitively; ~600 KB live set cost is acceptable for the
+        # opt-in heap-profiling image.
+        "@snmalloc//snmalloc-rs:snmalloc_rs_profiling_symbolicated",
     ],
     proc_macro_deps = ["@konfig_crates//:async-trait"],
 )
@@ -186,12 +192,14 @@ rust_binary(
 # Opt-in heap-profiling binary — same sources as `:konfig_bin` but built
 # with `--cfg feature="snmalloc_profiling"`, which compiles in the
 # `/debug/heap-profile.pprof` endpoint in `startup::serve_metrics`. The
-# snmalloc dep swaps to `:snmalloc_rs_profiling` (fork-built with the
-# `profiling` Cargo feature on snmalloc-rs + the matching
-# `SNMALLOC_PROFILE=ON` C archive), which exposes
-# `SnMalloc.snapshot()` and `HeapProfile::write_pprof_gz`. Packaged
-# separately as the `konfig-heapprof` image; the default `konfig` image
-# stays slim.
+# snmalloc dep swaps to `:snmalloc_rs_profiling_symbolicated` (fork-built
+# with the `profiling` + `symbolicate` Cargo features on snmalloc-rs +
+# the matching `SNMALLOC_PROFILE=ON` C archive), which exposes
+# `SnMalloc.snapshot()` and `HeapProfile::write_pprof_gz` with
+# in-process backtrace resolution — pprof bodies carry function/file/
+# line metadata, no operator-side `atos` step needed. Packaged
+# separately as the `konfig-heapprof` image; the default `konfig`
+# image stays slim.
 rust_binary(
     name = "konfig_bin_heapprof",
     srcs = ["main.rs"],
@@ -213,10 +221,11 @@ rust_binary(
         "@konfig_crates//:tonic-health",
         "@konfig_crates//:tracing",
         "@konfig_crates//:tracing-subscriber",
-        # Profiling-build allocator from jayakasadev fork. Exposes the
-        # `HeapProfile` / `write_pprof_gz` API that the
-        # `/debug/heap-profile.pprof` endpoint depends on.
-        "@snmalloc//snmalloc-rs:snmalloc_rs_profiling",
+        # Profiling-build allocator from jayakasadev fork. Symbolicated
+        # variant: `profiling` + `symbolicate` Cargo features both on,
+        # so pprof bodies emitted by `HeapProfile::write_pprof_gz`
+        # carry resolved function names instead of raw hex addresses.
+        "@snmalloc//snmalloc-rs:snmalloc_rs_profiling_symbolicated",
     ],
 )
 
