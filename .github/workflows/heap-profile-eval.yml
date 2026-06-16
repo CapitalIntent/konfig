@@ -1,0 +1,230 @@
+name: Heap Profile Eval (CU-86aj31n33)
+on:
+  workflow_dispatch:
+
+# Manual-trigger workflow that drives the in-cluster konfig-loadtest Job
+# against a `konfig-heapprof` Deployment (snmalloc-rs `profiling` feature
+# on; `/debug/heap-profile.pprof` endpoint live) and captures gzipped
+# pprof snapshots throughout the run.
+#
+# The captured profiles are uploaded as a workflow artifact named
+# `heap-profiles`; analyse locally with `go tool pprof -top`.
+#
+# Scope: this is NOT a gate. It runs only when manually dispatched, never
+# on push/PR. Wall-clock is dominated by the loadtest Job (~5-10 min).
+#
+# Tracker: CU-86aj31n33.
+
+jobs:
+  eval:
+    name: Capture heap profiles under loadtest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler
+
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
+
+      - name: Build konfig-heapprof + konfig-loadtest OCI images (linux/amd64)
+        # Native amd64 build on this runner — no Bazel sysroot wiring after
+        # the 2026-06-16 toolchain cleanup. `:load_amd64` tags the image
+        # into the local docker daemon for `kind load docker-image`.
+        run: |
+          bazel run //docker/konfig-heapprof:load_amd64
+          bazel run //docker/konfig-loadtest:load_amd64
+
+      - name: Create kind cluster (1 node)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: konfig-heapprof
+          wait: 120s
+
+      - name: Load images into kind
+        run: |
+          kind load docker-image kasa288/konfig-heapprof:latest --name konfig-heapprof
+          kind load docker-image kasa288/konfig-loadtest:latest --name konfig-heapprof
+
+      - name: Apply CRDs (Config) and wait for establishment
+        run: |
+          kubectl apply -f infra/konfig/crd.yaml
+          kubectl wait --for=condition=Established crd/configs.konfig.io --timeout=60s
+
+      - name: Apply namespace, RBAC, ServiceAccount, Service
+        run: |
+          kubectl apply -f infra/konfig/namespace.yaml
+          kubectl apply -f infra/konfig/serviceaccount.yaml
+          kubectl apply -f infra/konfig/clusterrole.yaml
+          kubectl apply -f infra/konfig/clusterrole-configmap.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding-configmap.yaml
+          kubectl apply -f infra/konfig/role-secret.yaml
+          kubectl apply -f infra/konfig/service.yaml
+
+      - name: Apply konfig ConfigMap (loadtest config name)
+        run: |
+          kubectl create configmap konfig-config \
+            --namespace=konfig-system \
+            --from-literal=namespace=konfig-system \
+            --from-literal=name=konfig-loadtest \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Pre-seed Config CR
+        run: |
+          kubectl apply -f infra/konfig-loadtest/seed-config.yaml
+
+      - name: Apply konfig Deployment override (heapprof image, 1 replica, --tls=false)
+        # Override:
+        #   * image       → `kasa288/konfig-heapprof:latest` (was `kasa288/konfig:latest`)
+        #   * replicas    → 1 (per-pod profiling — memory `feedback_loadtest_replicas.md`)
+        #   * pullPolicy  → IfNotPresent (use the locally-loaded :latest tag)
+        #   * args        → strip --tls* + add --tls=false (no cert-manager in kind)
+        #   * volumes     → drop konfig-tls Secret mount
+        run: |
+          yq '
+            .spec.replicas = 1
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).image = "kasa288/konfig-heapprof:latest"
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).imagePullPolicy = "IfNotPresent"
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).args |=
+                ([.[] | select(test("^--tls") | not)] + ["--tls=false"])
+            | del(.spec.template.spec.containers[] | select(.name == "konfig").volumeMounts[] | select(.name == "konfig-tls"))
+            | del(.spec.template.spec.volumes[] | select(.name == "konfig-tls"))
+          ' infra/konfig/deployment.yaml \
+          | kubectl apply -f -
+
+      - name: Wait for konfig-heapprof Pod Ready
+        run: |
+          kubectl rollout status -n konfig-system deploy/konfig --timeout=180s
+          kubectl wait --for=condition=Ready -n konfig-system pod -l app=konfig --timeout=180s
+
+      - name: Verify heap-profile endpoint shape
+        run: |
+          mkdir -p /tmp/pprofs
+          # Open a port-forward in the background; the same forward is
+          # reused for the loadtest-time snapshots below.
+          kubectl -n konfig-system port-forward svc/konfig 9090:9090 >/tmp/pprofs/portfwd.log 2>&1 &
+          PF_PID=$!
+          echo "$PF_PID" > /tmp/pprofs/portfwd.pid
+          # Give kubectl a moment to bind localhost:9090
+          for i in $(seq 1 20); do
+            if curl -fsS -o /dev/null --max-time 2 http://localhost:9090/metrics; then
+              echo "port-forward live after ${i}x500ms"
+              break
+            fi
+            sleep 0.5
+          done
+          # Sanity-check the endpoint returns octet-stream + non-trivial body.
+          HDR=$(curl -fsS -D - -o /tmp/pprofs/baseline.pb.gz http://localhost:9090/debug/heap-profile.pprof | grep -i '^content-type:' || true)
+          echo "baseline header: $HDR"
+          BYTES=$(stat -c '%s' /tmp/pprofs/baseline.pb.gz)
+          echo "baseline body bytes: $BYTES"
+          if [ "$BYTES" -lt 32 ]; then
+            echo "::error::Baseline pprof body suspiciously small ($BYTES bytes) — endpoint may be returning a stub"
+            cat /tmp/pprofs/baseline.pb.gz | head -c 256 | xxd | head -16
+            exit 1
+          fi
+          gunzip -t /tmp/pprofs/baseline.pb.gz
+
+      - name: Apply konfig-loadtest Job
+        run: |
+          sed 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/' \
+            infra/konfig-loadtest/job.yaml | kubectl apply -f -
+
+      - name: Capture pprofs during loadtest (every 30s, up to 12 minutes)
+        # Spin a foreground curl loop that snapshots `/debug/heap-profile.pprof`
+        # every 30s until the loadtest Job terminates. Each snapshot is named
+        # by elapsed seconds since loop start so the analysis side can build
+        # a timeseries (peak live bytes per call site over time).
+        run: |
+          set -uo pipefail
+          # Wait for loadtest pod phase != Pending.
+          for i in $(seq 1 60); do
+            PHASE=$(kubectl get pods -n konfig-system -l job-name=konfig-loadtest \
+                      -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+            if [ "$PHASE" = "Running" ] || [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "Failed" ]; then
+              echo "loadtest pod phase=$PHASE after ${i}x2s"
+              break
+            fi
+            sleep 2
+          done
+          start=$SECONDS
+          # 24 ticks × 30s = 12 min ceiling (loadtest scenarios = all takes
+          # ~5-10 min in practice; this is the upper bound).
+          for n in $(seq 1 24); do
+            sleep 30
+            t=$((SECONDS - start))
+            JOB_STATE=$(kubectl get job/konfig-loadtest -n konfig-system \
+                          -o jsonpath='{.status.succeeded}{.status.failed}' 2>/dev/null || true)
+            curl -fsS -o "/tmp/pprofs/t${t}s.pb.gz" http://localhost:9090/debug/heap-profile.pprof \
+              && echo "captured t=${t}s ($(stat -c '%s' /tmp/pprofs/t${t}s.pb.gz) bytes)" \
+              || echo "::warning::pprof scrape failed at t=${t}s"
+            if [ -n "$JOB_STATE" ] && [ "$JOB_STATE" != "0" ]; then
+              echo "loadtest Job terminated (status=$JOB_STATE) — stopping snapshot loop"
+              break
+            fi
+          done
+          # Final snapshot regardless of loop exit reason.
+          curl -fsS -o /tmp/pprofs/final.pb.gz http://localhost:9090/debug/heap-profile.pprof \
+            && echo "captured final ($(stat -c '%s' /tmp/pprofs/final.pb.gz) bytes)" \
+            || echo "::warning::final pprof scrape failed"
+
+      - name: Collect loadtest + konfig logs
+        if: always()
+        run: |
+          mkdir -p /tmp/pprofs
+          kubectl logs -n konfig-system -l job-name=konfig-loadtest --all-containers=true --tail=-1 \
+            > /tmp/pprofs/loadtest.log 2>&1 || true
+          POD=$(kubectl get pod -n konfig-system -l app=konfig -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$POD" ]; then
+            kubectl logs -n konfig-system "$POD" --tail=-1 > /tmp/pprofs/konfig.log 2>&1 || true
+            kubectl top pod -n konfig-system "$POD" > /tmp/pprofs/konfig.top 2>&1 || true
+          fi
+          kubectl get events -n konfig-system --sort-by=.lastTimestamp > /tmp/pprofs/events.log 2>&1 || true
+          kubectl get job/konfig-loadtest -n konfig-system -o yaml > /tmp/pprofs/loadtest-job.yaml 2>&1 || true
+
+      - name: Stop port-forward
+        if: always()
+        run: |
+          if [ -f /tmp/pprofs/portfwd.pid ]; then
+            kill "$(cat /tmp/pprofs/portfwd.pid)" 2>/dev/null || true
+          fi
+
+      - name: Verify pprof bodies decompress
+        if: always()
+        run: |
+          for f in /tmp/pprofs/*.pb.gz; do
+            [ -f "$f" ] || continue
+            sz=$(stat -c '%s' "$f")
+            if gunzip -t "$f" 2>/dev/null; then
+              echo "OK $f ($sz bytes)"
+            else
+              echo "::warning::$f failed gunzip test ($sz bytes)"
+            fi
+          done
+
+      - name: Upload heap profiles + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: heap-profiles
+          path: /tmp/pprofs/
+          retention-days: 14
