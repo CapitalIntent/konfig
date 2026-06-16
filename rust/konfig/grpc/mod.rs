@@ -56,6 +56,13 @@ use crate::secret_cache::SecretCache;
 /// forcing the gRPC server to stop accepting connections.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Initial capacity for per-namespace `DashMap`s in `serve()`.  Typical pod
+/// fans out across 10–50 namespaces; 64 is the next power of two and
+/// eliminates the early `RawTable::reserve_rehash` calls (~10 ms self-CPU
+/// hit observed in pyroscope profile CU-86aj360ae) before the maps reach
+/// steady state.
+const NAMESPACE_MAP_INITIAL_CAPACITY: usize = 64;
+
 // ── Server config ─────────────────────────────────────────────────────────────
 
 pub struct ServerConfig {
@@ -275,10 +282,13 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
     info!(addr = %cfg.addr, "KonfigService gRPC server starting");
 
     let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>> =
-        Arc::new(DashMap::new());
-    let namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>> = Arc::new(DashMap::new());
-    let watcher_handles: Arc<DashMap<String, JoinHandle<()>>> = Arc::new(DashMap::new());
-    let idle_since: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
+        Arc::new(DashMap::with_capacity(NAMESPACE_MAP_INITIAL_CAPACITY));
+    let namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>> =
+        Arc::new(DashMap::with_capacity(NAMESPACE_MAP_INITIAL_CAPACITY));
+    let watcher_handles: Arc<DashMap<String, JoinHandle<()>>> =
+        Arc::new(DashMap::with_capacity(NAMESPACE_MAP_INITIAL_CAPACITY));
+    let idle_since: Arc<DashMap<String, Instant>> =
+        Arc::new(DashMap::with_capacity(NAMESPACE_MAP_INITIAL_CAPACITY));
 
     // Spawn background GC task — cleans up idle namespace watchers to prevent
     // K8s watch connection leaks when all subscribers disconnect.
