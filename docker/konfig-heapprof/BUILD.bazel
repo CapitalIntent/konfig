@@ -1,0 +1,19 @@
+load("//bazel/oci:defs.bzl", "konfig_oci_image")
+
+# `konfig-heapprof` — opt-in image variant compiled against the snmalloc-rs
+# `profiling` Cargo feature (Bazel `crate_features = ["snmalloc","snmalloc_profiling"]`
+# on `//rust/konfig:konfig_bin_heapprof`). The bundled snmalloc C archive is
+# built with `SNMALLOC_PROFILE=ON` so `sn_rust_profile_*` exports are live,
+# and the binary registers `/debug/heap-profile.pprof` on the metrics server
+# (port 9090). The default `konfig` image stays slim — deploy this image
+# on demand when a pprof-format heap snapshot is wanted.
+konfig_oci_image(
+    name = "konfig_heapprof",
+    binary = "//rust/konfig:konfig_bin_heapprof",
+    binary_name = "konfig",
+    exposed_ports = [
+        "50051/tcp",
+        "9090/tcp",
+    ],
+    repository = "kasa288/konfig-heapprof",
+)

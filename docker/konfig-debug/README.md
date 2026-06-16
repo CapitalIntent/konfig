@@ -20,10 +20,18 @@ filesystem so `kubectl exec` Just Works.
 
 ```sh
 # Load locally (loads the host-arch image into the local docker daemon).
-bazel run //docker/konfig-debug:load
+# Use the suffix matching your host: `load_amd64` on Linux amd64,
+# `load_arm64` on Apple Silicon or arm64 Linux. There is no cross-arch
+# `:load` after the 2026-06-16 toolchain cleanup (no Bazel sysroot wiring).
+bazel run //docker/konfig-debug:load_amd64   # or :load_arm64
 
-# Push the multi-arch index (amd64 + arm64) to Docker Hub.
-bazel run //docker/konfig-debug:push -- --tag latest
+# Push the per-arch image to Docker Hub (one arch per command). The
+# `publish-images` GitHub Actions workflow runs both arches in a native
+# matrix and then assembles the multi-arch index via
+# `docker buildx imagetools create` — that's the canonical multi-arch
+# publish path.
+bazel run --stamp //docker/konfig-debug:push_amd64
+bazel run --stamp //docker/konfig-debug:push_arm64
 ```
 
 ## Use

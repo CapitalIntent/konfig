@@ -1,4 +1,0 @@
-exports_files(
-    ["sysroot.bzl", "extensions.bzl"],
-    visibility = ["//visibility:public"],
-)
