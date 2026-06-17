@@ -93,7 +93,7 @@ fn parse_configmap(cm: &ConfigMap, namespace: &str) -> Option<ConfigSnapshot> {
     let schema_version: u32 = data
         .get("schema_version")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+        .unwrap_or(99);
 
     // If data["content"] key exists, parse it as JSON/YAML.
     // Otherwise treat the entire data map (minus schema_version) as content.
@@ -188,6 +188,73 @@ mod tests {
         let cm = make_cm("cfg", BTreeMap::new());
         let snap = parse_configmap(&cm, "ns").unwrap();
         assert_eq!(snap.resource_version, "rv-001");
+    }
+
+    // ── parse_configmap — malformed-input branch coverage (CU-86aj14yzh) ─────
+    //
+    // The k8s-openapi `ConfigMap.data` binding is `BTreeMap<String, String>`,
+    // so non-UTF8 bytes cannot reach `parse_configmap` through this field —
+    // the apiserver/serde rejects them ahead of time. Binary payloads ride
+    // `binary_data` (Base64-encoded), which `parse_configmap` does not read.
+    // No `parse_configmap_non_utf8_bytes` test is added — the branch is
+    // unreachable through the typed binding.
+
+    /// Annotation present but unparseable as `u32` — the `.and_then(|v|
+    /// v.parse().ok()).unwrap_or(0)` chain must silently default to 0.
+    /// Hand-mutate: change `unwrap_or(0)` → `unwrap()` and re-run; the
+    /// `parse().ok()` yields `None`, which panics → test fails.
+    #[test]
+    fn parse_configmap_malformed_schema_version_defaults_to_zero() {
+        let mut data = BTreeMap::new();
+        data.insert("schema_version".into(), "v1".into()); // not a u32
+        data.insert("log_level".into(), "info".into());
+
+        let cm = make_cm("cfg", data);
+        let snap = parse_configmap(&cm, "ns").expect("snapshot must be produced");
+        assert_eq!(
+            snap.schema_version, 0,
+            "unparseable schema_version annotation must silently default to 0",
+        );
+        // The rest of the content map must still be populated — the default
+        // is local to the schema_version branch and must not poison sibling
+        // fields.
+        assert_eq!(snap.content["log_level"], "info");
+    }
+
+    /// `data["content"]` holds a string that is not valid YAML/JSON. The
+    /// `serde_yaml::from_str` error path must `warn!` and default `content`
+    /// to an empty JSON object (NOT `Value::Null` — distinct from the
+    /// "no data" branch upstream). Capturing the `warn!` line is optional
+    /// per the ticket; we assert on the structural fallback only.
+    /// Hand-mutate: change the `Err(e)` arm's fallback from
+    /// `Value::Object(Default::default())` to `Value::Null` and re-run; the
+    /// `is_object()` assertion fails.
+    #[test]
+    fn parse_configmap_invalid_yaml_returns_empty_content() {
+        let mut data = BTreeMap::new();
+        data.insert("schema_version".into(), "5".into());
+        // `: : :` is a YAML parse error (bare colons at the start of a flow
+        // node). `serde_yaml::from_str::<Value>` rejects it.
+        data.insert("content".into(), ": : :".into());
+
+        let cm = make_cm("cfg", data);
+        let snap = parse_configmap(&cm, "ns").expect("snapshot must be produced");
+
+        // schema_version is parsed independently — must survive the content
+        // parse failure.
+        assert_eq!(snap.schema_version, 5);
+
+        // Fallback is an empty JSON object, NOT Null.
+        assert!(
+            snap.content.is_object(),
+            "invalid-YAML fallback must be a JSON object, got {:?}",
+            snap.content,
+        );
+        assert_eq!(
+            snap.content.as_object().unwrap().len(),
+            0,
+            "invalid-YAML fallback object must be empty",
+        );
     }
 
     // ── pump_configmap_events ────────────────────────────────────────────────
