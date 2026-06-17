@@ -347,21 +347,40 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
                 // (which would freeze the konfig_stale_seconds /
                 // konfig_replay_buffer_depth gauges).
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    for entry in replay_buffers_for_sampler.iter() {
-                        let depth = entry
-                            .value()
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .len();
-                        REPLAY_BUFFER_DEPTH
-                            .with_label_values(&[entry.key()])
-                            .set(depth as f64);
+                    // Pre-collect keys (cheap String clones) before iterating
+                    // so we don't hold per-shard DashMap read locks across the
+                    // inner `Mutex::lock()` call below. Concurrent writers
+                    // (watchers pushing new replay entries / event timestamps)
+                    // would otherwise block on this sampler tick. CU-86aj3m24w.
+                    let replay_keys: Vec<String> = replay_buffers_for_sampler
+                        .iter()
+                        .map(|e| e.key().clone())
+                        .collect();
+                    for ns in &replay_keys {
+                        if let Some(buf_ref) = replay_buffers_for_sampler.get(ns) {
+                            let depth = buf_ref
+                                .value()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .len();
+                            REPLAY_BUFFER_DEPTH
+                                .with_label_values(&[ns.as_str()])
+                                .set(depth as f64);
+                        }
                     }
                     // konfig_stale_seconds: seconds since last event per namespace.
                     // None = cold start (no event received yet) → publish 0 (fresh).
-                    for entry in last_event_at_for_sampler.iter() {
-                        let secs = entry.value().elapsed_secs().unwrap_or(0.0);
-                        STALE_SECONDS.with_label_values(&[entry.key()]).set(secs);
+                    // Same pattern: collect keys first, release the iter, then
+                    // re-`get()` per key so writers aren't blocked by us.
+                    let stale_keys: Vec<String> = last_event_at_for_sampler
+                        .iter()
+                        .map(|e| e.key().clone())
+                        .collect();
+                    for ns in &stale_keys {
+                        if let Some(v_ref) = last_event_at_for_sampler.get(ns) {
+                            let secs = v_ref.value().elapsed_secs().unwrap_or(0.0);
+                            STALE_SECONDS.with_label_values(&[ns.as_str()]).set(secs);
+                        }
                     }
                 }));
                 if result.is_err() {
