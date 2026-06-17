@@ -48,8 +48,13 @@ pub async fn handle_subscribe_secrets(
     debug!(namespace = %req.namespace, resume_rv = %req.resume_resource_version, "SubscribeSecrets RPC");
 
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-    let namespace = req.namespace.clone();
-    let resume_rv = req.resume_resource_version.clone();
+    // Move req fields out instead of cloning — req is dropped at function
+    // exit; mirrors `subscribe::handle_subscribe`.
+    let SubscribeSecretsRequest {
+        namespace,
+        resume_resource_version: resume_rv,
+        ..
+    } = req;
 
     // Always emit the current cache snapshot first — both empty-rv (fresh
     // subscriber) and non-empty-rv (resume) paths get a synchronous
@@ -348,6 +353,7 @@ fn parse_secret_object(secret: &Secret, namespace: &str) -> Option<SecretSnapsho
         data,
         resource_version,
         loaded_at: std::time::Instant::now(),
+        ..Default::default()
     })
 }
 
@@ -597,6 +603,7 @@ mod tests {
                 data: Default::default(),
                 resource_version: "rv-001".into(),
                 loaded_at: std::time::Instant::now(),
+                ..Default::default()
             }),
             Arc::new(SecretSnapshot {
                 namespace: "trading".into(),
@@ -605,6 +612,7 @@ mod tests {
                 data: Default::default(),
                 resource_version: "rv-002".into(),
                 loaded_at: std::time::Instant::now(),
+                ..Default::default()
             }),
         ];
 
@@ -647,6 +655,7 @@ mod tests {
             data: Default::default(),
             resource_version: "rv-001".into(),
             loaded_at: std::time::Instant::now(),
+            ..Default::default()
         })];
         let kept_going = emit_snapshot_events(&tx, &snapshots, "test").await;
         assert!(
