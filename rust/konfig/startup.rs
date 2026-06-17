@@ -168,6 +168,19 @@ pub fn normalize_secret_namespaces(raw: Vec<String>) -> Vec<String> {
 /// (CLI parse) and tracing init stay in the binary entry point so this
 /// helper is reachable from tests with a synthetic [`Args`].
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    // snmalloc streaming-mode sampler (CU-86aj35zxw). Only compiled into
+    // the heapprof binary; runtime-gated by `KONFIG_SNMALLOC_STREAM_PATH`.
+    // No-op when the env var is absent. Started up-front so the activation
+    // window covers all subsequent allocations during startup.
+    #[cfg(feature = "snmalloc_profiling")]
+    {
+        // start_if_env emits its own info!() on activation. The bool
+        // return is only useful when downstream code wants to gate on
+        // activation; here we just propagate the error and ignore the
+        // success bool.
+        let _ = crate::stream_sink::start_if_env()?;
+    }
+
     // Resolve TLS up-front so a misconfig fails startup before we touch
     // the kube API or spawn any watcher.
     let tls_config = resolve_tls_config(&args)?;
