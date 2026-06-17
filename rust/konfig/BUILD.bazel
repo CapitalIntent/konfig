@@ -160,6 +160,41 @@ rust_binary(
     ],
 )
 
+# Opt-in tokio-console binary — same sources as `:konfig_bin` but built
+# with `--cfg feature="tokio_console"`, which compiles in the
+# `console_subscriber::ConsoleLayer` activation in `main.rs::init_tracing`.
+# Started at runtime when `RUST_CONSOLE=1` is set in the env; the layer
+# binds a gRPC server on port 6669 for `tokio-console` clients to attach
+# and watch per-task park/wake counts. Used for the CU-86aj37prc
+# parking_lot::unpark attribution eval. NOT a production image variant.
+rust_binary(
+    name = "konfig_bin_console",
+    srcs = ["main.rs"],
+    crate_features = [
+        "snmalloc",
+        "tokio_console",
+    ],
+    stamp = 1,
+    tags = ["konfig", "rust", "tokio_console"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":konfig",
+        "@konfig_crates//:axum",
+        "@konfig_crates//:clap",
+        "@konfig_crates//:console-subscriber",
+        "@konfig_crates//:dashmap",
+        "@konfig_crates//:kube",
+        "@konfig_crates//:prometheus",
+        "@konfig_crates//:tokio",
+        "@konfig_crates//:tonic-health",
+        "@konfig_crates//:tracing",
+        "@konfig_crates//:tracing-appender",
+        "@konfig_crates//:tracing-subscriber",
+        # Default allocator (all OS): snmalloc from jayakasadev fork.
+        "@snmalloc//snmalloc-rs:snmalloc_rs",
+    ],
+)
+
 # Opt-in profiling binary — same sources as `:konfig_bin` but built with
 # `--cfg feature="profiling"`, which pulls in pyroscope-rs and compiles the
 # agent init block in `main.rs`. Packaged separately as the `konfig-profiling`
