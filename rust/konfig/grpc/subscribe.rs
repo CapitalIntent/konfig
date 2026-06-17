@@ -93,7 +93,7 @@ pub type ReplayBuffer = Arc<Mutex<VecDeque<ReplayEntry>>>;
 /// `resource_version` is parsed as `u64` at push time so resume can
 /// binary-search the buffer.  An unparseable RV (kube only emits decimal
 /// strings, so this signals upstream malformation) is logged and dropped.
-fn push_replay(buf: &ReplayBuffer, resource_version: String, event: Arc<ConfigEvent>) {
+fn push_replay(buf: &ReplayBuffer, resource_version: &str, event: Arc<ConfigEvent>) {
     let Ok(resource_version_u64) = resource_version.parse::<u64>() else {
         warn!(
             resource_version = %resource_version,
@@ -105,8 +105,13 @@ fn push_replay(buf: &ReplayBuffer, resource_version: String, event: Arc<ConfigEv
     if guard.len() >= REPLAY_BUFFER_SIZE {
         guard.pop_front();
     }
+    // Defer the `to_owned` until after the parse succeeds — callers pass
+    // `&snap.resource_version` so we save a per-event clone on the warn
+    // path (CU-86aj3m1bd). The happy path's allocation is unavoidable
+    // because `ReplayEntry::resource_version` is `String` (the resume
+    // lookup compares string forms when the u64 parse falls back).
     guard.push_back(ReplayEntry {
-        resource_version,
+        resource_version: resource_version.to_owned(),
         resource_version_u64,
         event,
     });
@@ -178,10 +183,20 @@ fn get_or_create_broadcast(
         // Subscribe RPCs that hash to the same shard).
         let sender = sender_ref.clone();
         drop(sender_ref);
-        let buf = namespace_replay_buffers
-            .entry(namespace.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
-            .clone();
+        // Hot-path replay buffer lookup: prefer borrow-key `get()` over
+        // `entry()` so we don't pay the per-call `namespace.clone()` when
+        // the buffer already exists (the steady-state case under load).
+        // `entry()`'s `or_insert_with` requires an owned key up-front
+        // regardless of whether the insert fires, so a present buffer
+        // forces an unconditional clone. CU-86aj3m1bd.
+        let buf = if let Some(b) = namespace_replay_buffers.get(&namespace) {
+            b.clone()
+        } else {
+            namespace_replay_buffers
+                .entry(namespace.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
+                .clone()
+        };
         return (sender.subscribe(), buf);
     }
 
@@ -277,6 +292,11 @@ pub(crate) async fn pump_subscribe_namespace_events<S>(
     S: futures_util::stream::TryStream<Ok = Event<DynamicObject>, Error = kube_watcher::Error>
         + Unpin,
 {
+    // Hoist the counter lookup out of the hot loop — `with_label_values`
+    // does a hashmap lookup per call which adds up at high event rates.
+    // CU-86aj3m1bd: mirrors the same pattern already used for
+    // `SUBSCRIBE_E2E_LATENCY` + `BROADCAST_LAG` per-subscriber.
+    let events_broadcast = EVENTS_BROADCAST.with_label_values(&[namespace]);
     loop {
         let event = match stream.try_next().await {
             Ok(Some(event)) => event,
@@ -308,7 +328,6 @@ pub(crate) async fn pump_subscribe_namespace_events<S>(
         let Some(snap) = crate::watcher::parse_config_object(&obj) else {
             continue;
         };
-        let rv = snap.resource_version.clone();
         let config_event = Arc::new(ConfigEvent {
             event_type,
             config: Some(snapshot_to_proto(&snap)),
@@ -318,7 +337,13 @@ pub(crate) async fn pump_subscribe_namespace_events<S>(
 
         // Push into replay buffer before broadcasting so a subscriber that
         // races to read the buffer after receiving the live event will find it.
-        push_replay(replay_buf, rv, Arc::clone(&config_event));
+        // `&str` cheap-pass: `push_replay` allocates the owned String only
+        // on the happy parse path (CU-86aj3m1bd).
+        push_replay(
+            replay_buf,
+            &snap.resource_version,
+            Arc::clone(&config_event),
+        );
 
         let sent_at = Instant::now();
         let frame = Arc::new(BroadcastFrame {
@@ -329,7 +354,7 @@ pub(crate) async fn pump_subscribe_namespace_events<S>(
         APPLY_TO_BROADCAST_SECONDS.observe(sent_at.duration_since(apply_observed_at).as_secs_f64());
 
         if tx.send(frame).is_ok() {
-            EVENTS_BROADCAST.with_label_values(&[namespace]).inc();
+            events_broadcast.inc();
         }
     }
 }
@@ -525,11 +550,14 @@ async fn resume_from_buffer(
         });
         match lookup {
             Some(idx) => {
-                let slice: Vec<Arc<ConfigEvent>> = guard
-                    .iter()
-                    .skip(idx + 1)
-                    .map(|e| Arc::clone(&e.event))
-                    .collect();
+                // Reserve up-front: we know `guard.len() - idx - 1` is
+                // the upper bound on the replay slice length. Avoids the
+                // intermediate `RawVec::grow_amortized` reallocs that
+                // appear in the CU-86aj360ae heap profile on every
+                // reconnect that hits the replay buffer. CU-86aj3m1bd.
+                let cap = guard.len().saturating_sub(idx + 1);
+                let mut slice: Vec<Arc<ConfigEvent>> = Vec::with_capacity(cap);
+                slice.extend(guard.iter().skip(idx + 1).map(|e| Arc::clone(&e.event)));
                 debug!(
                     namespace = %namespace,
                     resume_rv = %resume_rv,
@@ -797,7 +825,7 @@ mod tests {
     fn make_replay_buf(entries: &[(&str, u32)]) -> ReplayBuffer {
         let buf = Arc::new(Mutex::new(VecDeque::new()));
         for (rv, sv) in entries {
-            push_replay(&buf, rv.to_string(), Arc::new(make_event(rv, *sv)));
+            push_replay(&buf, rv, Arc::new(make_event(rv, *sv)));
         }
         buf
     }
@@ -844,17 +872,14 @@ mod tests {
     fn push_replay_evicts_oldest_when_full() {
         let buf: ReplayBuffer = Arc::new(Mutex::new(VecDeque::new()));
         for i in 0..REPLAY_BUFFER_SIZE {
-            push_replay(
-                &buf,
-                format!("{i}"),
-                Arc::new(make_event(&format!("{i}"), i as u32)),
-            );
+            let rv = format!("{i}");
+            push_replay(&buf, &rv, Arc::new(make_event(&rv, i as u32)));
         }
         // Buffer is exactly full — oldest is rv-0.
         assert_eq!(buf.lock().unwrap().front().unwrap().resource_version, "0");
 
         // Push one more — rv-0 must be evicted.
-        push_replay(&buf, "9999".into(), Arc::new(make_event("9999", 9999)));
+        push_replay(&buf, "9999", Arc::new(make_event("9999", 9999)));
         let guard = buf.lock().unwrap();
         assert_eq!(guard.len(), REPLAY_BUFFER_SIZE);
         assert_eq!(guard.front().unwrap().resource_version, "1");
@@ -1452,13 +1477,13 @@ mod tests {
     #[test]
     fn push_replay_drops_non_numeric_rv() {
         let buf: ReplayBuffer = Arc::new(Mutex::new(VecDeque::new()));
-        push_replay(&buf, "not-a-number".into(), Arc::new(make_event("0", 0)));
+        push_replay(&buf, "not-a-number", Arc::new(make_event("0", 0)));
         assert!(
             buf.lock().unwrap().is_empty(),
             "push_replay must drop entries with non-numeric resource_version",
         );
         // Valid RV still pushes.
-        push_replay(&buf, "42".into(), Arc::new(make_event("42", 42)));
+        push_replay(&buf, "42", Arc::new(make_event("42", 42)));
         assert_eq!(buf.lock().unwrap().len(), 1);
     }
 
