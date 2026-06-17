@@ -121,6 +121,12 @@ impl ConfigSnapshot {
 // ── SecretSnapshot ────────────────────────────────────────────────────────────
 
 /// Snapshot of a managed K8s Secret (label: konfig.io/managed=true).
+///
+/// `data_json_cache` memoises the serialised `data_json` payload that
+/// `grpc::secret_get::secret_snapshot_to_proto` emits.  Without the cache,
+/// every `SubscribeSecrets` event re-built a transient `HashMap<&str, &str>`
+/// and re-ran `serde_json::to_string` — per-event work on the hot path.
+/// Mirrors `ConfigSnapshot::content_json_cache`.
 #[derive(Debug, Clone)]
 pub struct SecretSnapshot {
     pub name: String,
@@ -131,6 +137,11 @@ pub struct SecretSnapshot {
     pub data: std::collections::HashMap<String, bytes::Bytes>,
     pub resource_version: String,
     pub loaded_at: std::time::Instant,
+    /// Memoised JSON encoding of `data` (`{"key": "<base64>"}`).  Shared
+    /// across clones via `Arc<OnceLock<…>>` — see `ConfigSnapshot::
+    /// content_json_cache` for the same pattern.  Populate via
+    /// [`Self::data_json`]; do not write to it directly.
+    pub data_json_cache: Arc<OnceLock<String>>,
 }
 
 impl Default for SecretSnapshot {
@@ -142,7 +153,44 @@ impl Default for SecretSnapshot {
             data: std::collections::HashMap::new(),
             resource_version: String::new(),
             loaded_at: std::time::Instant::now(),
+            data_json_cache: Arc::new(OnceLock::new()),
         }
+    }
+}
+
+impl SecretSnapshot {
+    /// Serialise `data` once per snapshot and return the cached JSON string.
+    ///
+    /// Values are already base64-encoded ASCII bytes — `from_utf8` is
+    /// effectively a no-op pointer cast.  Returning `&str` lets callers
+    /// clone at the proto boundary instead of re-serialising per event.
+    pub fn data_json(&self) -> &str {
+        self.data_json_cache.get_or_init(|| {
+            let data_map: std::collections::HashMap<&str, &str> = self
+                .data
+                .iter()
+                .map(|(k, v)| {
+                    // kube secret data is base64 on the wire — `parse_secret`
+                    // re-encodes to base64 into `Bytes`, so every byte here
+                    // is ASCII (a strict UTF-8 subset). If `from_utf8` ever
+                    // fails the upstream bytes were tampered with somehow;
+                    // surface "" + a `warn!` rather than silently shipping
+                    // garbled JSON.
+                    match std::str::from_utf8(v) {
+                        Ok(s) => (k.as_str(), s),
+                        Err(e) => {
+                            tracing::warn!(
+                                key = %k,
+                                err = %e,
+                                "secret value is not valid UTF-8 — emitting empty string",
+                            );
+                            (k.as_str(), "")
+                        }
+                    }
+                })
+                .collect();
+            serde_json::to_string(&data_map).unwrap_or_default()
+        })
     }
 }
 
@@ -216,5 +264,54 @@ mod tests {
         let p_a = snap_a.content_json().as_ptr();
         let p_b = snap_b.content_json().as_ptr();
         assert_eq!(p_a, p_b, "clones must share the same OnceLock cell");
+    }
+
+    /// Concurrent `content_json()` calls on clones of the same snapshot must
+    /// resolve to the SAME backing string — `OnceLock::get_or_init` must
+    /// dedupe the serialisation across racing threads, not let two threads
+    /// each materialise their own copy. Proving this with pointer-equality
+    /// closes the gap the single-threaded `_is_memoised` test left open:
+    /// without `OnceLock` we'd still observe identical *bytes* but distinct
+    /// allocations, which would silently break the
+    /// "serialise once per snapshot" invariant the `serve()` hot path relies on.
+    #[test]
+    fn content_json_cache_dedupes_under_concurrent_init() {
+        use std::sync::Arc as StdArc;
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Run many trials to expose the race window — a single trial can
+        // accidentally serialise (init thread wins by a wide margin) and miss
+        // a regression where the `OnceLock` is replaced by something that
+        // doesn't synchronise.
+        for _ in 0..32 {
+            let snap = ConfigSnapshot {
+                schema_version: 1,
+                content: json!({"k": "v", "n": 42, "arr": [1, 2, 3]}),
+                ..Default::default()
+            };
+            let snap_a = snap.clone();
+            let snap_b = snap.clone();
+            let barrier = StdArc::new(Barrier::new(2));
+            let b_a = StdArc::clone(&barrier);
+            let b_b = StdArc::clone(&barrier);
+
+            let h_a = thread::spawn(move || {
+                b_a.wait();
+                snap_a.content_json().as_ptr() as usize
+            });
+            let h_b = thread::spawn(move || {
+                b_b.wait();
+                snap_b.content_json().as_ptr() as usize
+            });
+
+            let p_a = h_a.join().expect("thread A panicked");
+            let p_b = h_b.join().expect("thread B panicked");
+            assert_eq!(
+                p_a, p_b,
+                "concurrent content_json() must return the same Arc-backed cache pointer \
+                 (OnceLock must dedupe the serialisation work)",
+            );
+        }
     }
 }

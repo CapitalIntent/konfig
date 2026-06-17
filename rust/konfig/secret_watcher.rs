@@ -115,7 +115,10 @@ pub(crate) fn handle_secret_event(
     match event {
         Event::Apply(secret) | Event::InitApply(secret) => {
             if let Some(snap) = parse_secret(&secret, namespace) {
-                info!(
+                // debug! not info!: this fires per secret event in the
+                // watcher hot loop. Operators can flip RUST_LOG=konfig=debug
+                // when they need per-event signal.
+                debug!(
                     name = %snap.name,
                     schema_version = snap.schema_version,
                     "Secret applied",
@@ -208,6 +211,7 @@ fn parse_secret(secret: &Secret, namespace: &str) -> Option<SecretSnapshot> {
         data,
         resource_version,
         loaded_at: std::time::Instant::now(),
+        ..Default::default()
     })
 }
 

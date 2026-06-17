@@ -52,33 +52,15 @@ pub async fn handle_get_all_secrets(
 }
 
 pub fn secret_snapshot_to_proto(snap: &SecretSnapshot) -> SecretResponse {
-    let data_map: std::collections::HashMap<&str, &str> = snap
-        .data
-        .iter()
-        .map(|(k, v)| {
-            // kube secret data is base64 on the wire — `secret_watcher::parse_secret`
-            // re-encodes to base64 into `Bytes`, so every byte here is ASCII (a
-            // strict UTF-8 subset). If `from_utf8` ever fails the upstream bytes
-            // were tampered with somehow; surface "" + a `warn!` rather than
-            // silently shipping garbled JSON.
-            match std::str::from_utf8(v) {
-                Ok(s) => (k.as_str(), s),
-                Err(e) => {
-                    tracing::warn!(
-                        key = %k,
-                        err = %e,
-                        "secret value is not valid UTF-8 — emitting empty string",
-                    );
-                    (k.as_str(), "")
-                }
-            }
-        })
-        .collect();
+    // `data_json()` memoises the serialised payload per snapshot via
+    // `Arc<OnceLock<String>>` — see `SecretSnapshot::data_json_cache`.
+    // The clone here is one alloc instead of a per-event re-walk of `data`
+    // and re-run of `serde_json::to_string`.
     SecretResponse {
         namespace: snap.namespace.clone(),
         name: snap.name.clone(),
         schema_version: snap.schema_version,
-        data_json: serde_json::to_string(&data_map).unwrap_or_default(),
+        data_json: snap.data_json().to_owned(),
         resource_version: snap.resource_version.clone(),
         age_ms: snap.loaded_at.elapsed().as_millis() as i64,
     }
@@ -105,6 +87,7 @@ mod tests {
                 .collect(),
             resource_version: "rv-001".to_string(),
             loaded_at: std::time::Instant::now(),
+            ..Default::default()
         });
         cache
     }
