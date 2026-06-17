@@ -168,11 +168,29 @@ async fn patch_with_retry(
     body: serde_json::Value,
 ) -> Result<String, Status> {
     let pp = PatchParams::apply("konfig.v1").force();
-    let mut attempt = 0usize;
+    run_patch_retry_loop(|| async {
+        api.patch(name, &pp, &Patch::Apply(body.clone()))
+            .await
+            .map(|obj| obj.metadata.resource_version.unwrap_or_default())
+    })
+    .await
+}
 
+/// Pure retry loop body — drives a single-attempt patch closure through the
+/// `RETRY_DELAYS_MS` ladder so the loop-exit path can be tested without a
+/// kube mock. Real callers pass a closure that performs one `api.patch(...)`
+/// call; the loop-exit boundary test (CU-86aj14yvh) passes a closure that
+/// returns 409 every call and asserts the loop exits with `Status::aborted`
+/// after exactly `RETRY_DELAYS_MS.len() + 1` invocations.
+pub(crate) async fn run_patch_retry_loop<F, Fut>(mut do_patch: F) -> Result<String, Status>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<String, kube::Error>>,
+{
+    let mut attempt = 0usize;
     loop {
-        match api.patch(name, &pp, &Patch::Apply(body.clone())).await {
-            Ok(obj) => return Ok(obj.metadata.resource_version.unwrap_or_default()),
+        match do_patch().await {
+            Ok(rv) => return Ok(rv),
             Err(e) => match classify_patch_error(&e, attempt) {
                 PatchRetryDecision::RetryAfter { delay_ms } => {
                     // ±25 % jitter to break lockstep retries from N clients
@@ -326,5 +344,94 @@ mod tests {
         // are explicit rather than accidental.
         let got = parse_schema_version_from_object(&obj);
         assert_eq!(got, 4);
+    }
+
+    // ── run_patch_retry_loop: max-retry loop-exit boundary (CU-86aj14yvh) ──
+    //
+    // PR D unit-tested the per-attempt classifier (`classify_patch_error`)
+    // but left the loop body uncovered. This test drives the actual loop
+    // with a 409-returning stub closure to lock in the loop-exit
+    // contract:
+    //   1. The closure is invoked EXACTLY `RETRY_DELAYS_MS.len() + 1` times
+    //      (initial attempt + N retries — no off-by-one in either direction).
+    //   2. The final error is `Status::aborted` (NOT `unavailable`, which
+    //      would silently flip retry-eligible behaviour for callers).
+    //   3. Total elapsed time is within the ±25 % jitter band around
+    //      `sum(RETRY_DELAYS_MS)` — proves the loop actually slept the
+    //      configured delays between attempts.
+    //
+    // Hand-mutation verification (per PR plan): shortening `RETRY_DELAYS_MS`
+    // by one element makes this test fail on the call-count assertion,
+    // which proves the assertion is load-bearing.
+    //
+    // Uses `tokio::time::pause()` so the sleeps are advanced instantly by
+    // the runtime — no real wall-clock waits, deterministic elapsed
+    // measurement via `tokio::time::Instant`.
+    #[tokio::test(start_paused = true)]
+    async fn run_patch_retry_loop_409_exhausts_with_aborted() {
+        use std::cell::Cell;
+
+        // Lock the constant by value here (not just by length) so mutating
+        // either entry of RETRY_DELAYS_MS — its length OR an element — makes
+        // this test fail loudly. Without this guard the call-count and
+        // elapsed-band assertions below silently re-derive their expectations
+        // from the mutated constant and would still pass. Compared as a
+        // slice so a length-shortening mutation does NOT compile-error out;
+        // it falls through to the call-count assertion below (which prints
+        // the off-by-one diff a reviewer expects to see).
+        assert_eq!(
+            RETRY_DELAYS_MS.as_slice(),
+            [100u64, 200u64].as_slice(),
+            "test pins RETRY_DELAYS_MS to [100, 200]; update the hardcoded \
+             EXPECTED_CALLS and SUM_MS below if you intentionally change it",
+        );
+        const EXPECTED_CALLS: usize = 3; // initial + 2 retries
+        const SUM_MS: u64 = 300; // 100 + 200
+
+        let calls = Cell::new(0usize);
+        let started = tokio::time::Instant::now();
+
+        let result = run_patch_retry_loop(|| {
+            calls.set(calls.get() + 1);
+            async { Err::<String, _>(api_err(409)) }
+        })
+        .await;
+
+        let elapsed = started.elapsed();
+        let err = result.expect_err("loop must exit with Status after exhausting retries");
+
+        // (1) exact call count — initial attempt + N retries.
+        assert_eq!(
+            calls.get(),
+            EXPECTED_CALLS,
+            "expected {EXPECTED_CALLS} attempts (initial + {} retries), got {}",
+            EXPECTED_CALLS - 1,
+            calls.get(),
+        );
+
+        // (2) final result is Status::aborted (NOT unavailable / NOT internal).
+        assert_eq!(
+            err.code(),
+            tonic::Code::Aborted,
+            "loop-exit on consecutive 409s must surface Aborted, got {:?}: {}",
+            err.code(),
+            err.message(),
+        );
+
+        // (3) total elapsed within ±25 % jitter band of sum(RETRY_DELAYS_MS).
+        //     `jittered_retry_ms` picks an offset in [base*0.75, base*1.25],
+        //     so the sum lies in [sum*0.75, sum*1.25]. Use the conservative
+        //     [sum*0.74, sum*1.26] band to absorb integer-division rounding
+        //     in `base_ms / 4`.
+        let lower = Duration::from_millis((SUM_MS * 74) / 100);
+        let upper = Duration::from_millis((SUM_MS * 126) / 100);
+        assert!(
+            elapsed >= lower && elapsed <= upper,
+            "elapsed {:?} outside jitter band [{:?}, {:?}] for sum {} ms",
+            elapsed,
+            lower,
+            upper,
+            SUM_MS,
+        );
     }
 }

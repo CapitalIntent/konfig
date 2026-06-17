@@ -139,14 +139,30 @@ async fn patch_secret_with_retry(
     };
 
     let ssapply = PatchParams::apply("konfig.v1").force();
-    let mut attempt = 0usize;
-
-    loop {
+    run_secret_patch_retry_loop(|| async {
         let patch = build_patch(data.clone());
-        match secrets.patch(name, &ssapply, &Patch::Apply(&patch)).await {
-            Ok(s) => {
-                return Ok(s.metadata.resource_version.unwrap_or_default());
-            }
+        secrets
+            .patch(name, &ssapply, &Patch::Apply(&patch))
+            .await
+            .map(|s| s.metadata.resource_version.unwrap_or_default())
+    })
+    .await
+}
+
+/// Pure retry loop body — drives a single-attempt secret-patch closure
+/// through the `RETRY_DELAYS_MS` ladder so the loop-exit path can be tested
+/// without a kube mock. Symmetric with `apply::run_patch_retry_loop`; the
+/// emitted `Status::aborted` carries the ApplySecret-specific message so
+/// the production log line stays unchanged.
+pub(crate) async fn run_secret_patch_retry_loop<F, Fut>(mut do_patch: F) -> Result<String, Status>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<String, kube::Error>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        match do_patch().await {
+            Ok(rv) => return Ok(rv),
             Err(e) => match classify_secret_patch_error(&e, attempt) {
                 SecretPatchRetryDecision::RetryAfter { delay_ms } => {
                     // ±25 % jitter — see `crate::grpc::jittered_retry_ms`.
@@ -291,5 +307,78 @@ mod tests {
     fn parse_secret_schema_version_empty_string() {
         let s = secret_with_annotation(Some(""));
         assert_eq!(parse_secret_schema_version(&s), 0);
+    }
+
+    // ── run_secret_patch_retry_loop: max-retry loop-exit boundary (CU-86aj14yvh) ──
+    //
+    // Mirror of `apply::run_patch_retry_loop_409_exhausts_with_aborted`. PR D
+    // unit-tested the per-attempt classifier (`classify_secret_patch_error`)
+    // but left the loop body uncovered. This test drives the actual loop
+    // with a 409-returning stub closure to lock in the loop-exit contract
+    // for `patch_secret_with_retry`:
+    //   1. The closure is invoked EXACTLY `RETRY_DELAYS_MS.len() + 1` times.
+    //   2. The final error is `Status::aborted` (NOT `unavailable`).
+    //   3. Total elapsed time is within the ±25 % jitter band around
+    //      `sum(RETRY_DELAYS_MS)`.
+    //
+    // Hand-mutation verification (per PR plan): shortening `RETRY_DELAYS_MS`
+    // by one element makes this test fail on the call-count assertion.
+    //
+    // Uses `tokio::time::pause()` for instant, deterministic time advancement.
+    #[tokio::test(start_paused = true)]
+    async fn run_secret_patch_retry_loop_409_exhausts_with_aborted() {
+        use std::cell::Cell;
+
+        assert_eq!(
+            RETRY_DELAYS_MS.as_slice(),
+            [100u64, 200u64].as_slice(),
+            "test pins RETRY_DELAYS_MS to [100, 200]; update the hardcoded \
+             EXPECTED_CALLS and SUM_MS below if you intentionally change it",
+        );
+        const EXPECTED_CALLS: usize = 3; // initial + 2 retries
+        const SUM_MS: u64 = 300; // 100 + 200
+
+        let calls = Cell::new(0usize);
+        let started = tokio::time::Instant::now();
+
+        let result = run_secret_patch_retry_loop(|| {
+            calls.set(calls.get() + 1);
+            async { Err::<String, _>(api_err(409)) }
+        })
+        .await;
+
+        let elapsed = started.elapsed();
+        let err = result.expect_err("loop must exit with Status after exhausting retries");
+
+        // (1) exact call count — initial attempt + N retries.
+        assert_eq!(
+            calls.get(),
+            EXPECTED_CALLS,
+            "expected {EXPECTED_CALLS} attempts (initial + {} retries), got {}",
+            EXPECTED_CALLS - 1,
+            calls.get(),
+        );
+
+        // (2) final result is Status::aborted (NOT unavailable / NOT internal).
+        assert_eq!(
+            err.code(),
+            tonic::Code::Aborted,
+            "loop-exit on consecutive 409s must surface Aborted, got {:?}: {}",
+            err.code(),
+            err.message(),
+        );
+
+        // (3) total elapsed within ±25 % jitter band of sum(RETRY_DELAYS_MS).
+        //     See twin test in `apply.rs` for the jitter-band derivation.
+        let lower = Duration::from_millis((SUM_MS * 74) / 100);
+        let upper = Duration::from_millis((SUM_MS * 126) / 100);
+        assert!(
+            elapsed >= lower && elapsed <= upper,
+            "elapsed {:?} outside jitter band [{:?}, {:?}] for sum {} ms",
+            elapsed,
+            lower,
+            upper,
+            SUM_MS,
+        );
     }
 }
