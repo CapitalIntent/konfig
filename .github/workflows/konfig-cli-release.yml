@@ -152,10 +152,22 @@ jobs:
           Built from commit \`${{ github.sha }}\`.
           EOF
 
+      # Guarded by an env-var check (not a workflow-level `if:` on the
+      # secret) because GitHub Actions does not expose `secrets.*` to
+      # job/step `if:` expressions in older runner versions — the
+      # expression silently evaluates to an empty string and the step
+      # runs anyway. Propagating the secret via `env:` and gating on
+      # `env.GH_TOKEN` works on every runner version. On forks / PRs
+      # where the secret is not available, the step no-ops with a clear
+      # log line instead of failing the release job.
       - name: Create release in jayakasadev/konfig
         env:
           GH_TOKEN: ${{ secrets.KONFIG_RELEASE_TOKEN }}
         run: |
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "KONFIG_RELEASE_TOKEN is unset; skipping release publish." >&2
+            exit 0
+          fi
           TAG="${{ steps.version.outputs.tag }}"
           gh release create "$TAG" \
             --repo jayakasadev/konfig \

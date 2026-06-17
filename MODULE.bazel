@@ -190,23 +190,30 @@ crate.from_cargo(
 # and the `konfig-profiling` image). `cargo tree` without `--features` skips
 # optional deps, so crate_universe wouldn't generate @konfig_crates targets
 # for them off the lockfile alone. Listing them here as `crate.spec` forces
-# the generation; the actual crate version is still pinned by Cargo.lock.
+# the generation.
+#
+# Versions are pinned to the EXACT lockfile version (not a loose semver range
+# like "0.5") so the crate.spec can never drift past what Cargo.lock resolves.
+# A loose "0.5" spec would silently let crate_universe pick up a newer 0.5.x
+# release on lockfile refresh without anyone noticing in review. Keep these
+# in sync with Cargo.lock when bumping.
 crate.spec(
     package = "pyroscope",
-    version = "0.5",
+    version = "=0.5.8",
 )
 crate.spec(
     package = "pyroscope_pprofrs",
-    version = "0.2",
+    version = "=0.2.10",
 )
 
 # console-subscriber is an optional dep of the `konfig` crate behind the
 # `tokio_console` feature. Same pattern as pyroscope above — listed here so
 # crate_universe materialises a Bazel target even when no rust_binary opts
-# into the feature by default.
+# into the feature by default. Pinned exactly to the lockfile version for
+# the same drift-prevention reason described above.
 crate.spec(
     package = "console-subscriber",
-    version = "0.4",
+    version = "=0.4.1",
 )
 
 # tokio + tokio-metrics + console-subscriber expose their full APIs (per-worker

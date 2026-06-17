@@ -6,7 +6,7 @@
 #
 # Updates every `kasa288/konfig*:...` reference in:
 #   - infra/konfig/deployment.yaml
-#   - infra/konfig-loadtest/job.yaml
+#   - infra/konfig-loadtest/job*.yaml  (job.yaml + every scenario variant)
 #
 # The CI workflow (.github/workflows/publish-images.yml) calls this after
 # pushing the multi-arch images so the committed-back manifests pin to the
@@ -41,8 +41,14 @@ sed_inplace() {
 PATTERN='s|(kasa288/konfig[a-z-]*):[A-Za-z0-9._-]+|\1:'"$SHA"'|g'
 
 sed_inplace -E "$PATTERN" infra/konfig/deployment.yaml
-sed_inplace -E "$PATTERN" infra/konfig-loadtest/job.yaml
 
 echo "Pinned image tags to $SHA in:"
 echo "  infra/konfig/deployment.yaml"
-echo "  infra/konfig-loadtest/job.yaml"
+
+# Loop over every job-*.yaml variant (job.yaml, job-stress.yaml,
+# job-backpressure.yaml, job-saturate.yaml, …) so new scenario manifests
+# get picked up automatically without script edits.
+for f in infra/konfig-loadtest/job*.yaml; do
+    sed_inplace -E "$PATTERN" "$f"
+    echo "  $f"
+done
