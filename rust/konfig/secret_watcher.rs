@@ -294,15 +294,63 @@ mod tests {
         let cache = Arc::new(SecretCache::new());
         let (tx, mut rx) = broadcast::channel(8);
         let lea = Arc::new(LastEventAt::new());
+        // Freshness gauge starts uninitialised — must transition to "set"
+        // after the first event so `konfig_stale_seconds` reflects API
+        // connectivity, not pod-uptime.
+        assert!(lea.elapsed_secs().is_none(), "precondition: no event yet");
+
         let events: Vec<Result<Event<Secret>, kube_watcher::Error>> =
             vec![Ok(Event::Apply(secret_with_data("s-a", "k", b"v1", 1)))];
 
+        // Strengthen `res.is_ok()` to an exhaustive match — a regression
+        // that wraps the success in a different variant (or returns Ok(())
+        // prematurely without consuming the stream) is still possible after
+        // future refactors.
         let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
-        assert!(res.is_ok());
-        assert_eq!(cache.get("ns", "s-a").unwrap().schema_version, 1);
+        match res {
+            Ok(()) => {}
+            Err(e) => panic!("clean-stream end must be Ok(()), got Err({e:?})"),
+        }
+
+        // (a) Cache: synthetic Apply must materialise the snapshot under the
+        // (namespace, name) key with the schema_version from the annotation.
+        // The value must round-trip as base64-encoded bytes (`djE=` ==
+        // b64("v1")), not as plaintext.
+        let cached = cache
+            .get("ns", "s-a")
+            .expect("Apply must populate (ns, name) entry in cache");
+        assert_eq!(cached.schema_version, 1);
+        let val = cached
+            .data
+            .get("k")
+            .expect("synthetic data key must round-trip into cache");
+        assert_eq!(
+            std::str::from_utf8(val).unwrap(),
+            "djE=",
+            "cache stores base64-encoded value, not plaintext",
+        );
+
+        // (b) Broadcast: exactly one event of type Modified — Apply maps to
+        // Modified in the proto (Added is reserved for the separate "new
+        // subscriber initial snapshot" path).
         let evt = rx.try_recv().expect("must broadcast Modified");
         assert_eq!(evt.event_type, EventType::Modified as i32);
-        assert!(rx.try_recv().is_err(), "exactly one broadcast");
+        let bcast_secret = evt.secret.as_ref().expect("event must carry payload");
+        assert_eq!(bcast_secret.name, "s-a");
+        assert_eq!(bcast_secret.namespace, "ns");
+        assert_eq!(bcast_secret.schema_version, 1);
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "Apply must produce exactly one broadcast event",
+        );
+
+        // (c) Freshness: gauge must have been touched (Some, not None)
+        // because pump_secret_events touches it on every event before
+        // dispatching to handle_secret_event.
+        assert!(
+            lea.elapsed_secs().is_some(),
+            "Apply event must touch last_event_at — konfig_stale_seconds tracks this",
+        );
     }
 
     #[tokio::test]
@@ -339,11 +387,27 @@ mod tests {
         ];
 
         let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
-        assert!(res.is_err());
+        // Strengthen `is_err()` to a precise variant match — the kube
+        // runtime watcher distinguishes WatchFailed (this case), InitFailed,
+        // TooManyObjects etc. The reconnect loop in `run_with_reconnect`
+        // backs off uniformly for now, but downstream metric labelling and
+        // alert routing depend on the variant being preserved through the
+        // pump.
+        let err = res.expect_err("stream error must propagate, not be swallowed");
+        assert!(
+            matches!(err, kube_watcher::Error::WatchFailed(_)),
+            "expected kube::runtime::watcher::Error::WatchFailed, got: {err:?}",
+        );
+
+        // Pre-error event landed in cache; post-error event must NOT
+        // (pump halts on first Err — `try_next?` short-circuits).
         assert_eq!(cache.get("ns", "s-a").unwrap().schema_version, 1);
         assert!(cache.get("ns", "s-c").is_none());
         let _ = rx.try_recv().expect("pre-error broadcast lands");
-        assert!(rx.try_recv().is_err());
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "no post-error broadcast must land",
+        );
     }
 
     #[tokio::test]

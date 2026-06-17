@@ -491,23 +491,62 @@ mod tests {
         );
     }
 
-    /// get_broadcast_rx returns Some when a sender exists in the map.
-    #[test]
-    fn get_broadcast_rx_returns_some_when_sender_exists() {
+    /// `get_broadcast_rx` must return a `Receiver` that is *actually* wired
+    /// to the per-namespace `Sender` — not just any `Receiver` from any
+    /// channel. Verify by sending a recognisable event through the original
+    /// `Sender` and confirming the returned `Receiver` observes it within a
+    /// small timeout.
+    #[tokio::test]
+    async fn get_broadcast_rx_returns_receiver_wired_to_original_sender() {
         let broadcasts = Arc::new(DashMap::new());
-        let (tx, _rx) = broadcast::channel::<SecretEvent>(BROADCAST_CAPACITY);
-        broadcasts.insert("trading".to_string(), tx);
+        let (tx, _keepalive_rx) = broadcast::channel::<SecretEvent>(BROADCAST_CAPACITY);
+        broadcasts.insert("trading".to_string(), tx.clone());
 
-        let result = get_broadcast_rx("trading", &broadcasts);
-        assert!(result.is_some());
+        let mut rx = get_broadcast_rx("trading", &broadcasts)
+            .expect("must return Some(Receiver) when sender exists");
+
+        // Drive a recognisable event through the original sender; the
+        // returned receiver must observe it. If `get_broadcast_rx` returns a
+        // receiver from a *different* channel (regression), recv() times out.
+        let evt = make_secret_event("trading", "api-keys", EventType::Added as i32);
+        tx.send(evt).expect("at least one receiver exists");
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("receiver must observe the broadcast within 500ms")
+            .expect("recv must not error on a live channel");
+        assert_eq!(recv.event_type, EventType::Added as i32);
+        let secret = recv.secret.expect("secret payload");
+        assert_eq!(secret.namespace, "trading");
+        assert_eq!(secret.name, "api-keys");
     }
 
-    /// get_broadcast_rx returns None when no sender exists.
+    /// `get_broadcast_rx` returns `None` only when there is *no* sender for
+    /// the namespace — and inserting a sender for an *unrelated* namespace
+    /// must not satisfy the lookup. Catches a regression where the lookup
+    /// ignored the key and returned any sender it found.
     #[test]
-    fn get_broadcast_rx_returns_none_when_no_sender() {
+    fn get_broadcast_rx_returns_none_for_missing_namespace_only() {
         let broadcasts = Arc::new(DashMap::<String, broadcast::Sender<SecretEvent>>::new());
-        let result = get_broadcast_rx("missing-ns", &broadcasts);
-        assert!(result.is_none());
+        // Empty map → None.
+        assert!(
+            get_broadcast_rx("missing-ns", &broadcasts).is_none(),
+            "empty map must yield None",
+        );
+
+        // Map with a sender for a *different* namespace → still None for
+        // the missing one. Guards against a regression where the lookup
+        // returned `.iter().next()` instead of `.get(namespace)`.
+        let (tx, _rx) = broadcast::channel::<SecretEvent>(BROADCAST_CAPACITY);
+        broadcasts.insert("other-ns".to_string(), tx);
+        assert!(
+            get_broadcast_rx("missing-ns", &broadcasts).is_none(),
+            "lookup must be keyed on namespace, not just map non-emptiness",
+        );
+        assert!(
+            get_broadcast_rx("other-ns", &broadcasts).is_some(),
+            "the actual key must still resolve",
+        );
     }
 
     /// parse_secret_object rejects secrets without the managed label.

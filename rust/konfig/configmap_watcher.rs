@@ -213,16 +213,51 @@ mod tests {
     async fn pump_applies_events_to_cache_and_completes_on_stream_close() {
         use futures_util::stream;
         let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        assert!(
+            !cache.is_populated(),
+            "precondition: empty cache before pump",
+        );
+
         let events: Vec<Result<Event<ConfigMap>, kube_watcher::Error>> = vec![
             Ok(Event::InitApply(cm("cm-a", 1))),
             Ok(Event::Apply(cm("cm-a", 2))),
             Ok(Event::Apply(cm("cm-b", 3))),
         ];
 
+        // Strengthen `res.is_ok()` to an exhaustive match — a regression
+        // that wraps the success in a different variant would still pass
+        // `is_ok()`.
         let res = pump_configmap_events(stream::iter(events), &cache, "default").await;
-        assert!(res.is_ok(), "clean stream end is Ok");
-        assert_eq!(cache.get("default", "cm-a").unwrap().schema_version, 2);
-        assert_eq!(cache.get("default", "cm-b").unwrap().schema_version, 3);
+        match res {
+            Ok(()) => {}
+            Err(e) => panic!("clean stream end must be Ok(()), got Err({e:?})"),
+        }
+
+        // (a) Cache: last-write-wins on the same key — Apply(cm-a, 2) must
+        // overwrite InitApply(cm-a, 1). The synthetic stream put `k=v2` into
+        // the data map (cf. `cm()` helper); round-trip through
+        // `parse_configmap` → `ConfigSnapshot.content` keeps it a string.
+        let cm_a = cache
+            .get("default", "cm-a")
+            .expect("cm-a must be cached after Apply");
+        assert_eq!(
+            cm_a.schema_version, 2,
+            "last write wins — Apply(v2) must overwrite InitApply(v1)",
+        );
+        assert_eq!(cm_a.content["k"], "v2");
+
+        let cm_b = cache
+            .get("default", "cm-b")
+            .expect("cm-b must be cached after Apply");
+        assert_eq!(cm_b.schema_version, 3);
+        assert_eq!(cm_b.content["k"], "v3");
+
+        // (b) Cache populated flag flips after first Apply event — the
+        // readiness probe / `is_populated()` gate depends on this.
+        assert!(
+            cache.is_populated(),
+            "cache must report populated after Apply events",
+        );
     }
 
     #[tokio::test]
