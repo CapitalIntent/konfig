@@ -702,4 +702,82 @@ mod tests {
             "closed receiver must yield false so caller bails",
         );
     }
+
+    /// Cold-start failure path: `run_raw_watch` must surface a
+    /// `Status::unavailable` frame on the subscriber's mpsc when the very
+    /// first `api.watch().await` call fails (e.g. kube apiserver
+    /// unreachable / partitioned). Without this branch, the resume-path
+    /// subscriber would observe a silent end-of-stream and have no signal
+    /// to retry on a different peer — undermining the "kube partition
+    /// resilience" contract documented in the README. CU-86aj14z40.
+    ///
+    /// Mock kube apiserver: bind a TcpListener on an ephemeral port, drop
+    /// it immediately, then point the kube client at the now-closed port.
+    /// The first `watch()` attempt fails with ECONNREFUSED → exercises
+    /// the `Err(e)` arm at the top of `run_raw_watch` deterministically.
+    #[tokio::test]
+    async fn subscribe_secrets_raw_watch_returns_unavailable_on_cold_start_failure() {
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+
+        // Atomically reserve a free port, then drop the listener so the
+        // next connect attempt fails with ECONNREFUSED immediately
+        // (no flaky timeouts).
+        let addr = {
+            let l = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind ephemeral port");
+            l.local_addr().expect("local_addr")
+        };
+
+        let cfg = kube::Config::new(format!("http://{addr}").parse().expect("valid URL"));
+        let kube_client = Client::try_from(cfg).expect("Client::try_from must not connect");
+
+        let (tx, mut rx) = mpsc::channel::<Result<SecretEvent, Status>>(CHANNEL_CAPACITY);
+        let drain_notify = Arc::new(Notify::new());
+
+        // Drive run_raw_watch directly — cold-start watch() will fail.
+        let handle = tokio::spawn(run_raw_watch(
+            kube_client,
+            "trading".to_string(),
+            "rv-001".to_string(),
+            tx,
+            drain_notify,
+        ));
+
+        // The function must emit exactly one Status::unavailable frame and
+        // then drop the mpsc sender (task exits via early `return`).
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("run_raw_watch must surface a frame within 5 s")
+            .expect("mpsc must carry a frame before being dropped");
+
+        let status = first.expect_err("cold-start failure must produce Err(Status)");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unavailable,
+            "kube apiserver unreachable must map to UNAVAILABLE (retryable), \
+             got {:?}: {}",
+            status.code(),
+            status.message(),
+        );
+        assert!(
+            status.message().contains("watch error"),
+            "status message must identify the failed operation, got: {:?}",
+            status.message(),
+        );
+
+        // mpsc must close after the error frame — `run_raw_watch`
+        // returned, dropping `tx`.
+        let trailing = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("recv after error must resolve within 1 s");
+        assert!(
+            trailing.is_none(),
+            "channel must close after the error frame (got {:?})",
+            trailing,
+        );
+
+        handle.await.expect("run_raw_watch task must not panic");
+    }
 }
