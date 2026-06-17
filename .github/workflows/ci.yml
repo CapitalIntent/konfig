@@ -43,7 +43,17 @@ jobs:
         run: bazel test //rust/konfig:test //tools/konfig-cli/... --test_output=errors
 
       - name: Format
-        run: bazel test //rust/konfig:fmt_test //tools/konfig-cli:fmt_test
+        run: |
+          bazel test \
+            //rust/konfig:fmt_test \
+            //rust/konfig-consumer:fmt_test \
+            //tools/konfig-cli:fmt_test \
+            //tools/konfig-loadtest:fmt_test
 
       - name: Clippy
-        run: bazel build //rust/konfig:clippy_test //tools/konfig-cli:clippy_test
+        run: |
+          bazel build \
+            //rust/konfig:clippy_test \
+            //rust/konfig-consumer:clippy_test \
+            //tools/konfig-cli:clippy_test \
+            //tools/konfig-loadtest:clippy_test
