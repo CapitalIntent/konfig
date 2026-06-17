@@ -20,6 +20,8 @@ pub mod metrics;
 pub mod secret_cache;
 pub mod secret_watcher;
 pub mod startup;
+#[cfg(feature = "snmalloc_profiling")]
+pub mod stream_sink;
 pub mod sync_util;
 pub mod types;
 pub mod value_parse;
