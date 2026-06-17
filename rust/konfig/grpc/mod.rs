@@ -785,4 +785,98 @@ mod tests {
         let cfg = kube::Config::new("http://127.0.0.1:0".parse().expect("valid URL"));
         kube::Client::try_from(cfg).expect("infallible — only constructs HTTP client")
     }
+
+    // ── snapshot_to_proto ─────────────────────────────────────────────────────
+
+    /// `snapshot_to_proto` runs on every `Get` + `Subscribe` response (CU-86aj3m14k).
+    /// Verify every protobuf field is populated from the right `ConfigSnapshot`
+    /// source and that the cached `content_json` is propagated correctly.
+    #[test]
+    fn snapshot_to_proto_populates_namespace_name_and_resource_version() {
+        let snap = crate::types::ConfigSnapshot {
+            namespace: "ns-a".to_string(),
+            name: "cfg-x".to_string(),
+            resource_version: "1234".to_string(),
+            schema_version: 7,
+            ..Default::default()
+        };
+        let proto = snapshot_to_proto(&snap);
+        assert_eq!(proto.namespace, "ns-a");
+        assert_eq!(proto.name, "cfg-x");
+        assert_eq!(proto.resource_version, "1234");
+        assert_eq!(proto.schema_version, 7);
+    }
+
+    #[test]
+    fn snapshot_to_proto_propagates_memoised_content_json() {
+        let snap = crate::types::ConfigSnapshot {
+            content: serde_json::json!({"k": "v", "n": 42}),
+            ..Default::default()
+        };
+        // Force-warm the cache to verify the proto field receives the memoised
+        // string, not a fresh serialisation.
+        let warmed = snap.content_json().to_owned();
+        let proto = snapshot_to_proto(&snap);
+        assert_eq!(proto.content_json, warmed);
+        // Validate the JSON shape so a future refactor that changes the encoder
+        // (e.g. canonical-form ordering) fails this test loudly.
+        let v: serde_json::Value = serde_json::from_str(&proto.content_json).expect("valid json");
+        assert_eq!(v["k"], "v");
+        assert_eq!(v["n"], 42);
+    }
+
+    #[test]
+    fn snapshot_to_proto_emits_non_negative_age_ms() {
+        let snap = crate::types::ConfigSnapshot::default();
+        // A freshly constructed snapshot's `loaded_at` is `Instant::now()`.
+        // The proto's `age_ms` is the elapsed time at conversion. Both the
+        // construct + convert happen in the same test stack, so age_ms is
+        // either 0 (fast machine) or a small positive integer — never < 0.
+        let proto = snapshot_to_proto(&snap);
+        assert!(
+            proto.age_ms >= 0,
+            "age_ms must be non-negative, got {}",
+            proto.age_ms
+        );
+    }
+
+    #[test]
+    fn snapshot_to_proto_stale_since_sentinel_minus_one_when_fresh() {
+        let snap = crate::types::ConfigSnapshot {
+            stale_since: None,
+            ..Default::default()
+        };
+        let proto = snapshot_to_proto(&snap);
+        assert_eq!(
+            proto.stale_since_ms, -1,
+            "fresh (None) `stale_since` must emit the -1 sentinel"
+        );
+    }
+
+    #[test]
+    fn snapshot_to_proto_stale_since_non_negative_when_stale() {
+        // Construct a snapshot whose `stale_since` was set in the past so
+        // the elapsed conversion produces a non-negative i64. Use a tiny
+        // delay (10ms) inside the same test to keep timing deterministic
+        // without sleeping the whole suite.
+        let stale_anchor = Instant::now();
+        std::thread::sleep(Duration::from_millis(10));
+        let snap = crate::types::ConfigSnapshot {
+            stale_since: Some(stale_anchor),
+            ..Default::default()
+        };
+        let proto = snapshot_to_proto(&snap);
+        assert!(
+            proto.stale_since_ms >= 0,
+            "stale_since_ms must be non-negative when stale_since is Some, got {}",
+            proto.stale_since_ms
+        );
+        // The 10ms sleep guarantees a strictly-positive elapsed time on
+        // any reasonable runner.
+        assert!(
+            proto.stale_since_ms > 0,
+            "stale_since_ms must be > 0 after a 10ms sleep, got {}",
+            proto.stale_since_ms
+        );
+    }
 }
