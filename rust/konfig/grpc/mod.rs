@@ -508,6 +508,16 @@ mod tests {
     /// no public getters for the SETTINGS values, so this test exercises the
     /// signature + compile contract only — we just verify it returns a usable
     /// builder that we can chain further calls on.
+    ///
+    /// **Assurance level: compile + chain.** A wire-level SETTINGS-frame
+    /// check (open a TCP socket, accept a tonic server's connection, parse
+    /// the SETTINGS frame with an `h2` client, assert
+    /// `SETTINGS_INITIAL_WINDOW_SIZE` and `SETTINGS_MAX_CONCURRENT_STREAMS`
+    /// match the overrides) would require pulling `h2` into dev-deps and
+    /// regenerating the Bazel `cargo-bazel-lock.json`. Deferred to a future
+    /// integration test (see `apply_h2_overrides_builder_binds_and_serves`
+    /// below, which validates the next-best signal: the configured builder
+    /// successfully binds a listener and completes an HTTP/2 handshake).
     #[test]
     fn apply_h2_overrides_compiles_and_chains() {
         let b = tonic::transport::Server::builder();
@@ -520,19 +530,122 @@ mod tests {
         let _ = apply_h2_overrides(b, Some(1_048_576), Some(2048));
     }
 
-    /// Jitter must keep the output within ±25 % of the input base.
+    /// End-to-end binding smoke: build a `tonic::transport::Server` with
+    /// `apply_h2_overrides`, mount a `tonic_health` service, bind to an
+    /// ephemeral port, and confirm a tonic `Channel` can connect and
+    /// complete an HTTP/2 preface + SETTINGS exchange.
+    ///
+    /// This catches builder-pipeline regressions that the
+    /// `_compiles_and_chains` test cannot — any mutation that breaks the
+    /// h2 layer (e.g. an ICE-style breakage from a future tonic API churn)
+    /// fails here, not at compile time. Wire-level SETTINGS-value
+    /// introspection itself is still deferred (see the
+    /// `_compiles_and_chains` docstring): tonic's `Channel` will accept
+    /// nonsense window sizes silently, so this test cannot guarantee the
+    /// *exact* SETTINGS values reached the wire — only that the builder is
+    /// not totally broken.
+    #[tokio::test]
+    async fn apply_h2_overrides_builder_binds_and_serves() {
+        use tokio::net::TcpListener;
+        use tonic::transport::Server as TonicServer;
+
+        // Bind first so the kernel hands us a free port atomically, then
+        // immediately drop the listener — `tonic::Server::serve_with_shutdown`
+        // wants a `SocketAddr` it can bind itself. Inherent TOCTOU here, but
+        // on a CI host with no port pressure this is the standard
+        // "ephemeral free port" trick used widely in the tonic ecosystem.
+        let addr: SocketAddr = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            l.local_addr().expect("local_addr")
+        };
+
+        // Health reporter is the simplest non-trivial service we can mount
+        // without bringing up the full KonfigServer (which needs a kube
+        // client). Exercises the same `add_service` path that `serve()` uses
+        // in prod.
+        let (reporter, health_server) = tonic_health::server::health_reporter();
+        reporter
+            .set_service_status("ping", tonic_health::ServingStatus::Serving)
+            .await;
+
+        let mut builder = apply_h2_overrides(TonicServer::builder(), Some(1_048_576), Some(2_048));
+
+        // Drive the server in the background; shutdown when the oneshot fires.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            builder
+                .add_service(health_server)
+                .serve_with_shutdown(addr, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        // A real tonic `Channel` connect performs the HTTP/2 preface +
+        // initial SETTINGS exchange. Retry briefly because the server task
+        // may not have reached `bind()` yet when we connect.
+        let channel = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+                    .expect("endpoint")
+                    .connect()
+                    .await
+                {
+                    Ok(ch) => break ch,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("h2 handshake must succeed within 3s with valid overrides");
+        // Drop the channel before shutting down so the server's graceful
+        // shutdown does not race with an in-flight handshake.
+        drop(channel);
+
+        let _ = shutdown_tx.send(());
+        let res = tokio::time::timeout(Duration::from_secs(2), server_handle)
+            .await
+            .expect("server task must terminate within 2s after shutdown");
+        res.expect("join").expect("server must shut down cleanly");
+    }
+
+    /// Jitter must keep the output within ±25 % of the input base AND must
+    /// actually vary across calls — a constant return (e.g. someone replaces
+    /// `nanos % span` with `0`) would silently satisfy the band check alone.
+    ///
+    /// Test design (no sleep!):
+    ///   - The previous implementation slept 1 µs per iteration to vary the
+    ///     `SystemTime::now().subsec_nanos()` entropy source. Microsecond
+    ///     sleeps are unreliable on slow CI runners (sleep granularity can
+    ///     exceed the requested duration), occasionally producing identical
+    ///     samples and a falsely-flaky "no variation" assertion.
+    ///   - This rewrite collects 4 096 samples back-to-back. `subsec_nanos()`
+    ///     advances by at least one tick between any two `now()` calls on
+    ///     every supported platform; with no sleep we still see ≥ hundreds
+    ///     of distinct nanos values across the loop, which is plenty to
+    ///     exercise the `nanos % span` distribution.
     #[test]
     fn jittered_retry_ms_stays_within_band() {
+        use std::collections::HashSet;
         let base = 200u64;
-        // 16 samples to give the SystemTime entropy a chance to vary.
-        for _ in 0..16 {
+        let mut seen = HashSet::new();
+        for _ in 0..4_096 {
             let v = jittered_retry_ms(base);
             assert!(
                 (150..=250).contains(&v),
                 "jittered_retry_ms({base}) = {v} outside ±25 % band",
             );
-            std::thread::sleep(std::time::Duration::from_micros(1));
+            seen.insert(v);
         }
+        // Must observe meaningful spread — a constant-return regression
+        // (e.g. `offset = 0`) would only ever produce `base - jitter_range`.
+        // Demanding > 10 distinct samples out of 4 096 is far above the
+        // false-positive floor while still catching collapse to a constant.
+        assert!(
+            seen.len() > 10,
+            "jitter must vary across calls; only {} distinct values in 4 096 samples",
+            seen.len(),
+        );
     }
 
     #[test]
@@ -571,14 +684,33 @@ mod tests {
         assert!(server.is_draining());
     }
 
-    /// `check_drain` returns `UNAVAILABLE` once the flag is set.
+    /// `check_drain` returns `Ok(())` when not draining and `UNAVAILABLE`
+    /// once the flag is set — with a human-readable "draining" message so
+    /// operators can distinguish drain-aborts from other `UNAVAILABLE`
+    /// returns in client logs.
     #[test]
     fn check_drain_returns_unavailable_when_draining() {
         let flag = AtomicBool::new(false);
-        assert!(check_drain(&flag).is_ok());
+        // Exhaustively match instead of `is_ok()` — a regression that wraps
+        // `Ok(())` in some other variant would still satisfy `is_ok()`
+        // after a future refactor but fail this match.
+        match check_drain(&flag) {
+            Ok(()) => {}
+            Err(s) => panic!("expected Ok when draining=false, got Err({s:?})"),
+        }
+
         flag.store(true, Ordering::Release);
         let err = check_drain(&flag).expect_err("must error when draining");
-        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unavailable,
+            "drain rejects must use UNAVAILABLE so clients reconnect to a healthy pod",
+        );
+        assert!(
+            err.message().contains("draining"),
+            "status message must mention 'draining' for operator log greppability; got: {:?}",
+            err.message(),
+        );
     }
 
     /// While draining the `Get` RPC short-circuits with UNAVAILABLE before
