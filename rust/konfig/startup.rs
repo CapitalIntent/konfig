@@ -127,6 +127,18 @@ pub struct Args {
     /// eventual-consistency contract tolerates the delay; start with 5.
     #[arg(long, env = "KONFIG_COALESCE_WINDOW_MS", default_value = "0")]
     pub coalesce_window_ms: u64,
+
+    /// Per-namespace broadcast shard count (CU-86aj3vpnh). Clamped to `1..=16`.
+    /// `1` (the default) is byte-for-byte the historical single broadcast
+    /// channel per namespace — every event wakes every subscriber. `> 1`
+    /// splits each namespace into N broadcast channels: the watcher fans every
+    /// event to all N, and each Subscribe RPC attaches its receiver to ONE
+    /// shard (round-robin), so an event wakes only ~1/N of the namespace's
+    /// subscribers — cutting wake amplification under fan-out. The per-namespace
+    /// replay buffer is shared (NOT sharded), so reconnect/resume semantics are
+    /// unchanged. Default flips to 4 only after a bench validates the win.
+    #[arg(long, env = "KONFIG_BROADCAST_SHARDS", default_value = "1")]
+    pub broadcast_shards: usize,
 }
 
 /// Resolve a `ServerTlsConfig` from the TLS-related fields on `args`, or
@@ -308,6 +320,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         h2_initial_window_bytes: args.h2_initial_window_bytes,
         h2_max_concurrent_streams: args.h2_max_concurrent_streams,
         coalesce_window: std::time::Duration::from_millis(args.coalesce_window_ms),
+        broadcast_shards: args.broadcast_shards,
     })
     .await?;
 
@@ -436,6 +449,7 @@ mod tests {
             h2_initial_window_bytes: None,
             h2_max_concurrent_streams: None,
             coalesce_window_ms: 0,
+            broadcast_shards: 1,
         }
     }
 
@@ -553,6 +567,35 @@ mod tests {
         .expect("must parse");
         assert_eq!(args.h2_initial_window_bytes, Some(1_048_576));
         assert_eq!(args.h2_max_concurrent_streams, Some(2048));
+    }
+
+    /// `--broadcast-shards` defaults to `1` (CU-86aj3vpnh) — the historical
+    /// single-channel path. Clear the env var first so a leaked
+    /// `KONFIG_BROADCAST_SHARDS` in the runner shell can't perturb the default.
+    #[test]
+    fn args_parse_broadcast_shards_default_one() {
+        // SAFETY: test process; clap reads this env var during parse and we
+        // only touch it here to make the default deterministic.
+        unsafe {
+            std::env::remove_var("KONFIG_BROADCAST_SHARDS");
+        }
+        let args =
+            Args::try_parse_from(["konfig", "--name", "cfg", "--tls=false"]).expect("must parse");
+        assert_eq!(args.broadcast_shards, 1, "broadcast-shards defaults to 1");
+    }
+
+    #[test]
+    fn args_parse_broadcast_shards_explicit() {
+        let args = Args::try_parse_from([
+            "konfig",
+            "--name",
+            "cfg",
+            "--tls=false",
+            "--broadcast-shards",
+            "8",
+        ])
+        .expect("must parse");
+        assert_eq!(args.broadcast_shards, 8);
     }
 
     #[test]

@@ -16,6 +16,7 @@
 //!    is returned; the client gets a consistent snapshot and continues normally.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -67,6 +68,116 @@ const COALESCE_MAX_BATCH: usize = 16;
 /// Broadcast ring-buffer capacity per namespace.
 /// Sized so that even the slowest subscriber can drain before the ring wraps.
 const BROADCAST_CAPACITY: usize = 1_024;
+
+/// Lower / upper clamp for the per-namespace broadcast shard count
+/// (CU-86aj3vpnh). `1` keeps the historical single-channel path byte-for-byte;
+/// `16` caps the per-namespace `Vec<Sender>` + per-apply fan-out cost.
+pub const MIN_BROADCAST_SHARDS: usize = 1;
+pub const MAX_BROADCAST_SHARDS: usize = 16;
+
+/// Sharded broadcast fan-out for one namespace (CU-86aj3vpnh).
+///
+/// Holds `N` independent `broadcast::Sender`s (`1..=16`). The watcher pump
+/// fans **every** event to **all** `N` senders (after a single shared
+/// `push_replay`), but each Subscribe RPC attaches its `Receiver` to exactly
+/// **one** shard — picked round-robin via [`ShardSet::next_receiver`]. An event
+/// therefore wakes only the ~1/N of subscribers parked on that shard instead of
+/// every subscriber in the namespace.
+///
+/// `N == 1` is the historical single-channel path: the `Vec` has one element,
+/// the round-robin index is always `0`, and `send_to_all` does exactly one
+/// `tx.send` — byte-for-byte the pre-sharding behaviour.
+///
+/// The replay buffer is intentionally **NOT** sharded (it stays one
+/// `ReplayBuffer` per namespace, owned by the watcher). A reconnecting
+/// subscriber resumes from that single shared buffer regardless of which shard
+/// it then lands on; per-shard replay would fragment resume semantics.
+#[derive(Clone)]
+pub struct ShardSet {
+    senders: Arc<Vec<broadcast::Sender<Arc<BroadcastFrame>>>>,
+    /// Round-robin cursor, advanced once per Subscribe attach. Wrapping is
+    /// fine — assignment is `idx % N`, so overflow only re-bases the sequence.
+    next: Arc<AtomicUsize>,
+}
+
+impl ShardSet {
+    /// Build `shards` independent broadcast channels for a namespace, returning
+    /// the [`ShardSet`] plus one `Receiver` per shard (the slow-path caller
+    /// keeps the receiver for the shard it attaches to and drops the rest).
+    ///
+    /// `shards` is assumed pre-clamped to `1..=MAX_BROADCAST_SHARDS` by the
+    /// caller (`serve` clamps the CLI value once at startup).
+    fn new(shards: usize) -> (Self, Vec<broadcast::Receiver<Arc<BroadcastFrame>>>) {
+        let shards = shards.max(MIN_BROADCAST_SHARDS);
+        let mut senders = Vec::with_capacity(shards);
+        let mut receivers = Vec::with_capacity(shards);
+        for _ in 0..shards {
+            let (tx, rx) = broadcast::channel(BROADCAST_CAPACITY);
+            senders.push(tx);
+            receivers.push(rx);
+        }
+        (
+            Self {
+                senders: Arc::new(senders),
+                next: Arc::new(AtomicUsize::new(0)),
+            },
+            receivers,
+        )
+    }
+
+    /// Round-robin a `Receiver` onto the next shard. Advances the per-namespace
+    /// cursor with `Relaxed` ordering — assignment only needs even spread, not
+    /// a happens-before edge, so the cheapest atomic suffices.
+    fn next_receiver(&self) -> broadcast::Receiver<Arc<BroadcastFrame>> {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+        self.senders[idx].subscribe()
+    }
+
+    /// Fan one frame out to **every** shard. Returns `true` if at least one
+    /// shard had a live receiver (`broadcast::send` errors only on zero
+    /// receivers), preserving the `EVENTS_BROADCAST` counter semantics (counts
+    /// events that reached >= 1 subscriber, namespace-wide).
+    fn send_to_all(&self, frame: Arc<BroadcastFrame>) -> bool {
+        let mut delivered = false;
+        for tx in self.senders.iter() {
+            if tx.send(Arc::clone(&frame)).is_ok() {
+                delivered = true;
+            }
+        }
+        delivered
+    }
+
+    /// Total live receivers summed across all shards — for the dispatch span
+    /// and GC idle check.
+    fn total_receiver_count(&self) -> usize {
+        self.senders.iter().map(|tx| tx.receiver_count()).sum()
+    }
+}
+
+#[cfg(test)]
+impl ShardSet {
+    /// Number of shards (`>= 1`) — test-only assertions.
+    pub(crate) fn len(&self) -> usize {
+        self.senders.len()
+    }
+
+    /// Wrap a pre-built set of senders (test-only). Lets a test create the
+    /// broadcast channels itself, keep the receivers it wants to read from, and
+    /// still drive the production pump / GC code through a `ShardSet`.
+    pub(crate) fn from_senders(senders: Vec<broadcast::Sender<Arc<BroadcastFrame>>>) -> Self {
+        assert!(!senders.is_empty(), "ShardSet needs >= 1 sender");
+        Self {
+            senders: Arc::new(senders),
+            next: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Sender for one shard (test-only) — lets a test push frames or assert on
+    /// `receiver_count` of an individual shard.
+    pub(crate) fn sender(&self, idx: usize) -> &broadcast::Sender<Arc<BroadcastFrame>> {
+        &self.senders[idx]
+    }
+}
 
 /// Maximum number of events kept in the per-namespace replay buffer.
 /// Events older than this are evicted (FIFO).  1 000 events at typical
@@ -126,11 +237,12 @@ fn push_replay(buf: &ReplayBuffer, resource_version: &str, event: Arc<ConfigEven
 pub async fn handle_subscribe(
     cache: Arc<ConfigCache>,
     kube_client: Client,
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
+    namespace_broadcasts: Arc<DashMap<String, ShardSet>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
     watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
     drain_notify: Arc<Notify>,
     coalesce_window: Duration,
+    broadcast_shards: usize,
     req: SubscribeRequest,
 ) -> Result<Response<ReceiverStream<Result<ConfigEvent, Status>>>, Status> {
     debug!(namespace = %req.namespace, resume_rv = %req.resume_resource_version, "Subscribe RPC");
@@ -147,6 +259,8 @@ pub async fn handle_subscribe(
     let resume_rv = req.resume_resource_version;
 
     // Get or create the broadcast receiver and replay buffer for this namespace.
+    // The returned receiver is attached to ONE shard (round-robin); the watcher
+    // fans every event to all shards.
     let (bcast_rx, replay_buf) = get_or_create_broadcast(
         namespace.clone(),
         kube_client,
@@ -154,6 +268,7 @@ pub async fn handle_subscribe(
         Arc::clone(&namespace_replay_buffers),
         Arc::clone(&watcher_handles),
         coalesce_window,
+        broadcast_shards,
     );
 
     // Both resume and fresh-subscribe paths route through resume_from_buffer:
@@ -176,22 +291,30 @@ pub async fn handle_subscribe(
 
 /// Return a `(broadcast::Receiver, ReplayBuffer)` for `namespace`, spinning up
 /// a kube watcher if one isn't already running for that namespace.
+///
+/// The receiver is attached to ONE shard of the namespace's [`ShardSet`],
+/// chosen round-robin (CU-86aj3vpnh). `broadcast_shards` (pre-clamped to
+/// `1..=MAX_BROADCAST_SHARDS`) only takes effect when this call creates the
+/// namespace's `ShardSet`; an already-running namespace keeps the shard count
+/// it was created with until its watcher is GC'd.
+#[allow(clippy::too_many_arguments)]
 fn get_or_create_broadcast(
     namespace: String,
     kube_client: Client,
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
+    namespace_broadcasts: Arc<DashMap<String, ShardSet>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
     watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
     coalesce_window: Duration,
+    broadcast_shards: usize,
 ) -> (broadcast::Receiver<Arc<BroadcastFrame>>, ReplayBuffer) {
     // Fast path: namespace already has a running watcher.
-    if let Some(sender_ref) = namespace_broadcasts.get(&namespace) {
-        // Clone the sender out and drop the shard ref before calling
-        // .subscribe() so we don't hold a DashMap shard lock across the
-        // broadcast-receiver allocation (would serialise concurrent
-        // Subscribe RPCs that hash to the same shard).
-        let sender = sender_ref.clone();
-        drop(sender_ref);
+    if let Some(shards_ref) = namespace_broadcasts.get(&namespace) {
+        // Clone the (cheap, Arc-backed) ShardSet out and drop the shard ref
+        // before calling `.next_receiver()` so we don't hold a DashMap shard
+        // lock across the broadcast-receiver allocation (would serialise
+        // concurrent Subscribe RPCs that hash to the same DashMap shard).
+        let shards = shards_ref.clone();
+        drop(shards_ref);
         // Hot-path replay buffer lookup: prefer borrow-key `get()` over
         // `entry()` so we don't pay the per-call `namespace.clone()` when
         // the buffer already exists (the steady-state case under load).
@@ -206,7 +329,7 @@ fn get_or_create_broadcast(
                 .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
                 .clone()
         };
-        return (sender.subscribe(), buf);
+        return (shards.next_receiver(), buf);
     }
 
     // Slow path: first subscriber for this namespace — create broadcast + watcher.
@@ -223,11 +346,18 @@ fn get_or_create_broadcast(
                 .entry(namespace.clone())
                 .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
                 .clone();
-            (e.get().subscribe(), buf)
+            (e.get().next_receiver(), buf)
         }
         dashmap::mapref::entry::Entry::Vacant(e) => {
-            let (bcast_tx, bcast_rx) = broadcast::channel(BROADCAST_CAPACITY);
-            e.insert(bcast_tx.clone());
+            // Build N shard channels. This first subscriber attaches to shard 0
+            // (`receivers[0]`); the remaining receivers are dropped — they exist
+            // only to seed the senders, and future subscribers round-robin onto
+            // them via `next_receiver()`.
+            let (shard_set, mut receivers) = ShardSet::new(broadcast_shards);
+            // `ShardSet::new` always produces `>= 1` receiver.
+            let bcast_rx = receivers.swap_remove(0);
+            drop(receivers);
+            e.insert(shard_set.clone());
 
             let buf: ReplayBuffer = namespace_replay_buffers
                 .entry(namespace.clone())
@@ -239,7 +369,7 @@ fn get_or_create_broadcast(
             let handle = tokio::spawn(run_namespace_watcher(
                 namespace.clone(),
                 kube_client,
-                bcast_tx,
+                shard_set,
                 Arc::clone(&buf),
                 broadcasts_for_spawn,
                 replay_buffers_for_spawn,
@@ -258,9 +388,9 @@ fn get_or_create_broadcast(
 async fn run_namespace_watcher(
     namespace: String,
     kube_client: Client,
-    tx: broadcast::Sender<Arc<BroadcastFrame>>,
+    shards: ShardSet,
     replay_buf: ReplayBuffer,
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
+    namespace_broadcasts: Arc<DashMap<String, ShardSet>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
     coalesce_window: Duration,
 ) {
@@ -269,7 +399,8 @@ async fn run_namespace_watcher(
     let wc = kube_watcher::Config::default();
     let stream = kube_watch_stream(api, wc).boxed();
 
-    pump_subscribe_namespace_events(stream, &namespace, &tx, &replay_buf, coalesce_window).await;
+    pump_subscribe_namespace_events(stream, &namespace, &shards, &replay_buf, coalesce_window)
+        .await;
 
     // Watcher stream ended — remove from maps so next Subscribe recreates them.
     namespace_broadcasts.remove(&namespace);
@@ -313,10 +444,16 @@ async fn run_namespace_watcher(
 /// `push_replay` still runs once per event (RV-keyed) before the frame is
 /// emitted, and every accepted event is delivered (no drops — a partially
 /// filled buffer is flushed on window expiry and on stream end).
+///
+/// Sharding (CU-86aj3vpnh): the pump fans every accepted event to **all**
+/// shards in `shards` via [`ShardSet::send_to_all`], after the single shared
+/// `push_replay`. With `N == 1` shard this is exactly one `tx.send` per event —
+/// the historical path. Coalesce composes orthogonally: a coalesced batch is
+/// flushed to all shards.
 pub(crate) async fn pump_subscribe_namespace_events<S>(
     stream: S,
     namespace: &str,
-    tx: &broadcast::Sender<Arc<BroadcastFrame>>,
+    shards: &ShardSet,
     replay_buf: &ReplayBuffer,
     coalesce_window: Duration,
 ) where
@@ -330,12 +467,12 @@ pub(crate) async fn pump_subscribe_namespace_events<S>(
     let events_broadcast = EVENTS_BROADCAST.with_label_values(&[namespace]);
 
     if coalesce_window.is_zero() {
-        pump_immediate(stream, namespace, tx, replay_buf, &events_broadcast).await;
+        pump_immediate(stream, namespace, shards, replay_buf, &events_broadcast).await;
     } else {
         pump_coalesced(
             stream,
             namespace,
-            tx,
+            shards,
             replay_buf,
             coalesce_window,
             &events_broadcast,
@@ -384,7 +521,7 @@ fn classify_stream_item(
 async fn pump_immediate<S>(
     mut stream: S,
     namespace: &str,
-    tx: &broadcast::Sender<Arc<BroadcastFrame>>,
+    shards: &ShardSet,
     replay_buf: &ReplayBuffer,
     events_broadcast: &prometheus::Counter,
 ) where
@@ -397,16 +534,16 @@ async fn pump_immediate<S>(
         };
         if let Some(frame) = process_namespace_event(event, replay_buf) {
             // OTEL child span (Phase 7, CU-86ahzwj3k) per broadcast dispatch,
-            // carrying the live subscriber count. `level = "debug"` keeps it
-            // off the INFO production path; `tx.send` is synchronous so the
-            // entered guard never spans an await. `subscribers` is a cheap
-            // integer read.
+            // carrying the live subscriber count across all shards. `level =
+            // "debug"` keeps it off the INFO production path; `send_to_all` is
+            // synchronous so the entered guard never spans an await.
+            // `subscribers` is a cheap integer read.
             let span = tracing::debug_span!(
                 "konfig.broadcast_dispatch",
-                subscribers = tx.receiver_count(),
+                subscribers = shards.total_receiver_count(),
             );
             let _enter = span.enter();
-            if tx.send(frame).is_ok() {
+            if shards.send_to_all(frame) {
                 events_broadcast.inc();
             }
         }
@@ -422,7 +559,7 @@ async fn pump_immediate<S>(
 async fn pump_coalesced<S>(
     mut stream: S,
     namespace: &str,
-    tx: &broadcast::Sender<Arc<BroadcastFrame>>,
+    shards: &ShardSet,
     replay_buf: &ReplayBuffer,
     coalesce_window: Duration,
     events_broadcast: &prometheus::Counter,
@@ -444,7 +581,7 @@ async fn pump_coalesced<S>(
                     Ok(item) => item,
                     Err(_elapsed) => {
                         // Window expired with a partially filled batch — flush.
-                        flush_batch(&mut batch, tx, events_broadcast);
+                        flush_batch(&mut batch, shards, events_broadcast);
                         deadline = None;
                         continue;
                     }
@@ -456,7 +593,7 @@ async fn pump_coalesced<S>(
         let Some(event) = classify_stream_item(item, namespace) else {
             // Stream ended or errored — flush whatever was buffered before
             // exiting so no accepted event is dropped (100 % delivery).
-            flush_batch(&mut batch, tx, events_broadcast);
+            flush_batch(&mut batch, shards, events_broadcast);
             return;
         };
 
@@ -467,7 +604,7 @@ async fn pump_coalesced<S>(
             }
             batch.push(frame);
             if batch.len() >= COALESCE_MAX_BATCH {
-                flush_batch(&mut batch, tx, events_broadcast);
+                flush_batch(&mut batch, shards, events_broadcast);
                 deadline = None;
             }
         }
@@ -530,21 +667,22 @@ fn process_namespace_event(
 /// there are zero receivers, which is not a per-event failure to surface.
 fn flush_batch(
     batch: &mut Vec<Arc<BroadcastFrame>>,
-    tx: &broadcast::Sender<Arc<BroadcastFrame>>,
+    shards: &ShardSet,
     events_broadcast: &prometheus::Counter,
 ) {
     // OTEL child span (Phase 7, CU-86ahzwj3k) per coalesced flush burst,
-    // carrying the live subscriber count + burst size. `level = "debug"`
-    // keeps it off the INFO production path; `tx.send` is synchronous so the
-    // entered guard never spans an await. Both fields are cheap integer reads.
+    // carrying the live subscriber count across all shards + burst size.
+    // `level = "debug"` keeps it off the INFO production path; `send_to_all`
+    // is synchronous so the entered guard never spans an await. Both fields
+    // are cheap integer reads.
     let span = tracing::debug_span!(
         "konfig.broadcast_dispatch",
-        subscribers = tx.receiver_count(),
+        subscribers = shards.total_receiver_count(),
         events = batch.len(),
     );
     let _enter = span.enter();
     for frame in batch.drain(..) {
-        if tx.send(frame).is_ok() {
+        if shards.send_to_all(frame) {
             events_broadcast.inc();
         }
     }
@@ -566,7 +704,7 @@ const GC_GRACE: Duration = Duration::from_secs(30);
 /// feature (no `tokio::time::pause` / `advance` required).
 pub fn gc_tick(
     now: Instant,
-    namespace_broadcasts: &DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>,
+    namespace_broadcasts: &DashMap<String, ShardSet>,
     namespace_replay_buffers: &DashMap<String, ReplayBuffer>,
     watcher_handles: &DashMap<String, JoinHandle<()>>,
     idle_since: &DashMap<String, Instant>,
@@ -580,7 +718,9 @@ pub fn gc_tick(
     let to_gc: Vec<String> = namespace_broadcasts
         .iter()
         .filter_map(|entry| {
-            let count = entry.value().receiver_count();
+            // Sum across all shards — a namespace is idle only when EVERY shard
+            // has zero receivers (CU-86aj3vpnh).
+            let count = entry.value().total_receiver_count();
             if count == 0 {
                 // No active receivers — check how long the channel has been idle.
                 let ns = entry.key().clone();
@@ -614,7 +754,7 @@ pub fn gc_tick(
         // so no new subscriber can race in.  If it now sees a non-zero
         // count, the entry stays and we skip the rest of the teardown.
         let removed = namespace_broadcasts
-            .remove_if(&ns, |_k, v| v.receiver_count() == 0)
+            .remove_if(&ns, |_k, v| v.total_receiver_count() == 0)
             .is_some();
         if !removed {
             debug!(
@@ -646,7 +786,7 @@ pub fn gc_tick(
 /// - Never hold a DashMap entry ref (`.get()`, `.entry()`) across an `.await`.
 /// - The GC list is collected to a `Vec` inside `gc_tick` before any mutations.
 pub async fn gc_task(
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
+    namespace_broadcasts: Arc<DashMap<String, ShardSet>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
     watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
     idle_since: Arc<DashMap<String, Instant>>,
@@ -1378,17 +1518,16 @@ mod tests {
     /// feature of the `tokio` crate.
     #[tokio::test]
     async fn gc_removes_idle_namespace_after_grace_period() {
-        let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>> =
-            Arc::new(DashMap::new());
+        let namespace_broadcasts: Arc<DashMap<String, ShardSet>> = Arc::new(DashMap::new());
         let namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>> = Arc::new(DashMap::new());
         let watcher_handles: Arc<DashMap<String, JoinHandle<()>>> = Arc::new(DashMap::new());
         let idle_since: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 
-        // Insert a broadcast channel with NO active receivers (sender only).
+        // Insert a ShardSet with NO active receivers (sender only).
         let (tx, _rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
-        // Drop _rx so receiver_count() == 0.
+        // Drop _rx so total_receiver_count() == 0.
         drop(_rx);
-        namespace_broadcasts.insert("test-ns".to_string(), tx);
+        namespace_broadcasts.insert("test-ns".to_string(), ShardSet::from_senders(vec![tx]));
         namespace_replay_buffers
             .insert("test-ns".to_string(), Arc::new(Mutex::new(VecDeque::new())));
 
@@ -1434,15 +1573,14 @@ mod tests {
     /// even when called with a `now` far in the future.
     #[tokio::test]
     async fn gc_does_not_remove_namespace_with_active_subscriber() {
-        let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>> =
-            Arc::new(DashMap::new());
+        let namespace_broadcasts: Arc<DashMap<String, ShardSet>> = Arc::new(DashMap::new());
         let namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>> = Arc::new(DashMap::new());
         let watcher_handles: Arc<DashMap<String, JoinHandle<()>>> = Arc::new(DashMap::new());
         let idle_since: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 
-        // Insert a broadcast channel AND keep a live receiver so receiver_count() > 0.
+        // Insert a ShardSet AND keep a live receiver so total_receiver_count() > 0.
         let (tx, _live_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
-        namespace_broadcasts.insert("active-ns".to_string(), tx);
+        namespace_broadcasts.insert("active-ns".to_string(), ShardSet::from_senders(vec![tx]));
         namespace_replay_buffers.insert(
             "active-ns".to_string(),
             Arc::new(Mutex::new(VecDeque::new())),
@@ -1808,8 +1946,15 @@ mod tests {
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
             vec![Ok(Event::Apply(dyn_config("cfg", "ns", 1, "100")))];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
-            .await;
+        let shards = ShardSet::from_senders(vec![tx.clone()]);
+        pump_subscribe_namespace_events(
+            stream::iter(events),
+            "ns",
+            &shards,
+            &replay,
+            Duration::ZERO,
+        )
+        .await;
 
         let frame = rx.try_recv().expect("must broadcast Modified");
         assert_eq!(frame.event.event_type, EventType::Modified as i32);
@@ -1826,8 +1971,15 @@ mod tests {
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
             vec![Ok(Event::Init), Ok(Event::InitDone)];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
-            .await;
+        let shards = ShardSet::from_senders(vec![tx.clone()]);
+        pump_subscribe_namespace_events(
+            stream::iter(events),
+            "ns",
+            &shards,
+            &replay,
+            Duration::ZERO,
+        )
+        .await;
 
         assert!(
             rx.try_recv().is_err(),
@@ -1846,8 +1998,15 @@ mod tests {
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
             vec![Ok(Event::Delete(obj))];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
-            .await;
+        let shards = ShardSet::from_senders(vec![tx.clone()]);
+        pump_subscribe_namespace_events(
+            stream::iter(events),
+            "ns",
+            &shards,
+            &replay,
+            Duration::ZERO,
+        )
+        .await;
 
         let frame = rx.try_recv().expect("must broadcast Deleted");
         assert_eq!(frame.event.event_type, EventType::Deleted as i32);
@@ -1865,8 +2024,15 @@ mod tests {
             Ok(Event::Apply(dyn_config("cfg-z", "ns", 99, "99"))),
         ];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
-            .await;
+        let shards = ShardSet::from_senders(vec![tx.clone()]);
+        pump_subscribe_namespace_events(
+            stream::iter(events),
+            "ns",
+            &shards,
+            &replay,
+            Duration::ZERO,
+        )
+        .await;
 
         let first = rx.try_recv().expect("pre-error event landed");
         assert_eq!(first.event.event_type, EventType::Modified as i32);
@@ -1886,8 +2052,15 @@ mod tests {
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
             vec![Ok(Event::Apply(bad))];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
-            .await;
+        let shards = ShardSet::from_senders(vec![tx.clone()]);
+        pump_subscribe_namespace_events(
+            stream::iter(events),
+            "ns",
+            &shards,
+            &replay,
+            Duration::ZERO,
+        )
+        .await;
 
         assert!(
             rx.try_recv().is_err(),
@@ -1906,8 +2079,15 @@ mod tests {
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
             vec![Ok(Event::Apply(dyn_config("cfg", "ns", 1, "1")))];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
-            .await;
+        let shards = ShardSet::from_senders(vec![tx.clone()]);
+        pump_subscribe_namespace_events(
+            stream::iter(events),
+            "ns",
+            &shards,
+            &replay,
+            Duration::ZERO,
+        )
+        .await;
 
         // Replay buffer is populated even when there are no live subscribers
         // so a subscriber that arrives mid-event-burst can resume cleanly.
@@ -1933,10 +2113,11 @@ mod tests {
             Ok(Event::Apply(dyn_config("cfg", "ns", 3, "102"))),
         ];
 
+        let shards = ShardSet::from_senders(vec![tx.clone()]);
         pump_subscribe_namespace_events(
             stream::iter(events),
             "ns",
-            &tx,
+            &shards,
             &replay,
             Duration::from_millis(5),
         )
@@ -1992,8 +2173,9 @@ mod tests {
         let blocked = stream::iter(one).chain(stream::pending());
 
         let window = Duration::from_millis(5);
+        let shards = ShardSet::from_senders(vec![tx.clone()]);
         let pump = tokio::spawn(async move {
-            pump_subscribe_namespace_events(blocked, "ns", &tx, &replay, window).await;
+            pump_subscribe_namespace_events(blocked, "ns", &shards, &replay, window).await;
         });
 
         // Before the window elapses, nothing has been broadcast yet (the event
@@ -2037,10 +2219,11 @@ mod tests {
             })
             .collect();
 
+        let shards = ShardSet::from_senders(vec![tx.clone()]);
         pump_subscribe_namespace_events(
             stream::iter(events),
             "ns",
-            &tx,
+            &shards,
             &replay,
             Duration::from_secs(3600),
         )
@@ -2056,5 +2239,117 @@ mod tests {
         );
         let buf = crate::sync_util::lock_recovered(&replay);
         assert_eq!(buf.len(), total);
+    }
+
+    // ── Sharded broadcast (CU-86aj3vpnh) ──────────────────────────────────────
+
+    /// `ShardSet::new` clamps the floor to 1 and respects the requested count.
+    /// `N == 1` is the historical single-channel path: one shard, every
+    /// `next_receiver()` lands on shard 0, `send_to_all` is one send.
+    #[tokio::test]
+    async fn shardset_n1_is_single_channel_path() {
+        let (shards, mut receivers) = ShardSet::new(1);
+        assert_eq!(shards.len(), 1, "N=1 has exactly one shard");
+        assert_eq!(receivers.len(), 1, "one seed receiver");
+        let mut rx0 = receivers.swap_remove(0);
+
+        // Round-robin always returns shard 0 when there is a single shard.
+        let mut rx_extra = shards.next_receiver();
+        // Both receivers subscribe to the SAME (only) shard, so both see the event.
+        let delivered = shards.send_to_all(make_frame(make_event("1", 1)));
+        assert!(
+            delivered,
+            "single shard with live receivers accepts the send"
+        );
+        assert!(
+            rx0.try_recv().is_ok(),
+            "seed receiver on shard 0 gets event"
+        );
+        assert!(
+            rx_extra.try_recv().is_ok(),
+            "round-robin receiver also on shard 0 gets event"
+        );
+        assert_eq!(
+            shards.total_receiver_count(),
+            2,
+            "both receivers counted on the single shard"
+        );
+    }
+
+    /// `send_to_all` fans every event to ALL N shards: a subscriber attached to
+    /// each distinct shard receives the event (the fan-out invariant).
+    #[tokio::test]
+    async fn shardset_fans_event_to_every_shard() {
+        const N: usize = 4;
+        let (shards, receivers) = ShardSet::new(N);
+        assert_eq!(shards.len(), N);
+        // Keep one receiver per shard (the seed receivers — one per shard).
+        let mut receivers = receivers;
+
+        let delivered = shards.send_to_all(make_frame(make_event("7", 7)));
+        assert!(delivered, "at least one shard had a live receiver");
+
+        // Every shard's receiver must observe the single broadcast event.
+        for (i, rx) in receivers.iter_mut().enumerate() {
+            let frame = rx
+                .try_recv()
+                .unwrap_or_else(|e| panic!("shard {i} receiver must get the event: {e:?}"));
+            assert_eq!(
+                frame.event.config.as_ref().unwrap().resource_version,
+                "7",
+                "shard {i} received the right frame"
+            );
+        }
+        assert_eq!(
+            shards.total_receiver_count(),
+            N,
+            "one live receiver per shard"
+        );
+    }
+
+    /// Round-robin assignment spreads subscribers evenly: with N shards and
+    /// N*k `next_receiver()` calls, each shard ends up with exactly k receivers.
+    #[tokio::test]
+    async fn shardset_round_robin_spreads_subscribers() {
+        const N: usize = 4;
+        const PER_SHARD: usize = 5;
+        let (shards, seed_receivers) = ShardSet::new(N);
+        // Drop the seed receivers so each shard starts at zero, isolating the
+        // round-robin assignment count.
+        drop(seed_receivers);
+
+        // Attach N * PER_SHARD receivers via round-robin and hold them all live.
+        let mut held = Vec::new();
+        for _ in 0..(N * PER_SHARD) {
+            held.push(shards.next_receiver());
+        }
+
+        // Each shard must hold exactly PER_SHARD receivers — even spread.
+        for shard_idx in 0..N {
+            assert_eq!(
+                shards.sender(shard_idx).receiver_count(),
+                PER_SHARD,
+                "shard {shard_idx} must hold exactly {PER_SHARD} round-robin receivers"
+            );
+        }
+        assert_eq!(shards.total_receiver_count(), N * PER_SHARD);
+        // Hold receivers alive until the assertions complete.
+        drop(held);
+    }
+
+    /// `send_to_all` returns `false` when every shard has zero receivers
+    /// (so the `EVENTS_BROADCAST` counter is not bumped for a no-op fan-out),
+    /// but the event is still considered processed by the pump (replay push
+    /// happens earlier, independent of fan-out).
+    #[tokio::test]
+    async fn shardset_send_to_all_false_when_no_receivers() {
+        let (shards, receivers) = ShardSet::new(4);
+        drop(receivers); // no live receivers on any shard
+        let delivered = shards.send_to_all(make_frame(make_event("1", 1)));
+        assert!(
+            !delivered,
+            "send_to_all must report false when no shard has a receiver"
+        );
+        assert_eq!(shards.total_receiver_count(), 0);
     }
 }

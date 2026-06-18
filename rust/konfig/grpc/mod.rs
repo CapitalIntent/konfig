@@ -42,7 +42,9 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::cache::ConfigCache;
-use crate::grpc::subscribe::{BroadcastFrame, ReplayBuffer, gc_task};
+use crate::grpc::subscribe::{
+    MAX_BROADCAST_SHARDS, MIN_BROADCAST_SHARDS, ReplayBuffer, ShardSet, gc_task,
+};
 use crate::metrics::{LastEventAtMap, REPLAY_BUFFER_DEPTH, STALE_SECONDS};
 use crate::proto::{
     ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, Config, ConfigEvent,
@@ -114,6 +116,13 @@ pub struct ServerConfig {
     /// amplification at high churn at the cost of up to `window` ms of added
     /// tail latency.
     pub coalesce_window: Duration,
+    /// Per-namespace broadcast shard count (CU-86aj3vpnh, `--broadcast-shards`).
+    /// Clamped to `1..=16`. `1` (the default) is byte-for-byte the historical
+    /// single-channel path. `> 1` splits each namespace into N broadcast
+    /// channels: the watcher fans every event to all N, each Subscribe attaches
+    /// to one (round-robin), so an event wakes only ~1/N of subscribers. The
+    /// shared replay buffer is intentionally NOT sharded.
+    pub broadcast_shards: usize,
 }
 
 /// Type-erased shutdown future.  Boxed so the field doesn't push a generic
@@ -127,12 +136,14 @@ pub struct KonfigServer {
     pub(crate) cache: Arc<ConfigCache>,
     pub(crate) secret_cache: Arc<SecretCache>,
     pub(crate) kube_client: Client,
-    /// One broadcast sender per namespace — shared across all Config subscribers
-    /// for that namespace.  A single kube watcher drives the sender; each
-    /// subscriber gets a `Receiver` clone (O(1) fan-out).
-    /// Events are wrapped in `Arc` so broadcast clones are reference-count
-    /// increments only — serialisation happens once per apply, not per subscriber.
-    pub(crate) namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
+    /// One [`ShardSet`] per namespace — N broadcast senders shared across all
+    /// Config subscribers for that namespace (CU-86aj3vpnh). A single kube
+    /// watcher fans every event to all N shard senders; each subscriber's
+    /// `Receiver` is attached to ONE shard (round-robin), so an event wakes only
+    /// ~1/N of the namespace's subscribers. `N == 1` is the historical
+    /// single-channel path. Events are wrapped in `Arc` so broadcast clones are
+    /// reference-count increments only — serialisation happens once per apply.
+    pub(crate) namespace_broadcasts: Arc<DashMap<String, ShardSet>>,
     /// Per-namespace replay buffer for the `resume_resource_version` reconnect
     /// path.  Holds the last `REPLAY_BUFFER_SIZE` events so reconnecting clients
     /// can catch up without opening a new kube watch.
@@ -155,6 +166,11 @@ pub struct KonfigServer {
     /// `ServerConfig` to the per-namespace pump on each `subscribe` call.
     /// `Duration::ZERO` = coalescing disabled (default).
     pub(crate) coalesce_window: Duration,
+    /// Per-namespace broadcast shard count (CU-86aj3vpnh). Clamped to `1..=16`
+    /// in `serve`. Threaded to `get_or_create_broadcast` so it only takes
+    /// effect when a namespace's `ShardSet` is first created. `1` = historical
+    /// single-channel path.
+    pub(crate) broadcast_shards: usize,
 }
 
 impl KonfigServer {
@@ -420,6 +436,7 @@ impl KonfigService for KonfigServer {
                 Arc::clone(&self.watcher_handles),
                 self.drain_notify(),
                 self.coalesce_window,
+                self.broadcast_shards,
                 request.into_inner(),
             )
             .await,
@@ -554,7 +571,21 @@ fn apply_h2_overrides(
 pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
     info!(addr = %cfg.addr, "KonfigService gRPC server starting");
 
-    let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>> =
+    // Clamp the shard count once at startup so every namespace's ShardSet is
+    // created with a valid `1..=16` value (CU-86aj3vpnh). Out-of-range CLI
+    // input is clamped (not rejected) so a typo degrades gracefully.
+    let broadcast_shards = cfg
+        .broadcast_shards
+        .clamp(MIN_BROADCAST_SHARDS, MAX_BROADCAST_SHARDS);
+    if broadcast_shards != cfg.broadcast_shards {
+        warn!(
+            requested = cfg.broadcast_shards,
+            clamped = broadcast_shards,
+            "broadcast-shards out of range — clamped to 1..=16"
+        );
+    }
+
+    let namespace_broadcasts: Arc<DashMap<String, ShardSet>> =
         Arc::new(DashMap::with_capacity(NAMESPACE_MAP_INITIAL_CAPACITY));
     let namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>> =
         Arc::new(DashMap::with_capacity(NAMESPACE_MAP_INITIAL_CAPACITY));
@@ -645,6 +676,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         draining: Arc::clone(&draining),
         drain_notify: Arc::clone(&drain_notify),
         coalesce_window: cfg.coalesce_window,
+        broadcast_shards,
     };
     let svc = KonfigServiceServer::new(server);
 
@@ -1098,6 +1130,7 @@ mod tests {
             draining: Arc::new(AtomicBool::new(false)),
             drain_notify: Arc::new(Notify::new()),
             coalesce_window: Duration::ZERO,
+            broadcast_shards: 1,
         }
     }
 
