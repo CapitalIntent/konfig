@@ -67,10 +67,14 @@ impl SecretWatcher {
             // with backoff so a single failure does not silently kill secret
             // delivery for the namespace.
             tokio::spawn(async move {
+                // Mark every cached secret stale on each disconnect; a fresh
+                // event after reconnect clears it via `update`. Mirrors the
+                // Config watcher's `cache.mark_all_stale()` on stream error.
+                let cache_stale = Arc::clone(&cache);
                 run_with_reconnect(
                     "secret",
                     namespace.clone(),
-                    || {},
+                    move || cache_stale.mark_all_stale(),
                     |_attempt| {
                         run_namespace_watcher(
                             client.clone(),

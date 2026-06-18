@@ -137,6 +137,10 @@ pub struct SecretSnapshot {
     pub data: std::collections::HashMap<String, bytes::Bytes>,
     pub resource_version: String,
     pub loaded_at: std::time::Instant,
+    /// `Some(t)` once the secret watcher loses its K8s connection (set by
+    /// `SecretCache::mark_all_stale`); `None` while fresh.  Surfaced as
+    /// `SecretResponse.stale_since_ms`.  Mirrors `ConfigSnapshot::stale_since`.
+    pub stale_since: Option<Instant>,
     /// Memoised JSON encoding of `data` (`{"key": "<base64>"}`).  Shared
     /// across clones via `Arc<OnceLock<…>>` — see `ConfigSnapshot::
     /// content_json_cache` for the same pattern.  Populate via
@@ -153,6 +157,7 @@ impl Default for SecretSnapshot {
             data: std::collections::HashMap::new(),
             resource_version: String::new(),
             loaded_at: std::time::Instant::now(),
+            stale_since: None,
             data_json_cache: Arc::new(OnceLock::new()),
         }
     }
