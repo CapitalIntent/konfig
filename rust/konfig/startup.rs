@@ -116,6 +116,17 @@ pub struct Args {
     /// the default.
     #[arg(long, env = "KONFIG_H2_MAX_CONCURRENT_STREAMS")]
     pub h2_max_concurrent_streams: Option<u32>,
+
+    /// Broadcast fan-out coalesce window in milliseconds (CU-86aj3vpgr).
+    /// `0` (default) disables coalescing — every config apply is broadcast
+    /// to subscribers immediately, byte-for-byte the historical behaviour.
+    /// `> 0` buffers events arriving within the window in each namespace's
+    /// watch pump and dispatches them as a burst, cutting per-subscriber
+    /// wake amplification at high churn at the cost of up to this many
+    /// milliseconds of added tail latency on event delivery. Konfig's
+    /// eventual-consistency contract tolerates the delay; start with 5.
+    #[arg(long, env = "KONFIG_COALESCE_WINDOW_MS", default_value = "0")]
+    pub coalesce_window_ms: u64,
 }
 
 /// Resolve a `ServerTlsConfig` from the TLS-related fields on `args`, or
@@ -296,6 +307,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         tls_config,
         h2_initial_window_bytes: args.h2_initial_window_bytes,
         h2_max_concurrent_streams: args.h2_max_concurrent_streams,
+        coalesce_window: std::time::Duration::from_millis(args.coalesce_window_ms),
     })
     .await?;
 
@@ -423,6 +435,7 @@ mod tests {
             tls_client_ca: None,
             h2_initial_window_bytes: None,
             h2_max_concurrent_streams: None,
+            coalesce_window_ms: 0,
         }
     }
 
