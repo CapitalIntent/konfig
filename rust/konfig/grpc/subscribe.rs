@@ -395,10 +395,20 @@ async fn pump_immediate<S>(
         let Some(event) = classify_stream_item(stream.try_next().await, namespace) else {
             return;
         };
-        if let Some(frame) = process_namespace_event(event, replay_buf)
-            && tx.send(frame).is_ok()
-        {
-            events_broadcast.inc();
+        if let Some(frame) = process_namespace_event(event, replay_buf) {
+            // OTEL child span (Phase 7, CU-86ahzwj3k) per broadcast dispatch,
+            // carrying the live subscriber count. `level = "debug"` keeps it
+            // off the INFO production path; `tx.send` is synchronous so the
+            // entered guard never spans an await. `subscribers` is a cheap
+            // integer read.
+            let span = tracing::debug_span!(
+                "konfig.broadcast_dispatch",
+                subscribers = tx.receiver_count(),
+            );
+            let _enter = span.enter();
+            if tx.send(frame).is_ok() {
+                events_broadcast.inc();
+            }
         }
     }
 }
@@ -523,6 +533,16 @@ fn flush_batch(
     tx: &broadcast::Sender<Arc<BroadcastFrame>>,
     events_broadcast: &prometheus::Counter,
 ) {
+    // OTEL child span (Phase 7, CU-86ahzwj3k) per coalesced flush burst,
+    // carrying the live subscriber count + burst size. `level = "debug"`
+    // keeps it off the INFO production path; `tx.send` is synchronous so the
+    // entered guard never spans an await. Both fields are cheap integer reads.
+    let span = tracing::debug_span!(
+        "konfig.broadcast_dispatch",
+        subscribers = tx.receiver_count(),
+        events = batch.len(),
+    );
+    let _enter = span.enter();
     for frame in batch.drain(..) {
         if tx.send(frame).is_ok() {
             events_broadcast.inc();

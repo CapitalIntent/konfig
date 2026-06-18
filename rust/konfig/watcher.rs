@@ -210,9 +210,26 @@ where
     }
 }
 
+/// OTEL child span (Phase 7, CU-86ahzwj3k) per Config watch event, nested
+/// under the broader trace so a Jaeger view shows the Apply→cache propagation.
+/// `level = "debug"` keeps it off the INFO production path; `skip_all` keeps
+/// the (large) `DynamicObject` out of the span. `event_type` / `resource_version`
+/// are recorded as borrowed `&str` — no per-event heap alloc on the hot loop.
+#[tracing::instrument(
+    level = "debug",
+    name = "konfig.watch_event",
+    skip_all,
+    fields(event_type, resource_version)
+)]
 pub(crate) fn handle_event(event: Event<DynamicObject>, cache: &Arc<ConfigCache>) {
+    let span = tracing::Span::current();
     match event {
         Event::Apply(obj) | Event::InitApply(obj) => {
+            span.record("event_type", "Apply");
+            span.record(
+                "resource_version",
+                obj.metadata.resource_version.as_deref().unwrap_or(""),
+            );
             let name = obj.metadata.name.as_deref().unwrap_or("<unknown>");
             if let Some(snap) = parse_config_object(&obj) {
                 info!(name = %name, schema_version = snap.schema_version, "Config applied — cache updated");
@@ -222,11 +239,22 @@ pub(crate) fn handle_event(event: Event<DynamicObject>, cache: &Arc<ConfigCache>
             }
         }
         Event::Delete(obj) => {
+            span.record("event_type", "Delete");
+            span.record(
+                "resource_version",
+                obj.metadata.resource_version.as_deref().unwrap_or(""),
+            );
             let name = obj.metadata.name.as_deref().unwrap_or("<unknown>");
             warn!(name = %name, "Config deleted — cache retains last-known-good");
         }
-        Event::Init => debug!("Watch stream: initial list phase"),
-        Event::InitDone => debug!("Watch stream: initial list complete"),
+        Event::Init => {
+            span.record("event_type", "Init");
+            debug!("Watch stream: initial list phase");
+        }
+        Event::InitDone => {
+            span.record("event_type", "InitDone");
+            debug!("Watch stream: initial list complete");
+        }
     }
 }
 
