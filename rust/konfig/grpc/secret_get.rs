@@ -63,6 +63,12 @@ pub fn secret_snapshot_to_proto(snap: &SecretSnapshot) -> SecretResponse {
         data_json: snap.data_json().to_owned(),
         resource_version: snap.resource_version.clone(),
         age_ms: snap.loaded_at.elapsed().as_millis() as i64,
+        // -1 sentinel when fresh; elapsed ms since the watcher disconnected
+        // otherwise. Mirrors `grpc::snapshot_to_proto` for Config.
+        stale_since_ms: snap
+            .stale_since
+            .map(|t| t.elapsed().as_millis() as i64)
+            .unwrap_or(-1),
     }
 }
 
@@ -148,5 +154,34 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn secret_snapshot_to_proto_stale_since_sentinel_minus_one_when_fresh() {
+        let snap = SecretSnapshot {
+            stale_since: None,
+            ..Default::default()
+        };
+        let proto = secret_snapshot_to_proto(&snap);
+        assert_eq!(
+            proto.stale_since_ms, -1,
+            "fresh (None) `stale_since` must emit the -1 sentinel"
+        );
+    }
+
+    #[test]
+    fn secret_snapshot_to_proto_stale_since_non_negative_when_stale() {
+        // stale_since set in the past → elapsed ms is positive at conversion.
+        let stale_anchor = std::time::Instant::now() - std::time::Duration::from_millis(10);
+        let snap = SecretSnapshot {
+            stale_since: Some(stale_anchor),
+            ..Default::default()
+        };
+        let proto = secret_snapshot_to_proto(&snap);
+        assert!(
+            proto.stale_since_ms >= 0,
+            "stale_since_ms must be non-negative when stale_since is Some, got {}",
+            proto.stale_since_ms
+        );
     }
 }

@@ -77,6 +77,25 @@ impl SecretCache {
         }
         out
     }
+
+    /// Mark all cached snapshots as stale (secret watcher lost K8s connection).
+    ///
+    /// Called from the watcher's `on_disconnect` hook.  Each snapshot gets
+    /// `stale_since = Some(now)`.  The next `update(snap)` for a fresh event
+    /// inserts a snapshot with `stale_since = None`.  Mirrors
+    /// [`ConfigCache::mark_all_stale`](crate::cache::ConfigCache::mark_all_stale).
+    pub fn mark_all_stale(&self) {
+        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
+        let current = self.inner.load();
+        let mut next = (**current).clone();
+        let now = std::time::Instant::now();
+        for v in next.values_mut() {
+            let mut snap = (**v).clone();
+            snap.stale_since = Some(now);
+            *v = Arc::new(snap);
+        }
+        self.inner.store(Arc::new(next));
+    }
 }
 
 impl Default for SecretCache {
@@ -136,5 +155,31 @@ mod tests {
         cache.update(make_secret("ns", "sec", 1));
         cache.update(make_secret("ns", "sec", 5));
         assert_eq!(cache.get("ns", "sec").unwrap().schema_version, 5);
+    }
+
+    #[test]
+    fn mark_all_stale_sets_stale_since_on_all_entries() {
+        let cache = SecretCache::new();
+        cache.update(make_secret("ns", "sec-a", 1));
+        cache.update(make_secret("ns", "sec-b", 2));
+
+        assert!(cache.get("ns", "sec-a").unwrap().stale_since.is_none());
+        assert!(cache.get("ns", "sec-b").unwrap().stale_since.is_none());
+
+        cache.mark_all_stale();
+
+        assert!(cache.get("ns", "sec-a").unwrap().stale_since.is_some());
+        assert!(cache.get("ns", "sec-b").unwrap().stale_since.is_some());
+    }
+
+    #[test]
+    fn update_after_stale_clears_stale_since() {
+        let cache = SecretCache::new();
+        cache.update(make_secret("ns", "sec", 1));
+        cache.mark_all_stale();
+        assert!(cache.get("ns", "sec").unwrap().stale_since.is_some());
+        // A fresh event re-inserts with stale_since = None (Default).
+        cache.update(make_secret("ns", "sec", 2));
+        assert!(cache.get("ns", "sec").unwrap().stale_since.is_none());
     }
 }

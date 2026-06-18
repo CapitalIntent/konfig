@@ -85,6 +85,9 @@ message SecretResponse {
   string data_json = 4;
   string resource_version = 5;
   int64 age_ms = 6;
+  // Milliseconds since the watcher lost its K8s connection (cache serving
+  // stale). -1 when fresh. Mirrors Config.stale_since_ms.
+  int64 stale_since_ms = 7;
 }
 
 message GetAllSecretsRequest {
