@@ -10,6 +10,7 @@
 //! - [`secret_watcher`] — watcher for Secrets (konfig.io/managed=true)
 //! - [`grpc`] — gRPC server (Protobuf, standard tonic codec)
 //! - [`import`] — CLI helper: onboard existing ConfigMaps as Config CRDs
+//! - [`telemetry`] — optional OTLP/gRPC trace export (tracing-opentelemetry bridge)
 
 pub mod cache;
 pub mod cache_key;
@@ -23,6 +24,7 @@ pub mod startup;
 #[cfg(feature = "snmalloc_profiling")]
 pub mod stream_sink;
 pub mod sync_util;
+pub mod telemetry;
 pub mod types;
 pub mod value_parse;
 pub mod watcher;

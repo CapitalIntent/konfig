@@ -190,29 +190,73 @@ fn check_drain(draining: &AtomicBool) -> Result<(), Status> {
     }
 }
 
+/// Record the gRPC outcome of an RPC handler on the current tracing span as a
+/// `status_code` field, then return the result unchanged.
+///
+/// The `#[tracing::instrument]` attribute on each RPC method declares
+/// `status_code = tracing::field::Empty`; this helper fills it in once the
+/// handler resolves so the OTLP exporter (and any local subscriber) carries
+/// the canonical gRPC status — `"Ok"` on success, the tonic `Code` debug name
+/// (`"NotFound"`, `"Unavailable"`, …) on error. Pure pass-through: the
+/// `Result` is moved straight back out.
+fn record_status<T>(result: Result<T, Status>) -> Result<T, Status> {
+    let code = match &result {
+        Ok(_) => "Ok".to_string(),
+        Err(status) => format!("{:?}", status.code()),
+    };
+    tracing::Span::current().record("status_code", code.as_str());
+    result
+}
+
 #[tonic::async_trait]
 impl KonfigService for KonfigServer {
+    // ── OTEL root spans ─────────────────────────────────────────────────────
+    //
+    // Each RPC method carries a `#[tracing::instrument]` root span named after
+    // the RPC. `namespace`/`name` are recorded from the request up front;
+    // `status_code` starts `Empty` and is filled by `record_status` once the
+    // handler resolves. `skip_all` keeps the (possibly large) request body and
+    // `&self` out of the span — only the explicitly-listed fields are emitted.
+    // When the `tracing-opentelemetry` layer is active (OTLP endpoint set),
+    // these become OTLP spans; otherwise they are ordinary `tracing` spans on
+    // the fmt subscriber. Child spans on watcher/cache/broadcast are a
+    // follow-up (Phase 7, CU-86ahzwj3k).
+    #[tracing::instrument(
+        name = "konfig.Get",
+        skip_all,
+        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, status_code = tracing::field::Empty),
+    )]
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<Config>, Status> {
         check_drain(&self.draining)?;
-        get::handle_get(Arc::clone(&self.cache), request.into_inner()).await
+        record_status(get::handle_get(Arc::clone(&self.cache), request.into_inner()).await)
     }
 
     type GetAllStream = ReceiverStream<Result<Config, Status>>;
 
+    #[tracing::instrument(
+        name = "konfig.GetAll",
+        skip_all,
+        fields(namespace = %request.get_ref().namespace, status_code = tracing::field::Empty),
+    )]
     async fn get_all(
         &self,
         request: Request<GetAllRequest>,
     ) -> Result<Response<Self::GetAllStream>, Status> {
         check_drain(&self.draining)?;
-        get::handle_get_all(Arc::clone(&self.cache), request.into_inner()).await
+        record_status(get::handle_get_all(Arc::clone(&self.cache), request.into_inner()).await)
     }
 
+    #[tracing::instrument(
+        name = "konfig.Apply",
+        skip_all,
+        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, status_code = tracing::field::Empty),
+    )]
     async fn apply(
         &self,
         request: Request<ApplyRequest>,
     ) -> Result<Response<ApplyResponse>, Status> {
         check_drain(&self.draining)?;
-        apply::handle_apply(self.kube_client.clone(), request.into_inner()).await
+        record_status(apply::handle_apply(self.kube_client.clone(), request.into_inner()).await)
     }
 
     async fn revert(
@@ -224,67 +268,106 @@ impl KonfigService for KonfigServer {
 
     type SubscribeStream = ReceiverStream<Result<ConfigEvent, Status>>;
 
+    #[tracing::instrument(
+        name = "konfig.Subscribe",
+        skip_all,
+        fields(namespace = %request.get_ref().namespace, status_code = tracing::field::Empty),
+    )]
     async fn subscribe(
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         check_drain(&self.draining)?;
-        subscribe::handle_subscribe(
-            Arc::clone(&self.cache),
-            self.kube_client.clone(),
-            Arc::clone(&self.namespace_broadcasts),
-            Arc::clone(&self.namespace_replay_buffers),
-            Arc::clone(&self.watcher_handles),
-            self.drain_notify(),
-            request.into_inner(),
+        record_status(
+            subscribe::handle_subscribe(
+                Arc::clone(&self.cache),
+                self.kube_client.clone(),
+                Arc::clone(&self.namespace_broadcasts),
+                Arc::clone(&self.namespace_replay_buffers),
+                Arc::clone(&self.watcher_handles),
+                self.drain_notify(),
+                request.into_inner(),
+            )
+            .await,
         )
-        .await
     }
 
     // ── Secret RPCs ───────────────────────────────────────────────────────────
 
+    #[tracing::instrument(
+        name = "konfig.GetSecret",
+        skip_all,
+        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, status_code = tracing::field::Empty),
+    )]
     async fn get_secret(
         &self,
         request: Request<GetSecretRequest>,
     ) -> Result<Response<SecretResponse>, Status> {
         check_drain(&self.draining)?;
-        secret_get::handle_get_secret(Arc::clone(&self.secret_cache), request.into_inner()).await
+        record_status(
+            secret_get::handle_get_secret(Arc::clone(&self.secret_cache), request.into_inner())
+                .await,
+        )
     }
 
     type GetAllSecretsStream = ReceiverStream<Result<SecretResponse, Status>>;
 
+    #[tracing::instrument(
+        name = "konfig.GetAllSecrets",
+        skip_all,
+        fields(namespace = %request.get_ref().namespace, status_code = tracing::field::Empty),
+    )]
     async fn get_all_secrets(
         &self,
         request: Request<GetAllSecretsRequest>,
     ) -> Result<Response<Self::GetAllSecretsStream>, Status> {
         check_drain(&self.draining)?;
-        secret_get::handle_get_all_secrets(Arc::clone(&self.secret_cache), request.into_inner())
-            .await
+        record_status(
+            secret_get::handle_get_all_secrets(
+                Arc::clone(&self.secret_cache),
+                request.into_inner(),
+            )
+            .await,
+        )
     }
 
+    #[tracing::instrument(
+        name = "konfig.ApplySecret",
+        skip_all,
+        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, status_code = tracing::field::Empty),
+    )]
     async fn apply_secret(
         &self,
         request: Request<ApplySecretRequest>,
     ) -> Result<Response<ApplySecretResponse>, Status> {
         check_drain(&self.draining)?;
-        secret_apply::handle_apply_secret(self.kube_client.clone(), request.into_inner()).await
+        record_status(
+            secret_apply::handle_apply_secret(self.kube_client.clone(), request.into_inner()).await,
+        )
     }
 
     type SubscribeSecretsStream = ReceiverStream<Result<SecretEvent, Status>>;
 
+    #[tracing::instrument(
+        name = "konfig.SubscribeSecrets",
+        skip_all,
+        fields(namespace = %request.get_ref().namespace, status_code = tracing::field::Empty),
+    )]
     async fn subscribe_secrets(
         &self,
         request: Request<SubscribeSecretsRequest>,
     ) -> Result<Response<Self::SubscribeSecretsStream>, Status> {
         check_drain(&self.draining)?;
-        subscribe_secrets::handle_subscribe_secrets(
-            self.kube_client.clone(),
-            Arc::clone(&self.secret_cache),
-            Arc::clone(&self.secret_namespace_broadcasts),
-            self.drain_notify(),
-            request.into_inner(),
+        record_status(
+            subscribe_secrets::handle_subscribe_secrets(
+                self.kube_client.clone(),
+                Arc::clone(&self.secret_cache),
+                Arc::clone(&self.secret_namespace_broadcasts),
+                self.drain_notify(),
+                request.into_inner(),
+            )
+            .await,
         )
-        .await
     }
 }
 

@@ -28,13 +28,15 @@ use std::sync::OnceLock;
 
 use clap::Parser;
 use konfig::startup::{Args, run};
+use konfig::telemetry;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 #[cfg(feature = "profiling")]
 use pyroscope::PyroscopeAgent;
 #[cfg(feature = "profiling")]
 use pyroscope_pprofrs::{PprofConfig, pprof_backend};
-#[cfg(any(feature = "profiling", feature = "tokio_console"))]
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::prelude::*;
 
 // Holds the `tracing_appender::non_blocking` worker guard for the lifetime
 // of the process. Dropping the guard flushes any pending log lines and
@@ -44,7 +46,11 @@ static TRACING_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing()?;
+    // OTLP tracer provider — `Some` only when `OTEL_EXPORTER_OTLP_ENDPOINT`
+    // is set. Kept alive for the whole process so buffered spans flush; we
+    // explicitly `shutdown()` it after `run` returns to drain the batch
+    // exporter before exit.
+    let tracer_provider = init_tracing()?;
 
     let args = Args::parse();
 
@@ -69,13 +75,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
-    run(args).await
+    let result = run(args).await;
+
+    // Flush + stop the OTLP batch exporter so spans buffered at shutdown are
+    // not lost. No-op when tracing export was disabled (provider is `None`).
+    if let Some(provider) = tracer_provider {
+        if let Err(e) = provider.shutdown() {
+            tracing::warn!("OTLP tracer provider shutdown failed: {e}");
+        }
+    }
+
+    result
 }
 
-/// Install the tracing subscriber. Uses `console-subscriber` when the
-/// `tokio_console` feature is compiled in AND `RUST_CONSOLE=1` at runtime;
-/// otherwise installs the plain `tracing_subscriber::fmt` layer with the
-/// `konfig=info` filter.
+/// Install the tracing subscriber and, when enabled, the OTLP trace exporter.
+///
+/// Layer stack (built on `tracing_subscriber::Registry`):
+///   1. env-filter (`konfig=info` default, overridable via `RUST_LOG`)
+///   2. fmt layer → non-blocking stdout writer (always present)
+///   3. `tracing-opentelemetry` OTLP layer — **only** when
+///      `OTEL_EXPORTER_OTLP_ENDPOINT` is set (see [`telemetry`]). The OTLP
+///      layer is added *on top of* the fmt layer, never replacing it: with no
+///      collector configured konfig logs exactly as before.
+///
+/// Returns the [`SdkTracerProvider`] (`Some` iff the OTLP layer was installed)
+/// so `main` can `shutdown()` it on exit to flush buffered spans.
 ///
 /// The fmt layer writes through `tracing_appender::non_blocking`, which
 /// offloads the actual `StdoutRaw::write_all` syscalls onto a dedicated
@@ -85,7 +109,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// writer eliminates that hot path entirely. The returned `WorkerGuard`
 /// is stashed in [`TRACING_GUARD`] so it lives for the process lifetime
 /// — dropping the guard would shut the worker down and stall logs.
-fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `tokio-console` (when the `tokio_console` feature is compiled in AND
+/// `RUST_CONSOLE=1` at runtime) takes the whole subscriber over via
+/// `console_subscriber::init()` and short-circuits before the registry is
+/// built — OTLP export is not composed with the console subscriber.
+fn init_tracing() -> Result<Option<SdkTracerProvider>, Box<dyn std::error::Error>> {
     #[cfg(feature = "tokio_console")]
     let console_enabled = matches!(std::env::var("RUST_CONSOLE").as_deref(), Ok("1"));
     #[cfg(not(feature = "tokio_console"))]
@@ -97,7 +126,7 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
             console_subscriber::init();
             info!("tokio-console subscriber installed (RUST_CONSOLE=1)");
         }
-        return Ok(());
+        return Ok(None);
     }
 
     let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
@@ -105,11 +134,24 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
         return Err("init_tracing called more than once: TRACING_GUARD already populated".into());
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("konfig=info".parse()?),
-        )
-        .with_writer(writer)
+    let env_filter =
+        tracing_subscriber::EnvFilter::from_default_env().add_directive("konfig=info".parse()?);
+    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(writer);
+
+    // Build the OTLP provider up front so the layer (which borrows a tracer
+    // from it) and the returned provider (for shutdown) share one instance.
+    let tracer_provider = telemetry::build_tracer_provider()?;
+    let otel_layer = tracer_provider.as_ref().map(telemetry::otel_layer);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .with(otel_layer)
         .init();
-    Ok(())
+
+    if tracer_provider.is_some() {
+        info!("OTLP trace export enabled (OTEL_EXPORTER_OTLP_ENDPOINT set)");
+    }
+
+    Ok(tracer_provider)
 }

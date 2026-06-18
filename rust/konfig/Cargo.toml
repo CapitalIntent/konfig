@@ -85,6 +85,22 @@ tonic = {workspace = true}
 tonic-health = "0.14.6"
 tracing = {workspace = true}
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}
+# OpenTelemetry distributed tracing (Phase 7, CU-86ahzwj17). The
+# `tracing-opentelemetry` bridge exports the gRPC RPC root spans to an
+# OTLP/gRPC collector. Versions are the 0.32/0.33 family that pins
+# `tonic ^0.14.1` + `prost ^0.14` transitively — the SAME majors the konfig
+# crate already uses (tonic 0.14.6 / prost 0.14.3) — so the OTLP exporter
+# reuses the existing tonic/prost build, no duplicate gRPC stack in the tree.
+# Export is opt-in by `OTEL_EXPORTER_OTLP_ENDPOINT`; with no collector the
+# layer is a no-op (see `telemetry.rs`). NEVER opentelemetry-prometheus
+# (deprecated/slow) — bridge only.
+opentelemetry = "0.32"
+opentelemetry_sdk = {version = "0.32", default-features = false, features = ["trace"]}
+# default-features OFF drops the `reqwest-blocking-client` + `http-proto`
+# exporters (default-on) so only the OTLP/gRPC (tonic) path is compiled —
+# reuses the konfig crate's existing tonic/prost rather than pulling reqwest.
+opentelemetry-otlp = {version = "0.32", default-features = false, features = ["grpc-tonic", "trace"]}
+tracing-opentelemetry = "0.33"
 # Non-blocking stdout writer for the tracing subscriber — moves the
 # `LineWriterShim<StdoutRaw>::write_all` work off the runtime threads onto a
 # dedicated background worker, eliminating a 30 ms / 1.6% self-CPU hot path
