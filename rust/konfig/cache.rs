@@ -61,12 +61,24 @@ impl ConfigCache {
     /// Zero locking — atomic pointer load only.  Lookup is allocation-free:
     /// the `BorrowedKey` view passes `(&str, &str)` straight to the
     /// `HashMap` via the `Borrow<dyn KeyRef>` impl on [`OwnedKey`].
+    ///
+    /// OTEL child span (Phase 7, CU-86ahzwj3k): `level = "debug"` + `skip_all`
+    /// so the lock-free read path pays nothing at the production INFO level
+    /// (the span is never constructed unless a debug-level subscriber is
+    /// active). Records `hit` (bool) only — no per-op heap alloc.
+    #[tracing::instrument(level = "debug", name = "konfig.cache_get", skip_all, fields(hit))]
     pub fn get(&self, namespace: &str, name: &str) -> Option<Arc<ConfigSnapshot>> {
         let q = BorrowedKey::new(namespace, name);
-        self.inner.load().get(&q as &dyn KeyRef).map(Arc::clone)
+        let found = self.inner.load().get(&q as &dyn KeyRef).map(Arc::clone);
+        tracing::Span::current().record("hit", found.is_some());
+        found
     }
 
     /// Insert or replace the entry for `snap.namespace` / `snap.name`.
+    ///
+    /// OTEL child span (Phase 7, CU-86ahzwj3k): `level = "debug"` + `skip_all`
+    /// keeps the snapshot out of the span and off the INFO production path.
+    #[tracing::instrument(level = "debug", name = "konfig.cache_update", skip_all)]
     pub fn update(&self, snap: ConfigSnapshot) {
         let _guard = crate::sync_util::lock_recovered(&self.write_lock);
         let current = self.inner.load();

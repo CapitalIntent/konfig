@@ -110,14 +110,31 @@ async fn run_namespace_watcher(
 /// Apply one Secret watcher event to the cache + broadcast channel.
 /// Extracted so [`pump_secret_events`] stays a thin event loop and the
 /// per-event behaviour is unit-testable.
+///
+/// OTEL child span (Phase 7, CU-86ahzwj3k) per Secret watch event, mirroring
+/// the Config watcher. `level = "debug"` keeps it off the INFO production path;
+/// `skip_all` keeps the `Secret` payload out of the span. `event_type` /
+/// `resource_version` are recorded as borrowed `&str` — no per-event heap alloc.
+#[tracing::instrument(
+    level = "debug",
+    name = "konfig.secret_watch_event",
+    skip_all,
+    fields(event_type, resource_version)
+)]
 pub(crate) fn handle_secret_event(
     event: Event<Secret>,
     cache: &Arc<SecretCache>,
     namespace: &str,
     broadcast_tx: &broadcast::Sender<SecretEvent>,
 ) {
+    let span = tracing::Span::current();
     match event {
         Event::Apply(secret) | Event::InitApply(secret) => {
+            span.record("event_type", "Apply");
+            span.record(
+                "resource_version",
+                secret.metadata.resource_version.as_deref().unwrap_or(""),
+            );
             if let Some(snap) = parse_secret(&secret, namespace) {
                 // debug! not info!: this fires per secret event in the
                 // watcher hot loop. Operators can flip RUST_LOG=konfig=debug
@@ -137,6 +154,11 @@ pub(crate) fn handle_secret_event(
             }
         }
         Event::Delete(secret) => {
+            span.record("event_type", "Delete");
+            span.record(
+                "resource_version",
+                secret.metadata.resource_version.as_deref().unwrap_or(""),
+            );
             let name = secret.metadata.name.as_deref().unwrap_or("<unknown>");
             // Intentionally not removing from cache on delete — CP behavior:
             // serve stale secret rather than returning NotFound during a
@@ -150,7 +172,10 @@ pub(crate) fn handle_secret_event(
                 let _ = broadcast_tx.send(secret_event);
             }
         }
-        Event::Init | Event::InitDone => debug!("Secret watch stream: init"),
+        Event::Init | Event::InitDone => {
+            span.record("event_type", "Init");
+            debug!("Secret watch stream: init");
+        }
     }
 }
 

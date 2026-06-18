@@ -14,7 +14,7 @@ use kube::api::{Api, Patch, PatchParams};
 use kube::core::DynamicObject;
 use serde_json::json;
 use tonic::{Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::grpc::jittered_retry_ms;
 use crate::metrics::{APPLY_DURATION, APPLY_TOTAL};
@@ -189,7 +189,13 @@ where
 {
     let mut attempt = 0usize;
     loop {
-        match do_patch().await {
+        // OTEL child span (Phase 7, CU-86ahzwj3k) per patch attempt, nested
+        // under the `konfig.Apply` root span so a Jaeger trace shows each 409
+        // retry. `level = "debug"` keeps it off the INFO production path; the
+        // `attempt` field is a cheap integer (zero-indexed — `attempt + 1` is
+        // the human-facing count used in the warn! below).
+        let attempt_span = tracing::debug_span!("konfig.apply_attempt", attempt);
+        match do_patch().instrument(attempt_span).await {
             Ok(rv) => return Ok(rv),
             Err(e) => match classify_patch_error(&e, attempt) {
                 PatchRetryDecision::RetryAfter { delay_ms } => {
