@@ -1,0 +1,123 @@
+# konfig SLO alerting rules.
+#
+# Phase 7 observability (CU-86ahrwd61). Plain PrometheusRule CRD — NO Helm
+# templating per ADR-0001 (docs/adr/0001-deployment-raw-yaml.md). Apply with
+# `kubectl apply -f infra/konfig/prometheus-rules.yaml` (NOT wired into
+# kustomization.yaml because it requires the prometheus-operator CRD, which is
+# not a konfig dependency).
+#
+# Every expression here mirrors an SLI in docs/slo.md and references only
+# metrics actually exported by rust/konfig/metrics.rs. The `release: prometheus`
+# label is the conventional prometheus-operator `ruleSelector` match — adjust to
+# your operator's selector if different.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: konfig-slo
+  namespace: konfig-system
+  labels:
+    app: konfig
+    role: alert-rules
+    release: prometheus
+spec:
+  groups:
+    - name: konfig.slo.availability
+      rules:
+        # SLI 1: Apply availability 99.9% / 30d. Fast 1h burn-rate alert —
+        # error fraction over the last hour exceeding the 0.1% budget.
+        - alert: KonfigApplyErrorBudgetBurnFast
+          expr: |
+            sum(rate(konfig_apply_total{result="error"}[1h]))
+            /
+            sum(rate(konfig_apply_total[1h]))
+            > 0.001
+          for: 5m
+          labels:
+            severity: page
+            slo: apply_availability
+          annotations:
+            summary: konfig Apply error budget burning fast
+            description: >
+              Apply error fraction over 1h is above the 0.1% / 30d budget
+              ({{ $value | humanizePercentage }}). SLI: konfig_apply_total.
+              See docs/slo.md and docs/runbook.md (Latency investigation).
+
+        # Slower 6h burn confirms sustained budget erosion (lower severity).
+        - alert: KonfigApplyErrorBudgetBurnSlow
+          expr: |
+            sum(rate(konfig_apply_total{result="error"}[6h]))
+            /
+            sum(rate(konfig_apply_total[6h]))
+            > 0.001
+          for: 30m
+          labels:
+            severity: warning
+            slo: apply_availability
+          annotations:
+            summary: konfig Apply error budget eroding
+            description: >
+              Apply error fraction over 6h is above the 0.1% budget
+              ({{ $value | humanizePercentage }}). SLI: konfig_apply_total.
+
+    - name: konfig.slo.latency
+      rules:
+        # SLI 2: Subscribe e2e latency p99 <= 50ms (in-process fan-out).
+        - alert: KonfigSubscribeLatencyP99High
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le) (rate(konfig_subscribe_e2e_latency_seconds_bucket[5m]))
+            )
+            > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            slo: subscribe_latency
+          annotations:
+            summary: konfig Subscribe fan-out p99 latency above 50ms
+            description: >
+              Subscribe broadcast→mpsc-enqueue p99 over 5m is
+              {{ $value | humanizeDuration }} (> 50ms). SLI:
+              konfig_subscribe_e2e_latency_seconds. Drill into
+              konfig.broadcast_dispatch spans on the Tempo dashboard.
+
+        # SLI 3: Apply latency p99 <= 1s on the ok path.
+        - alert: KonfigApplyLatencyP99High
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le) (rate(konfig_apply_duration_seconds_bucket{result="ok"}[5m]))
+            )
+            > 1
+          for: 10m
+          labels:
+            severity: warning
+            slo: apply_latency
+          annotations:
+            summary: konfig Apply p99 latency above 1s
+            description: >
+              Apply (result=ok) p99 over 5m is {{ $value | humanizeDuration }}
+              (> 1s). SLI: konfig_apply_duration_seconds. Inspect
+              konfig.apply_attempt spans for 409 retry storms.
+
+    - name: konfig.slo.freshness
+      rules:
+        # SLI 4: Watcher freshness — alert any namespace stale > 300s.
+        - alert: KonfigWatcherStale
+          expr: max by (namespace) (konfig_stale_seconds) > 300
+          for: 1m
+          labels:
+            severity: page
+            slo: watcher_freshness
+          annotations:
+            summary: konfig watcher stale for namespace {{ $labels.namespace }}
+            description: >
+              No K8s watch event received for {{ $value | humanizeDuration }}
+              in namespace {{ $labels.namespace }} (> 300s threshold). The
+              watcher may be disconnected from the API server. SLI:
+              konfig_stale_seconds. See docs/runbook.md (Partition recovery).
+
+    # SLI 5 (cache hit ratio) is intentionally absent: no konfig_cache_hits_total
+    # / konfig_cache_lookups_total metric exists yet (only the `hit` attribute on
+    # the konfig.cache_get OTEL span). See docs/slo.md — pending metric. Do NOT
+    # add an alert here until those counters ship in metrics.rs.

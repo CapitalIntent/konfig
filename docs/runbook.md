@@ -87,6 +87,40 @@ dial9 serve --local-dir /tmp/dial9-traces --port 9191
 
 Enable tracing first (see [Configuration](configuration.md#telemetry)).
 
+## Latency investigation
+
+When an Apply or Subscribe latency SLI breaches (see [SLOs](slo.md)), use the
+span-level breakdown instead of guessing from metrics alone.
+
+1. **Confirm which SLI burned.** Check the alert label `slo` and the
+   corresponding PromQL in [`docs/slo.md`](slo.md) / the firing
+   `PrometheusRule` (`infra/konfig/prometheus-rules.yaml`):
+   - `apply_latency` → `konfig_apply_duration_seconds` p99 > 1s
+   - `subscribe_latency` → `konfig_subscribe_e2e_latency_seconds` p99 > 50ms
+   - `apply_availability` → `konfig_apply_total{result="error"}` budget burn
+
+2. **Open the Tempo trace dashboard** —
+   `infra/profiling/grafana-dashboards/konfig-traces.json` (provisioning:
+   `infra/profiling/grafana-dashboards/README.md`). Panels map directly to the
+   span path:
+   - *Apply RPC duration p50/p95/p99* — `konfig.Apply` root span.
+   - *Subscribe fan-out latency* — `konfig.broadcast_dispatch` leaf under
+     `konfig.Subscribe`.
+   - *409 retry counts* — `konfig.apply_attempt` spans with `attempt > 0`
+     (a spike = resourceVersion contention; cross-check Apply latency).
+   - *Watcher reconnect timeline* — `konfig.watch_event` rate (a drop to zero
+     corroborates a `konfig_stale_seconds` freshness alert).
+   - *Top-N slowest Subscribe streams* — click a row to open the full trace and
+     inspect `konfig.cache_get` (`hit` attribute) / `konfig.broadcast_dispatch`
+     children.
+
+3. **Enable tracing if no spans appear.** Spans only export when
+   `OTEL_EXPORTER_OTLP_ENDPOINT` is set and `OTEL_SDK_DISABLED` is not `true`
+   (see [Configuration](configuration.md#telemetry)). The child spans
+   (`konfig.cache_get`, `konfig.watch_event`, `konfig.apply_attempt`,
+   `konfig.broadcast_dispatch`) are `debug`-level — set the sampler / log level
+   accordingly to capture them.
+
 ## TLS / cert rotation
 
 mTLS is enforced by default. Certs are issued by cert-manager from
