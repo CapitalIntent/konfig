@@ -36,6 +36,7 @@ use pyroscope::PyroscopeAgent;
 use pyroscope_pprofrs::{PprofConfig, pprof_backend};
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::prelude::*;
 
 // Holds the `tracing_appender::non_blocking` worker guard for the lifetime
@@ -129,14 +130,28 @@ fn init_tracing() -> Result<Option<SdkTracerProvider>, Box<dyn std::error::Error
         return Ok(None);
     }
 
-    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
-    if TRACING_GUARD.set(guard).is_err() {
-        return Err("init_tracing called more than once: TRACING_GUARD already populated".into());
-    }
+    // CI/debug escape hatch: `KONFIG_LOG_SYNC=1` swaps the non-blocking writer
+    // for a synchronous one so every line hits stdout immediately and survives
+    // a hard kill — a SIGKILL (e.g. liveness probe) leaves the non-blocking
+    // worker's buffer unflushed, so `kubectl logs` comes back empty and the
+    // crash is undiagnosable. Prod leaves this unset and keeps the non-blocking
+    // writer (the CU-86aj360ae hot-path win). See CU-86aj4guza.
+    let sync_logs = matches!(std::env::var("KONFIG_LOG_SYNC").as_deref(), Ok("1"));
+    let make_writer: BoxMakeWriter = if sync_logs {
+        BoxMakeWriter::new(std::io::stdout)
+    } else {
+        let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+        if TRACING_GUARD.set(guard).is_err() {
+            return Err(
+                "init_tracing called more than once: TRACING_GUARD already populated".into(),
+            );
+        }
+        BoxMakeWriter::new(writer)
+    };
 
     let env_filter =
         tracing_subscriber::EnvFilter::from_default_env().add_directive("konfig=info".parse()?);
-    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(writer);
+    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(make_writer);
 
     // Build the OTLP provider up front so the layer (which borrows a tracer
     // from it) and the returned provider (for shutdown) share one instance.
