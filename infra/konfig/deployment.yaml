@@ -124,6 +124,43 @@ spec:
                 configMapKeyRef:
                   name: konfig-config
                   key: name
+            # ----------------------------------------------------------------
+            # Observability — structured logging + OTEL tracing
+            # (Phase 7: CU-86ahrwd64 logging, CU-86aj08u7k OTEL runtime config).
+            #
+            # Defaults are PROD-SAFE: OTEL export is OFF and the sampler is
+            # pinned to 1% so flipping the kill-switch never floods a
+            # collector. To ENABLE distributed tracing, ops:
+            #   1. set OTEL_SDK_DISABLED=false
+            #   2. set OTEL_EXPORTER_OTLP_ENDPOINT to the collector
+            #      (e.g. http://otel-collector.observability:4317)
+            # Both must change together — with the SDK disabled the endpoint
+            # is ignored (telemetry.rs `build_tracer_provider` short-circuits).
+            # ----------------------------------------------------------------
+            # Kill-switch: "true" disables the OTEL SDK even if an endpoint is
+            # set. Disabled by default — no exporter, no background batch task.
+            - name: OTEL_SDK_DISABLED
+              value: "true"
+            # Collector endpoint. Empty = export off (redundant with the
+            # kill-switch above; both gate it). Set to the OTLP/gRPC collector
+            # when enabling.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: ""
+            # Head sampler: parent-based ratio so a sampled parent trace keeps
+            # its children, but new root traces sample at the ratio below.
+            - name: OTEL_TRACES_SAMPLER
+              value: "parentbased_traceidratio"
+            # 1% — prod-safe default; raise in lower environments for debugging.
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: "0.01"
+            # service.name reported to the collector.
+            - name: OTEL_SERVICE_NAME
+              value: "konfig"
+            # Structured logging: "json" emits one machine-parseable object per
+            # log line for aggregation (CU-86ahrwd64). Use "pretty"/unset for
+            # human-readable local dev.
+            - name: RUST_LOG_FORMAT
+              value: "json"
           ports:
             - name: grpc
               containerPort: 50051

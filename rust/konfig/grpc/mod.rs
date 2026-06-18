@@ -30,7 +30,7 @@ pub mod tls;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -220,25 +220,117 @@ fn record_status<T>(result: Result<T, Status>) -> Result<T, Status> {
     result
 }
 
+/// Monotonic counter for the locally-generated request-id suffix. Combined
+/// with [`PROCESS_START_NANOS`] this yields a process-unique id without
+/// pulling in a `uuid` dep (CU-86ahrwd64): collisions would require two RPCs
+/// to share the same wrapping `u64` sequence number *and* the same process
+/// start instant, which cannot happen within one process lifetime.
+static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Process start time in nanos since the UNIX epoch — the high bits of a
+/// generated request id, so ids never collide across pod restarts (a fresh
+/// process re-zeroes [`REQUEST_SEQ`] but starts at a new instant). Computed
+/// once on first use.
+fn process_start_nanos() -> u128 {
+    use std::sync::OnceLock;
+    static PROCESS_START_NANOS: OnceLock<u128> = OnceLock::new();
+    *PROCESS_START_NANOS.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    })
+}
+
+/// Resolve the request id for an inbound RPC: echo the caller's
+/// `x-request-id` metadata header when present (so a client-supplied id
+/// flows through to logs + traces for end-to-end correlation), otherwise
+/// mint a lightweight process-local id. No `uuid` dep — see [`REQUEST_SEQ`].
+fn request_id<T>(request: &Request<T>) -> String {
+    if let Some(val) = request.metadata().get("x-request-id")
+        && let Ok(s) = val.to_str()
+        && !s.trim().is_empty()
+    {
+        return s.trim().to_string();
+    }
+    let seq = REQUEST_SEQ.fetch_add(1, Ordering::Relaxed);
+    // `{start_nanos:x}-{seq:x}` — compact, sortable-ish, grep-friendly.
+    format!("{:x}-{:x}", process_start_nanos(), seq)
+}
+
+/// Best-effort remote peer address for an inbound RPC, rendered for logs.
+/// `unknown` when tonic could not surface a peer addr (e.g. UDS / in-process
+/// test transport).
+fn client_addr<T>(request: &Request<T>) -> String {
+    request
+        .remote_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Emit the single entry-level `info!` for an inbound RPC and stamp the
+/// matching `client_addr` / `request_id` onto the current root span so the
+/// log line and the trace carry the same correlation ids (CU-86ahrwd64).
+///
+/// `name` is `Some` only for the keyed RPCs (`Get`/`Apply`/`GetSecret`/…);
+/// stream-of-namespace RPCs (`GetAll`/`Subscribe`/…) pass `None` and the
+/// `name` field is omitted from the log line. The `namespace`/`name` span
+/// fields are already populated by the `#[instrument]` macro — only
+/// `client_addr`/`request_id` (declared `Empty`) are recorded here.
+fn log_rpc_entry<T>(rpc: &str, request: &Request<T>, namespace: Option<&str>, name: Option<&str>) {
+    let addr = client_addr(request);
+    let id = request_id(request);
+    let span = tracing::Span::current();
+    span.record("client_addr", addr.as_str());
+    span.record("request_id", id.as_str());
+    match name {
+        Some(name) => info!(
+            rpc,
+            namespace = namespace.unwrap_or(""),
+            name,
+            client_addr = %addr,
+            request_id = %id,
+            "rpc start"
+        ),
+        None => info!(
+            rpc,
+            namespace = namespace.unwrap_or(""),
+            client_addr = %addr,
+            request_id = %id,
+            "rpc start"
+        ),
+    }
+}
+
 #[tonic::async_trait]
 impl KonfigService for KonfigServer {
-    // ── OTEL root spans ─────────────────────────────────────────────────────
+    // ── OTEL root spans + entry logging ─────────────────────────────────────
     //
     // Each RPC method carries a `#[tracing::instrument]` root span named after
     // the RPC. `namespace`/`name` are recorded from the request up front;
     // `status_code` starts `Empty` and is filled by `record_status` once the
-    // handler resolves. `skip_all` keeps the (possibly large) request body and
-    // `&self` out of the span — only the explicitly-listed fields are emitted.
-    // When the `tracing-opentelemetry` layer is active (OTLP endpoint set),
-    // these become OTLP spans; otherwise they are ordinary `tracing` spans on
-    // the fmt subscriber. Child spans on watcher/cache/broadcast are a
-    // follow-up (Phase 7, CU-86ahzwj3k).
+    // handler resolves. `client_addr`/`request_id` also start `Empty` and are
+    // filled by `log_rpc_entry`, which records them on the span (so traces
+    // correlate) AND emits exactly one entry-level `info!` per RPC carrying
+    // `rpc`, `namespace`, `name` (where applicable), `client_addr`,
+    // `request_id` (CU-86ahrwd64 structured logging). `skip_all` keeps the
+    // (possibly large) request body and `&self` out of the span — only the
+    // explicitly-listed fields are emitted. When the `tracing-opentelemetry`
+    // layer is active (OTLP endpoint set), these become OTLP spans; otherwise
+    // they are ordinary `tracing` spans on the fmt subscriber. Child spans on
+    // watcher/cache/broadcast are a follow-up (Phase 7, CU-86ahzwj3k).
     #[tracing::instrument(
         name = "konfig.Get",
         skip_all,
-        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, status_code = tracing::field::Empty),
+        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, client_addr = tracing::field::Empty, request_id = tracing::field::Empty, status_code = tracing::field::Empty),
     )]
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<Config>, Status> {
+        log_rpc_entry(
+            "konfig.Get",
+            &request,
+            Some(&request.get_ref().namespace),
+            Some(&request.get_ref().name),
+        );
         check_drain(&self.draining)?;
         record_status(get::handle_get(Arc::clone(&self.cache), request.into_inner()).await)
     }
@@ -248,12 +340,18 @@ impl KonfigService for KonfigServer {
     #[tracing::instrument(
         name = "konfig.GetAll",
         skip_all,
-        fields(namespace = %request.get_ref().namespace, status_code = tracing::field::Empty),
+        fields(namespace = %request.get_ref().namespace, client_addr = tracing::field::Empty, request_id = tracing::field::Empty, status_code = tracing::field::Empty),
     )]
     async fn get_all(
         &self,
         request: Request<GetAllRequest>,
     ) -> Result<Response<Self::GetAllStream>, Status> {
+        log_rpc_entry(
+            "konfig.GetAll",
+            &request,
+            Some(&request.get_ref().namespace),
+            None,
+        );
         check_drain(&self.draining)?;
         record_status(get::handle_get_all(Arc::clone(&self.cache), request.into_inner()).await)
     }
@@ -261,21 +359,38 @@ impl KonfigService for KonfigServer {
     #[tracing::instrument(
         name = "konfig.Apply",
         skip_all,
-        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, status_code = tracing::field::Empty),
+        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, client_addr = tracing::field::Empty, request_id = tracing::field::Empty, status_code = tracing::field::Empty),
     )]
     async fn apply(
         &self,
         request: Request<ApplyRequest>,
     ) -> Result<Response<ApplyResponse>, Status> {
+        log_rpc_entry(
+            "konfig.Apply",
+            &request,
+            Some(&request.get_ref().namespace),
+            Some(&request.get_ref().name),
+        );
         check_drain(&self.draining)?;
         record_status(apply::handle_apply(self.kube_client.clone(), request.into_inner()).await)
     }
 
+    #[tracing::instrument(
+        name = "konfig.Revert",
+        skip_all,
+        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, client_addr = tracing::field::Empty, request_id = tracing::field::Empty, status_code = tracing::field::Empty),
+    )]
     async fn revert(
         &self,
         request: Request<RevertRequest>,
     ) -> Result<Response<RevertResponse>, Status> {
-        revert::handle_revert(self.kube_client.clone(), request.into_inner()).await
+        log_rpc_entry(
+            "konfig.Revert",
+            &request,
+            Some(&request.get_ref().namespace),
+            Some(&request.get_ref().name),
+        );
+        record_status(revert::handle_revert(self.kube_client.clone(), request.into_inner()).await)
     }
 
     type SubscribeStream = ReceiverStream<Result<ConfigEvent, Status>>;
@@ -283,12 +398,18 @@ impl KonfigService for KonfigServer {
     #[tracing::instrument(
         name = "konfig.Subscribe",
         skip_all,
-        fields(namespace = %request.get_ref().namespace, status_code = tracing::field::Empty),
+        fields(namespace = %request.get_ref().namespace, client_addr = tracing::field::Empty, request_id = tracing::field::Empty, status_code = tracing::field::Empty),
     )]
     async fn subscribe(
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        log_rpc_entry(
+            "konfig.Subscribe",
+            &request,
+            Some(&request.get_ref().namespace),
+            None,
+        );
         check_drain(&self.draining)?;
         record_status(
             subscribe::handle_subscribe(
@@ -310,12 +431,18 @@ impl KonfigService for KonfigServer {
     #[tracing::instrument(
         name = "konfig.GetSecret",
         skip_all,
-        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, status_code = tracing::field::Empty),
+        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, client_addr = tracing::field::Empty, request_id = tracing::field::Empty, status_code = tracing::field::Empty),
     )]
     async fn get_secret(
         &self,
         request: Request<GetSecretRequest>,
     ) -> Result<Response<SecretResponse>, Status> {
+        log_rpc_entry(
+            "konfig.GetSecret",
+            &request,
+            Some(&request.get_ref().namespace),
+            Some(&request.get_ref().name),
+        );
         check_drain(&self.draining)?;
         record_status(
             secret_get::handle_get_secret(Arc::clone(&self.secret_cache), request.into_inner())
@@ -328,12 +455,18 @@ impl KonfigService for KonfigServer {
     #[tracing::instrument(
         name = "konfig.GetAllSecrets",
         skip_all,
-        fields(namespace = %request.get_ref().namespace, status_code = tracing::field::Empty),
+        fields(namespace = %request.get_ref().namespace, client_addr = tracing::field::Empty, request_id = tracing::field::Empty, status_code = tracing::field::Empty),
     )]
     async fn get_all_secrets(
         &self,
         request: Request<GetAllSecretsRequest>,
     ) -> Result<Response<Self::GetAllSecretsStream>, Status> {
+        log_rpc_entry(
+            "konfig.GetAllSecrets",
+            &request,
+            Some(&request.get_ref().namespace),
+            None,
+        );
         check_drain(&self.draining)?;
         record_status(
             secret_get::handle_get_all_secrets(
@@ -347,12 +480,18 @@ impl KonfigService for KonfigServer {
     #[tracing::instrument(
         name = "konfig.ApplySecret",
         skip_all,
-        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, status_code = tracing::field::Empty),
+        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, client_addr = tracing::field::Empty, request_id = tracing::field::Empty, status_code = tracing::field::Empty),
     )]
     async fn apply_secret(
         &self,
         request: Request<ApplySecretRequest>,
     ) -> Result<Response<ApplySecretResponse>, Status> {
+        log_rpc_entry(
+            "konfig.ApplySecret",
+            &request,
+            Some(&request.get_ref().namespace),
+            Some(&request.get_ref().name),
+        );
         check_drain(&self.draining)?;
         record_status(
             secret_apply::handle_apply_secret(self.kube_client.clone(), request.into_inner()).await,
@@ -364,12 +503,18 @@ impl KonfigService for KonfigServer {
     #[tracing::instrument(
         name = "konfig.SubscribeSecrets",
         skip_all,
-        fields(namespace = %request.get_ref().namespace, status_code = tracing::field::Empty),
+        fields(namespace = %request.get_ref().namespace, client_addr = tracing::field::Empty, request_id = tracing::field::Empty, status_code = tracing::field::Empty),
     )]
     async fn subscribe_secrets(
         &self,
         request: Request<SubscribeSecretsRequest>,
     ) -> Result<Response<Self::SubscribeSecretsStream>, Status> {
+        log_rpc_entry(
+            "konfig.SubscribeSecrets",
+            &request,
+            Some(&request.get_ref().namespace),
+            None,
+        );
         check_drain(&self.draining)?;
         record_status(
             subscribe_secrets::handle_subscribe_secrets(
@@ -879,6 +1024,66 @@ mod tests {
             .await
             .expect_err("must reject new subscribers during drain");
         assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    // ── request_id / client_addr helpers (CU-86ahrwd64) ───────────────────────
+
+    /// A caller-supplied `x-request-id` metadata header must be echoed back
+    /// verbatim so a client-generated correlation id flows through logs +
+    /// traces unchanged.
+    #[test]
+    fn request_id_echoes_client_supplied_header() {
+        let mut req = Request::new(GetRequest {
+            namespace: "default".into(),
+            name: "x".into(),
+        });
+        req.metadata_mut()
+            .insert("x-request-id", "abc-123".parse().expect("valid metadata"));
+        assert_eq!(request_id(&req), "abc-123");
+    }
+
+    /// A blank `x-request-id` is treated as absent — a generated id is minted
+    /// rather than echoing an empty string.
+    #[test]
+    fn request_id_generates_when_header_blank() {
+        let mut req = Request::new(GetRequest {
+            namespace: "default".into(),
+            name: "x".into(),
+        });
+        req.metadata_mut()
+            .insert("x-request-id", "   ".parse().expect("valid metadata"));
+        let id = request_id(&req);
+        assert_ne!(id.trim(), "", "blank header must yield a generated id");
+        assert!(
+            id.contains('-'),
+            "generated id is `<nanos>-<seq>`; got {id}"
+        );
+    }
+
+    /// With no metadata at all, a fresh process-local id is generated; two
+    /// successive generated ids must differ (the atomic sequence advances).
+    #[test]
+    fn request_id_generates_unique_ids_without_header() {
+        let req = || {
+            Request::new(GetRequest {
+                namespace: "default".into(),
+                name: "x".into(),
+            })
+        };
+        let a = request_id(&req());
+        let b = request_id(&req());
+        assert_ne!(a, b, "generated ids must be unique across calls");
+    }
+
+    /// `client_addr` falls back to `unknown` for the in-process test
+    /// transport (no peer socket).
+    #[test]
+    fn client_addr_unknown_without_peer() {
+        let req = Request::new(GetRequest {
+            namespace: "default".into(),
+            name: "x".into(),
+        });
+        assert_eq!(client_addr(&req), "unknown");
     }
 
     fn test_server() -> KonfigServer {

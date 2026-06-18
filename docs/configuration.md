@@ -84,26 +84,59 @@ At 100 concurrent subscribers and 10 Apply/min, measured usage is ~30m CPU / 40M
 Loadtest deployment scales the CPU limit to `1000m` (see commit `7cb3157`);
 production overlays should keep the conservative defaults.
 
-## Telemetry
+## Observability — structured logging + OTEL tracing
 
-Set via env block in your overlay's Deployment patch:
+Phase 7. Configured by the env block on the konfig container in
+`infra/konfig/deployment.yaml` (override in a Kustomize overlay patch). All
+defaults are **prod-safe**: tracing export is OFF and the sampler is pinned
+to 1% so enabling it never floods a collector.
+
+### Logging (CU-86ahrwd64)
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `RUST_LOG_FORMAT` | `pretty` (deployment ships `json`) | `json` emits one machine-parseable object per log line for aggregation; any other value (`pretty`/unset) keeps the human-readable format for local dev. |
+| `RUST_LOG` | `konfig=info` | Standard `tracing-subscriber` env-filter directive. |
+| `KONFIG_LOG_SYNC` | unset | `1` swaps the non-blocking stdout writer for a synchronous one so lines survive a `SIGKILL` (debug/CI escape hatch). Prod leaves unset for the non-blocking hot-path win. |
+
+Every gRPC RPC emits exactly one entry-level `info!` carrying `rpc`,
+`namespace`, `name` (keyed RPCs), `client_addr`, and `request_id`. The
+`request_id` echoes a caller-supplied `x-request-id` metadata header when
+present, otherwise a lightweight process-local id is minted (no `uuid` dep).
+The same `request_id` / `client_addr` are stamped on the trace span so logs
+and traces correlate.
+
+### OTEL tracing (CU-86aj08u7k)
+
+| Env | Default (deployment) | Description |
+|-----|----------------------|-------------|
+| `OTEL_SDK_DISABLED` | `true` | Kill-switch. `true` skips the exporter entirely **even when an endpoint is set**. Flip to `false` to enable. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `""` | OTLP/gRPC collector endpoint (e.g. `http://otel-collector.observability:4317`). Empty/unset = export off. |
+| `OTEL_TRACES_SAMPLER` | `parentbased_traceidratio` | Head sampler. Also: `always_on`/`always_off`, `traceidratio`, `parentbased_always_on`/`parentbased_always_off`. |
+| `OTEL_TRACES_SAMPLER_ARG` | `0.01` | Ratio for the `*traceidratio` samplers — 1% prod-safe default. |
+| `OTEL_SERVICE_NAME` | `konfig` | `service.name` resource attribute reported to the collector. |
+
+**To enable distributed tracing**, an operator flips two values together
+(both must change — with the SDK disabled the endpoint is ignored):
 
 ```yaml
+# overlay/kustomization.yaml — Deployment patch
 env:
-  - name: DIAL9_ENABLED
-    value: "true"
-  - name: DIAL9_TRACE_DIR
-    value: /tmp/dial9-traces
-  - name: DIAL9_MAX_DISK_USAGE_MB
-    value: "512"
-  - name: DIAL9_ROTATION_SECS
-    value: "60"
-  - name: TOKIO_CONSOLE_ENABLED
-    value: "true"          # development only; exposes port 4242
+  - name: OTEL_SDK_DISABLED
+    value: "false"
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: "http://otel-collector.observability:4317"
 ```
 
-Mount a PVC at `traceDir` for trace persistence across restarts.
-Connect `tokio-console` to `:4242` for live task inspection.
+Export uses the `tracing-opentelemetry` bridge over OTLP/gRPC (never
+`opentelemetry-prometheus`). With no endpoint the OTEL layer is a no-op and
+konfig logs exactly as before.
+
+### tokio-console (dev only)
+
+Build the `konfig-tokio-console` image variant (`--features tokio_console`)
+and set `RUST_CONSOLE=1` to install the `console-subscriber` gRPC server on
+port 6669 for `tokio-console` clients. Not a production image variant.
 
 ## ArgoCD
 

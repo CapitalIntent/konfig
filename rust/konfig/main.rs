@@ -93,7 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Layer stack (built on `tracing_subscriber::Registry`):
 ///   1. env-filter (`konfig=info` default, overridable via `RUST_LOG`)
-///   2. fmt layer → non-blocking stdout writer (always present)
+///   2. fmt layer → non-blocking stdout writer (always present). Encoder is
+///      JSON when `RUST_LOG_FORMAT=json` (machine-parseable, for log
+///      aggregation), human-readable otherwise (default / `pretty` / unset).
 ///   3. `tracing-opentelemetry` OTLP layer — **only** when
 ///      `OTEL_EXPORTER_OTLP_ENDPOINT` is set (see [`telemetry`]). The OTLP
 ///      layer is added *on top of* the fmt layer, never replacing it: with no
@@ -151,7 +153,28 @@ fn init_tracing() -> Result<Option<SdkTracerProvider>, Box<dyn std::error::Error
 
     let env_filter =
         tracing_subscriber::EnvFilter::from_default_env().add_directive("konfig=info".parse()?);
-    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(make_writer);
+
+    // `RUST_LOG_FORMAT=json` selects the machine-parseable JSON encoder
+    // (one object per event, fields as keys) for log aggregation; anything
+    // else (default, `pretty`, unset) keeps the human-readable format used in
+    // local dev + `kubectl logs`. The two encoders are distinct concrete
+    // `Layer` types, so `.boxed()` erases them to a single `Box<dyn Layer>`
+    // — without that the `if`/`else` arms would not unify. Both arms share the
+    // same `make_writer` (sync vs non-blocking, gated by `KONFIG_LOG_SYNC`)
+    // and compose identically with the optional OTEL layer below.
+    let json_logs = telemetry::log_format_is_json(
+        std::env::var(telemetry::RUST_LOG_FORMAT_ENV).ok().as_deref(),
+    );
+    let fmt_layer = if json_logs {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(make_writer)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .with_writer(make_writer)
+            .boxed()
+    };
 
     // Build the OTLP provider up front so the layer (which borrows a tracer
     // from it) and the returned provider (for shutdown) share one instance.

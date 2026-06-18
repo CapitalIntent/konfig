@@ -84,7 +84,9 @@ tokio-stream = "0.1"
 tonic = {workspace = true}
 tonic-health = "0.14.6"
 tracing = {workspace = true}
-tracing-subscriber = {version = "0.3", features = ["env-filter"]}
+# `json` feature: `RUST_LOG_FORMAT=json` selects the JSON event encoder for
+# log aggregation (CU-86ahrwd64); the default human format keeps `env-filter`.
+tracing-subscriber = {version = "0.3", features = ["env-filter", "json"]}
 # OpenTelemetry distributed tracing (Phase 7, CU-86ahzwj17). The
 # `tracing-opentelemetry` bridge exports the gRPC RPC root spans to an
 # OTLP/gRPC collector. Versions are the 0.32/0.33 family that pins
