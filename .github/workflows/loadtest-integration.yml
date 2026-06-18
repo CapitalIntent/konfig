@@ -44,6 +44,19 @@ jobs:
           build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
           EOF
 
+      - name: CPU capability probe (CU-86aj4guza — confirm CMPXCHG16B/cx16)
+        # snmalloc compiles with `-mcx16` (CMPXCHG16B). A runner/kind-node CPU
+        # model without it makes the konfig binary SIGILL (exit 132) at
+        # allocator init, before any log — the recurring loadtest flake.
+        # Print the host CPU model + cx16 flag so a failing run proves whether
+        # the instruction is actually absent. `|| true` so a missing flag (the
+        # very thing we're testing for) never fails this probe step.
+        run: |
+          echo "=== host CPU ==="
+          grep -m1 'model name' /proc/cpuinfo || true
+          if grep -qm1 cx16 /proc/cpuinfo; then echo "host: cx16 PRESENT"; else echo "host: cx16 MISSING"; fi
+          echo "flags: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(cx16|lm|avx|avx2|avx512f|sse4_2|popcnt)$' | tr '\n' ' ')"
+
       - name: Build konfig + konfig-loadtest OCI images (linux/amd64)
         # `:load_amd64` builds the amd64 image natively on this runner.
         # The macro also exposes `:load_arm64` for Apple Silicon dev hosts.
