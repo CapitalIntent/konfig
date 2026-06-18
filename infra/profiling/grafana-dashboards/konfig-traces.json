@@ -1,0 +1,251 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_TEMPO",
+      "label": "Tempo",
+      "description": "Tempo datasource holding konfig OTLP spans (service.name=konfig).",
+      "type": "datasource",
+      "pluginId": "tempo",
+      "pluginName": "Tempo"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "datasource",
+      "id": "tempo",
+      "name": "Tempo",
+      "version": "1.0.0"
+    },
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.0.0"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "konfig distributed-trace analysis (Phase 7, CU-86aj08ud0). Sourced from Tempo spans exported by the tracing-opentelemetry bridge (service.name=konfig). Span names: konfig.Apply / konfig.Subscribe (roots), konfig.apply_attempt / konfig.broadcast_dispatch / konfig.watch_event / konfig.cache_get (children). See docs/slo.md and docs/runbook.md (Latency investigation).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    {
+      "title": "konfig SLOs",
+      "type": "link",
+      "icon": "doc",
+      "url": "https://github.com/CapitalIntent/konfig/blob/main/docs/slo.md",
+      "targetBlank": true,
+      "tags": []
+    },
+    {
+      "title": "Runbook — Latency investigation",
+      "type": "link",
+      "icon": "doc",
+      "url": "https://github.com/CapitalIntent/konfig/blob/main/docs/runbook.md",
+      "targetBlank": true,
+      "tags": []
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Apply RPC duration — p50 / p95 / p99 (from spans)",
+      "description": "Quantiles of the konfig.Apply root-span duration. Computed by Tempo TraceQL metrics (quantile_over_time on span:duration).",
+      "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "ns"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "p50",
+          "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+          "queryType": "traceql",
+          "query": "{ name = \"konfig.Apply\" && resource.service.name = \"konfig\" } | quantile_over_time(duration, 0.5)",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "p95",
+          "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+          "queryType": "traceql",
+          "query": "{ name = \"konfig.Apply\" && resource.service.name = \"konfig\" } | quantile_over_time(duration, 0.95)",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "p99",
+          "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+          "queryType": "traceql",
+          "query": "{ name = \"konfig.Apply\" && resource.service.name = \"konfig\" } | quantile_over_time(duration, 0.99)",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Subscribe fan-out latency — broadcast_dispatch rate (p95/p99)",
+      "description": "Latency of the konfig.broadcast_dispatch leaf span (the in-process fan-out hop under the konfig.Subscribe root). Approximates the konfig_subscribe_e2e_latency_seconds SLI from the trace side.",
+      "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "ns"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "p95",
+          "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+          "queryType": "traceql",
+          "query": "{ name = \"konfig.broadcast_dispatch\" && resource.service.name = \"konfig\" } | quantile_over_time(duration, 0.95)",
+          "legendFormat": "broadcast_dispatch p95"
+        },
+        {
+          "refId": "p99",
+          "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+          "queryType": "traceql",
+          "query": "{ name = \"konfig.broadcast_dispatch\" && resource.service.name = \"konfig\" } | quantile_over_time(duration, 0.99)",
+          "legendFormat": "broadcast_dispatch p99"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Watcher reconnect timeline — watch_event span rate",
+      "description": "Rate of konfig.watch_event spans over time. A flat-line / drop to zero is the trace-side signal of a watcher disconnect (correlate with the konfig_stale_seconds Prometheus alert). Split by event_type (Apply / Delete).",
+      "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 40 },
+          "unit": "cps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+          "queryType": "traceql",
+          "query": "{ name = \"konfig.watch_event\" && resource.service.name = \"konfig\" } | rate() by (span.event_type)",
+          "legendFormat": "{{span.event_type}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "409 retry counts — apply_attempt spans (attempt > 0)",
+      "description": "Rate of konfig.apply_attempt child spans with attempt > 0, i.e. 409 Conflict retries under the konfig.Apply root span. A spike here is a resourceVersion contention storm.",
+      "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 40 },
+          "unit": "cps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+          "queryType": "traceql",
+          "query": "{ name = \"konfig.apply_attempt\" && resource.service.name = \"konfig\" && span.attempt > 0 } | rate()",
+          "legendFormat": "409 retries/s"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Top-N slowest Subscribe streams",
+      "description": "Slowest recent konfig.Subscribe root spans by duration. Click a row to open the full trace and inspect the broadcast_dispatch / cache_get child spans.",
+      "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 17 },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+          "queryType": "traceql",
+          "query": "{ name = \"konfig.Subscribe\" && resource.service.name = \"konfig\" && span.namespace =~ \"$namespace\" } | select(span.namespace, span.duration) | order_by(duration desc)",
+          "limit": 20,
+          "tableType": "traces"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["konfig", "tracing", "tempo", "phase7"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_TEMPO",
+        "label": "Tempo datasource",
+        "type": "datasource",
+        "query": "tempo",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": ""
+      },
+      {
+        "name": "namespace",
+        "label": "Namespace",
+        "type": "textbox",
+        "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+        "query": ".*",
+        "current": { "text": ".*", "value": ".*" },
+        "hide": 0,
+        "description": "Regex matched against the span.namespace attribute (TraceQL =~). Default .* matches all namespaces."
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "konfig — traces (Tempo)",
+  "uid": "konfig-traces",
+  "version": 1,
+  "weekStart": ""
+}
