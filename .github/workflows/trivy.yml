@@ -58,7 +58,7 @@ jobs:
         run: bazel run //docker/konfig:load_amd64
 
       - name: Trivy scan — fail on fixable HIGH/CRITICAL
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: kasa288/konfig:latest
           format: table
