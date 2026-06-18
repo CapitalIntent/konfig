@@ -18,7 +18,7 @@ concurrency:
 jobs:
   loadtest:
     name: konfig-loadtest in-cluster gate (kind)
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
     env:
@@ -43,6 +43,19 @@ jobs:
           build --build_metadata=COMMIT_SHA=${{ github.sha }}
           build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
           EOF
+
+      - name: CPU capability probe (CU-86aj4guza — confirm CMPXCHG16B/cx16)
+        # snmalloc compiles with `-mcx16` (CMPXCHG16B). A runner/kind-node CPU
+        # model without it makes the konfig binary SIGILL (exit 132) at
+        # allocator init, before any log — the recurring loadtest flake.
+        # Print the host CPU model + cx16 flag so a failing run proves whether
+        # the instruction is actually absent. `|| true` so a missing flag (the
+        # very thing we're testing for) never fails this probe step.
+        run: |
+          echo "=== host CPU ==="
+          grep -m1 'model name' /proc/cpuinfo || true
+          if grep -qm1 cx16 /proc/cpuinfo; then echo "host: cx16 PRESENT"; else echo "host: cx16 MISSING"; fi
+          echo "flags: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(cx16|lm|avx|avx2|avx512f|sse4_2|popcnt)$' | tr '\n' ' ')"
 
       - name: Build konfig + konfig-loadtest OCI images (linux/amd64)
         # `:load_amd64` builds the amd64 image natively on this runner.
@@ -190,13 +203,19 @@ jobs:
         # without cert-manager.
         #
         # Also bump readiness/liveness `initialDelaySeconds` from 5 → 15 for
-        # the kind gate only. On the blacksmith-8vcpu runner the konfig
+        # the kind gate only. On the blacksmith-2vcpu runner the konfig
         # process can take longer than 5s to reach the listener bind under
         # heavy I/O contention (image-store + cluster init still settling),
         # and a single missed TCP probe inside the failureThreshold window
         # can race the pod into CrashLoopBackOff before it ever serves.
         # Prod manifests stay tight (5s) — this is workflow-scoped only.
         # Refs CU-86aj3872a.
+        #
+        # Also (CU-86aj4guza): bump liveness `failureThreshold` 3 → 6 so a
+        # slow-to-bind pod under runner contention is not SIGKILLed prematurely
+        # (the recurring flake), and set `KONFIG_LOG_SYNC=1` so konfig logs
+        # synchronously — a SIGKILL leaves the prod non-blocking writer's buffer
+        # unflushed, making `kubectl logs` empty and the crash undiagnosable.
         run: |
           yq '
             (.spec.template.spec.containers[] | select(.name == "konfig")).imagePullPolicy = "IfNotPresent"
@@ -204,6 +223,8 @@ jobs:
                 ([.[] | select(test("^--tls") | not)] + ["--tls=false"])
             | (.spec.template.spec.containers[] | select(.name == "konfig")).readinessProbe.initialDelaySeconds = 15
             | (.spec.template.spec.containers[] | select(.name == "konfig")).livenessProbe.initialDelaySeconds = 15
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).livenessProbe.failureThreshold = 6
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).env += [{"name": "KONFIG_LOG_SYNC", "value": "1"}]
             | del(.spec.template.spec.containers[] | select(.name == "konfig").volumeMounts[] | select(.name == "konfig-tls"))
             | del(.spec.template.spec.volumes[] | select(.name == "konfig-tls"))
           ' infra/konfig/deployment.yaml \
@@ -279,8 +300,14 @@ jobs:
           kubectl get pods -A
           echo "=== konfig deployment describe ==="
           kubectl describe -n konfig-system deploy/konfig || true
-          echo "=== konfig pod logs ==="
+          echo "=== konfig pod describe ==="
+          kubectl describe -n konfig-system pod -l app=konfig || true
+          echo "=== konfig pod logs (current) ==="
           kubectl logs -n konfig-system -l app=konfig --tail=200 || true
+          echo "=== konfig pod logs (--previous: crashed instance) ==="
+          kubectl logs -n konfig-system -l app=konfig --previous --tail=200 || true
+          echo "=== node describe + capacity ==="
+          kubectl describe node || true
           echo "=== loadtest job describe ==="
           kubectl describe -n konfig-system job/konfig-loadtest || true
           echo "=== loadtest pod describe ==="

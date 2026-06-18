@@ -18,7 +18,7 @@ jobs:
   # ── Linux x86_64 ────────────────────────────────────────────────────────────
   build-linux-amd64:
     name: Build linux/amd64
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
     steps:
