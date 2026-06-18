@@ -18,7 +18,7 @@ concurrency:
 jobs:
   loadtest:
     name: konfig-loadtest in-cluster gate (kind)
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
     env:
