@@ -342,8 +342,7 @@ impl KonfigService for KonfigServer {
     ) -> Result<Response<ApplySecretResponse>, Status> {
         check_drain(&self.draining)?;
         record_status(
-            secret_apply::handle_apply_secret(self.kube_client.clone(), request.into_inner())
-                .await,
+            secret_apply::handle_apply_secret(self.kube_client.clone(), request.into_inner()).await,
         )
     }
 

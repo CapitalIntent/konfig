@@ -5,7 +5,7 @@
 //! The layer is **opt-in by environment** so a collector is never required to
 //! run konfig:
 //!
-//! * `OTEL_EXPORTER_OTLP_ENDPOINT` unset or empty → [`build_otel_layer`]
+//! * `OTEL_EXPORTER_OTLP_ENDPOINT` unset or empty → [`build_tracer_provider`]
 //!   returns `Ok(None)` and the caller installs the plain fmt subscriber only.
 //!   No exporter, no background batch task, no extra cost.
 //! * `OTEL_EXPORTER_OTLP_ENDPOINT` set (e.g. `http://otel-collector:4317`) →
@@ -59,7 +59,10 @@ const OTEL_SAMPLER_ARG_ENV: &str = "OTEL_TRACES_SAMPLER_ARG";
 pub fn resolve_sampler(sampler: Option<&str>, arg: Option<&str>) -> Sampler {
     // Ratio parse helper — fall back to 1.0 (sample everything) on missing /
     // malformed arg so a typo never silently drops all traces.
-    let ratio = || arg.and_then(|a| a.trim().parse::<f64>().ok()).unwrap_or(1.0);
+    let ratio = || {
+        arg.and_then(|a| a.trim().parse::<f64>().ok())
+            .unwrap_or(1.0)
+    };
 
     match sampler.map(str::trim) {
         Some("always_on") => Sampler::AlwaysOn,

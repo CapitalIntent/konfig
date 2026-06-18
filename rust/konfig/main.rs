@@ -134,8 +134,8 @@ fn init_tracing() -> Result<Option<SdkTracerProvider>, Box<dyn std::error::Error
         return Err("init_tracing called more than once: TRACING_GUARD already populated".into());
     }
 
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("konfig=info".parse()?);
+    let env_filter =
+        tracing_subscriber::EnvFilter::from_default_env().add_directive("konfig=info".parse()?);
     let fmt_layer = tracing_subscriber::fmt::layer().with_writer(writer);
 
     // Build the OTLP provider up front so the layer (which borrows a tracer
