@@ -106,6 +106,14 @@ pub struct ServerConfig {
     /// raising can help when many Subscribe RPCs multiplex on one
     /// connection. Sweep before changing the default.
     pub h2_max_concurrent_streams: Option<u32>,
+    /// Broadcast fan-out coalesce window (CU-86aj3vpgr). `Duration::ZERO`
+    /// (the default, `--coalesce-window-ms 0`) disables coalescing — each
+    /// apply is broadcast immediately, byte-for-byte the historical path.
+    /// `> 0` buffers events arriving within the window in the per-namespace
+    /// pump and dispatches them as a burst, cutting per-subscriber wake
+    /// amplification at high churn at the cost of up to `window` ms of added
+    /// tail latency.
+    pub coalesce_window: Duration,
 }
 
 /// Type-erased shutdown future.  Boxed so the field doesn't push a generic
@@ -143,6 +151,10 @@ pub struct KonfigServer {
     /// `Notify` triggered by `begin_drain`.  Active subscribe streams `await`
     /// this and exit cleanly (`Ok(())`) when notified.
     pub(crate) drain_notify: Arc<Notify>,
+    /// Broadcast fan-out coalesce window (CU-86aj3vpgr). Threaded from
+    /// `ServerConfig` to the per-namespace pump on each `subscribe` call.
+    /// `Duration::ZERO` = coalescing disabled (default).
+    pub(crate) coalesce_window: Duration,
 }
 
 impl KonfigServer {
@@ -286,6 +298,7 @@ impl KonfigService for KonfigServer {
                 Arc::clone(&self.namespace_replay_buffers),
                 Arc::clone(&self.watcher_handles),
                 self.drain_notify(),
+                self.coalesce_window,
                 request.into_inner(),
             )
             .await,
@@ -486,6 +499,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         secret_namespace_broadcasts: cfg.secret_namespace_broadcasts,
         draining: Arc::clone(&draining),
         drain_notify: Arc::clone(&drain_notify),
+        coalesce_window: cfg.coalesce_window,
     };
     let svc = KonfigServiceServer::new(server);
 
@@ -878,6 +892,7 @@ mod tests {
             secret_namespace_broadcasts: Arc::new(DashMap::new()),
             draining: Arc::new(AtomicBool::new(false)),
             drain_notify: Arc::new(Notify::new()),
+            coalesce_window: Duration::ZERO,
         }
     }
 

@@ -59,6 +59,11 @@ pub struct BroadcastFrame {
 /// Per-subscriber mpsc capacity — back-pressure for slow readers.
 const CHANNEL_CAPACITY: usize = 256;
 
+/// Maximum number of events accumulated in one coalesce window before an
+/// early flush is forced (cap on per-window latency-vs-throughput trade).
+/// Only consulted when the coalesce window is non-zero (CU-86aj3vpgr).
+const COALESCE_MAX_BATCH: usize = 16;
+
 /// Broadcast ring-buffer capacity per namespace.
 /// Sized so that even the slowest subscriber can drain before the ring wraps.
 const BROADCAST_CAPACITY: usize = 1_024;
@@ -117,6 +122,7 @@ fn push_replay(buf: &ReplayBuffer, resource_version: &str, event: Arc<ConfigEven
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_subscribe(
     cache: Arc<ConfigCache>,
     kube_client: Client,
@@ -124,6 +130,7 @@ pub async fn handle_subscribe(
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
     watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
     drain_notify: Arc<Notify>,
+    coalesce_window: Duration,
     req: SubscribeRequest,
 ) -> Result<Response<ReceiverStream<Result<ConfigEvent, Status>>>, Status> {
     debug!(namespace = %req.namespace, resume_rv = %req.resume_resource_version, "Subscribe RPC");
@@ -146,6 +153,7 @@ pub async fn handle_subscribe(
         Arc::clone(&namespace_broadcasts),
         Arc::clone(&namespace_replay_buffers),
         Arc::clone(&watcher_handles),
+        coalesce_window,
     );
 
     // Both resume and fresh-subscribe paths route through resume_from_buffer:
@@ -174,6 +182,7 @@ fn get_or_create_broadcast(
     namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
     watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
+    coalesce_window: Duration,
 ) -> (broadcast::Receiver<Arc<BroadcastFrame>>, ReplayBuffer) {
     // Fast path: namespace already has a running watcher.
     if let Some(sender_ref) = namespace_broadcasts.get(&namespace) {
@@ -234,6 +243,7 @@ fn get_or_create_broadcast(
                 Arc::clone(&buf),
                 broadcasts_for_spawn,
                 replay_buffers_for_spawn,
+                coalesce_window,
             ));
             handles_for_spawn.insert(namespace, handle);
 
@@ -252,13 +262,14 @@ async fn run_namespace_watcher(
     replay_buf: ReplayBuffer,
     namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
+    coalesce_window: Duration,
 ) {
     let ar = crate::watcher::config_api_resource();
     let api: Api<DynamicObject> = Api::namespaced_with(kube_client, &namespace, &ar);
     let wc = kube_watcher::Config::default();
     let stream = kube_watch_stream(api, wc).boxed();
 
-    pump_subscribe_namespace_events(stream, &namespace, &tx, &replay_buf).await;
+    pump_subscribe_namespace_events(stream, &namespace, &tx, &replay_buf, coalesce_window).await;
 
     // Watcher stream ended — remove from maps so next Subscribe recreates them.
     namespace_broadcasts.remove(&namespace);
@@ -283,11 +294,31 @@ async fn run_namespace_watcher(
 ///
 /// Extracted from [`run_namespace_watcher`] so this hot loop is unit-testable
 /// against a synthetic stream — no kube API connection required.
+///
+/// `coalesce_window` (CU-86aj3vpgr) controls broadcast fan-out batching:
+///
+/// - `Duration::ZERO` (default / `--coalesce-window-ms 0`): each event is
+///   broadcast immediately via its own `tx.send`. This is the historical
+///   behaviour, byte-for-byte — every parked subscriber `Receiver` is
+///   unparked once per apply.
+/// - `> 0`: events that arrive within the window are accumulated into a
+///   small buffer and dispatched as a back-to-back burst when the window
+///   elapses OR the buffer reaches [`COALESCE_MAX_BATCH`]. Because tokio's
+///   broadcast only unparks a receiver that is *currently* parked, a burst
+///   of N sends issued before the receiver task is rescheduled drains as a
+///   single wakeup instead of N — cutting the noop-park amplification.
+///
+/// Both paths preserve the per-event invariants exactly: each event keeps
+/// its own `apply_observed_at` / `sent_at` stamps (no collapsed timestamps),
+/// `push_replay` still runs once per event (RV-keyed) before the frame is
+/// emitted, and every accepted event is delivered (no drops — a partially
+/// filled buffer is flushed on window expiry and on stream end).
 pub(crate) async fn pump_subscribe_namespace_events<S>(
-    mut stream: S,
+    stream: S,
     namespace: &str,
     tx: &broadcast::Sender<Arc<BroadcastFrame>>,
     replay_buf: &ReplayBuffer,
+    coalesce_window: Duration,
 ) where
     S: futures_util::stream::TryStream<Ok = Event<DynamicObject>, Error = kube_watcher::Error>
         + Unpin,
@@ -297,62 +328,202 @@ pub(crate) async fn pump_subscribe_namespace_events<S>(
     // CU-86aj3m1bd: mirrors the same pattern already used for
     // `SUBSCRIBE_E2E_LATENCY` + `BROADCAST_LAG` per-subscriber.
     let events_broadcast = EVENTS_BROADCAST.with_label_values(&[namespace]);
-    loop {
-        let event = match stream.try_next().await {
-            Ok(Some(event)) => event,
-            Ok(None) => {
-                // Clean stream end — emit a `warn!` (not `info!`) so the
-                // outer caller's restart shows up in log search; the
-                // `get_or_create_broadcast` retry will rebuild the watcher
-                // when a fresh subscriber arrives.
-                warn!(namespace = %namespace, "Namespace watcher stream ended cleanly");
-                return;
-            }
-            Err(e) => {
-                // Previously `try_next().await.unwrap_or(None)` collapsed
-                // every stream error into an indistinguishable clean exit,
-                // hiding intermittent k8s API failures.  Surface them so
-                // the operator can correlate against API-server logs.
-                warn!(namespace = %namespace, "Namespace watcher stream error: {e}");
-                return;
-            }
-        };
 
-        let apply_observed_at = Instant::now();
-
-        let (event_type, obj) = match event {
-            Event::Apply(obj) | Event::InitApply(obj) => (EventType::Modified as i32, obj),
-            Event::Delete(obj) => (EventType::Deleted as i32, obj),
-            Event::Init | Event::InitDone => continue,
-        };
-        let Some(snap) = crate::watcher::parse_config_object(&obj) else {
-            continue;
-        };
-        let config_event = Arc::new(ConfigEvent {
-            event_type,
-            config: Some(snapshot_to_proto(&snap)),
-        });
-
-        H2_DATA_FRAME_BYTES.observe(config_event.encoded_len() as f64);
-
-        // Push into replay buffer before broadcasting so a subscriber that
-        // races to read the buffer after receiving the live event will find it.
-        // `&str` cheap-pass: `push_replay` allocates the owned String only
-        // on the happy parse path (CU-86aj3m1bd).
-        push_replay(
+    if coalesce_window.is_zero() {
+        pump_immediate(stream, namespace, tx, replay_buf, &events_broadcast).await;
+    } else {
+        pump_coalesced(
+            stream,
+            namespace,
+            tx,
             replay_buf,
-            &snap.resource_version,
-            Arc::clone(&config_event),
-        );
+            coalesce_window,
+            &events_broadcast,
+        )
+        .await;
+    }
+}
 
-        let sent_at = Instant::now();
-        let frame = Arc::new(BroadcastFrame {
-            sent_at,
-            event: config_event,
-        });
+/// Classify an already-resolved `stream.try_next()` result, emitting the same
+/// end/error logs the historical loop did. Returns `Some(event)` to process or
+/// `None` to terminate the pump (both clean-end and error map to `None` — the
+/// caller cleans up the namespace maps either way, as before).
+///
+/// Takes the resolved `Result` (rather than polling) so the coalesce loop can
+/// feed in the value it obtained from a `tokio::time::timeout` without
+/// re-polling the stream — re-polling would drop the already-yielded item and
+/// violate the 100 % delivery guarantee.
+fn classify_stream_item(
+    item: Result<Option<Event<DynamicObject>>, kube_watcher::Error>,
+    namespace: &str,
+) -> Option<Event<DynamicObject>> {
+    match item {
+        Ok(Some(event)) => Some(event),
+        Ok(None) => {
+            // Clean stream end — emit a `warn!` (not `info!`) so the outer
+            // caller's restart shows up in log search; the
+            // `get_or_create_broadcast` retry rebuilds the watcher when a
+            // fresh subscriber arrives.
+            warn!(namespace = %namespace, "Namespace watcher stream ended cleanly");
+            None
+        }
+        Err(e) => {
+            // Previously `try_next().await.unwrap_or(None)` collapsed every
+            // stream error into an indistinguishable clean exit, hiding
+            // intermittent k8s API failures. Surface them so the operator can
+            // correlate against API-server logs.
+            warn!(namespace = %namespace, "Namespace watcher stream error: {e}");
+            None
+        }
+    }
+}
 
-        APPLY_TO_BROADCAST_SECONDS.observe(sent_at.duration_since(apply_observed_at).as_secs_f64());
+/// Immediate fan-out — exact historical behaviour. Each accepted event is
+/// broadcast via its own `tx.send`, unparking every parked subscriber once
+/// per apply.
+async fn pump_immediate<S>(
+    mut stream: S,
+    namespace: &str,
+    tx: &broadcast::Sender<Arc<BroadcastFrame>>,
+    replay_buf: &ReplayBuffer,
+    events_broadcast: &prometheus::Counter,
+) where
+    S: futures_util::stream::TryStream<Ok = Event<DynamicObject>, Error = kube_watcher::Error>
+        + Unpin,
+{
+    loop {
+        let Some(event) = classify_stream_item(stream.try_next().await, namespace) else {
+            return;
+        };
+        if let Some(frame) = process_namespace_event(event, replay_buf)
+            && tx.send(frame).is_ok()
+        {
+            events_broadcast.inc();
+        }
+    }
+}
 
+/// Coalesced fan-out — accumulate events arriving within `coalesce_window` and
+/// dispatch them as a back-to-back send burst. `batch` holds fully-processed
+/// frames (each already stamped + pushed to the replay buffer); `deadline` is
+/// the flush time for the *first* buffered frame, or `None` when the batch is
+/// empty (then we block on the stream indefinitely). The partial batch is
+/// always flushed before returning, so no accepted event is ever dropped.
+async fn pump_coalesced<S>(
+    mut stream: S,
+    namespace: &str,
+    tx: &broadcast::Sender<Arc<BroadcastFrame>>,
+    replay_buf: &ReplayBuffer,
+    coalesce_window: Duration,
+    events_broadcast: &prometheus::Counter,
+) where
+    S: futures_util::stream::TryStream<Ok = Event<DynamicObject>, Error = kube_watcher::Error>
+        + Unpin,
+{
+    let mut batch: Vec<Arc<BroadcastFrame>> = Vec::with_capacity(COALESCE_MAX_BATCH);
+    let mut deadline: Option<Instant> = None;
+    loop {
+        // Non-empty batch: only wait until the window deadline for the next
+        // event; if the timeout fires first, flush the partial batch. Empty
+        // batch: block on the stream indefinitely. In both cases the resolved
+        // `try_next` value is captured (never re-polled) so no item is lost.
+        let item = match deadline {
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, stream.try_next()).await {
+                    Ok(item) => item,
+                    Err(_elapsed) => {
+                        // Window expired with a partially filled batch — flush.
+                        flush_batch(&mut batch, tx, events_broadcast);
+                        deadline = None;
+                        continue;
+                    }
+                }
+            }
+            None => stream.try_next().await,
+        };
+
+        let Some(event) = classify_stream_item(item, namespace) else {
+            // Stream ended or errored — flush whatever was buffered before
+            // exiting so no accepted event is dropped (100 % delivery).
+            flush_batch(&mut batch, tx, events_broadcast);
+            return;
+        };
+
+        if let Some(frame) = process_namespace_event(event, replay_buf) {
+            if batch.is_empty() {
+                // Start the window clock on the first buffered frame.
+                deadline = Some(Instant::now() + coalesce_window);
+            }
+            batch.push(frame);
+            if batch.len() >= COALESCE_MAX_BATCH {
+                flush_batch(&mut batch, tx, events_broadcast);
+                deadline = None;
+            }
+        }
+    }
+}
+
+/// Process one raw kube watch event into a ready-to-broadcast
+/// [`BroadcastFrame`], performing the per-event side effects that must happen
+/// regardless of whether fan-out is coalesced:
+///
+/// - stamp `apply_observed_at` → `sent_at` (each event keeps its own clock),
+/// - serialise the proto once into an `Arc<ConfigEvent>`,
+/// - observe `H2_DATA_FRAME_BYTES` + `APPLY_TO_BROADCAST_SECONDS`,
+/// - push into the replay buffer (RV-keyed) before the frame is emitted.
+///
+/// Returns `None` for `Init` / `InitDone` and unparseable objects (which are
+/// skipped without broadcasting, matching the historical immediate path).
+fn process_namespace_event(
+    event: Event<DynamicObject>,
+    replay_buf: &ReplayBuffer,
+) -> Option<Arc<BroadcastFrame>> {
+    let apply_observed_at = Instant::now();
+
+    let (event_type, obj) = match event {
+        Event::Apply(obj) | Event::InitApply(obj) => (EventType::Modified as i32, obj),
+        Event::Delete(obj) => (EventType::Deleted as i32, obj),
+        Event::Init | Event::InitDone => return None,
+    };
+    let snap = crate::watcher::parse_config_object(&obj)?;
+    let config_event = Arc::new(ConfigEvent {
+        event_type,
+        config: Some(snapshot_to_proto(&snap)),
+    });
+
+    H2_DATA_FRAME_BYTES.observe(config_event.encoded_len() as f64);
+
+    // Push into replay buffer before broadcasting so a subscriber that
+    // races to read the buffer after receiving the live event will find it.
+    // `&str` cheap-pass: `push_replay` allocates the owned String only
+    // on the happy parse path (CU-86aj3m1bd).
+    push_replay(
+        replay_buf,
+        &snap.resource_version,
+        Arc::clone(&config_event),
+    );
+
+    let sent_at = Instant::now();
+    APPLY_TO_BROADCAST_SECONDS.observe(sent_at.duration_since(apply_observed_at).as_secs_f64());
+
+    Some(Arc::new(BroadcastFrame {
+        sent_at,
+        event: config_event,
+    }))
+}
+
+/// Dispatch every buffered frame as a back-to-back `tx.send` burst, then clear
+/// the batch. Each successful send increments `events_broadcast` (preserving
+/// the per-event counter semantics — the counter still counts events that
+/// reached at least one subscriber, not batches). `tx.send` only errors when
+/// there are zero receivers, which is not a per-event failure to surface.
+fn flush_batch(
+    batch: &mut Vec<Arc<BroadcastFrame>>,
+    tx: &broadcast::Sender<Arc<BroadcastFrame>>,
+    events_broadcast: &prometheus::Counter,
+) {
+    for frame in batch.drain(..) {
         if tx.send(frame).is_ok() {
             events_broadcast.inc();
         }
@@ -1617,7 +1788,8 @@ mod tests {
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
             vec![Ok(Event::Apply(dyn_config("cfg", "ns", 1, "100")))];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
+            .await;
 
         let frame = rx.try_recv().expect("must broadcast Modified");
         assert_eq!(frame.event.event_type, EventType::Modified as i32);
@@ -1634,7 +1806,8 @@ mod tests {
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
             vec![Ok(Event::Init), Ok(Event::InitDone)];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
+            .await;
 
         assert!(
             rx.try_recv().is_err(),
@@ -1653,7 +1826,8 @@ mod tests {
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
             vec![Ok(Event::Delete(obj))];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
+            .await;
 
         let frame = rx.try_recv().expect("must broadcast Deleted");
         assert_eq!(frame.event.event_type, EventType::Deleted as i32);
@@ -1671,7 +1845,8 @@ mod tests {
             Ok(Event::Apply(dyn_config("cfg-z", "ns", 99, "99"))),
         ];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
+            .await;
 
         let first = rx.try_recv().expect("pre-error event landed");
         assert_eq!(first.event.event_type, EventType::Modified as i32);
@@ -1691,7 +1866,8 @@ mod tests {
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
             vec![Ok(Event::Apply(bad))];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
+            .await;
 
         assert!(
             rx.try_recv().is_err(),
@@ -1710,11 +1886,155 @@ mod tests {
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
             vec![Ok(Event::Apply(dyn_config("cfg", "ns", 1, "1")))];
 
-        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay).await;
+        pump_subscribe_namespace_events(stream::iter(events), "ns", &tx, &replay, Duration::ZERO)
+            .await;
 
         // Replay buffer is populated even when there are no live subscribers
         // so a subscriber that arrives mid-event-burst can resume cleanly.
         let buf = crate::sync_util::lock_recovered(&replay);
         assert_eq!(buf.len(), 1);
+    }
+
+    // ── Coalesce-by-window (CU-86aj3vpgr) ─────────────────────────────────────
+
+    /// Window > 0: multiple events arriving within the window are accumulated
+    /// and dispatched as a burst, but ALL of them are still delivered (100 %
+    /// delivery guarantee) with their own per-event content, and `push_replay`
+    /// still runs once per event (RV-keyed). A finite synthetic stream ends
+    /// before the timer fires, so the partial batch is flushed on stream-end.
+    #[tokio::test]
+    async fn ns_pump_coalesce_window_batches_all_events() {
+        use futures_util::stream;
+        let (tx, mut rx) = broadcast::channel(16);
+        let replay = Arc::new(Mutex::new(VecDeque::new()));
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> = vec![
+            Ok(Event::Apply(dyn_config("cfg", "ns", 1, "100"))),
+            Ok(Event::Apply(dyn_config("cfg", "ns", 2, "101"))),
+            Ok(Event::Apply(dyn_config("cfg", "ns", 3, "102"))),
+        ];
+
+        pump_subscribe_namespace_events(
+            stream::iter(events),
+            "ns",
+            &tx,
+            &replay,
+            Duration::from_millis(5),
+        )
+        .await;
+
+        // 100 % delivery: every event reaches the broadcast channel, in order,
+        // each carrying its own resource_version (timestamps not collapsed —
+        // distinct frames, distinct `sent_at`).
+        let mut got = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            assert_eq!(frame.event.event_type, EventType::Modified as i32);
+            got.push(
+                frame
+                    .event
+                    .config
+                    .as_ref()
+                    .expect("config present")
+                    .resource_version
+                    .clone(),
+            );
+        }
+        assert_eq!(
+            got,
+            vec!["100", "101", "102"],
+            "all events delivered in order"
+        );
+
+        // Replay buffer holds one entry per event — push semantics unchanged.
+        let buf = crate::sync_util::lock_recovered(&replay);
+        assert_eq!(
+            buf.len(),
+            3,
+            "push_replay still runs per event under coalesce"
+        );
+        let rvs: Vec<u64> = buf.iter().map(|e| e.resource_version_u64).collect();
+        assert_eq!(rvs, vec![100, 101, 102]);
+    }
+
+    /// Window > 0, deterministic timer flush: a single event is buffered and
+    /// the stream then stays pending forever (never ends). The ONLY thing that
+    /// can deliver the event is the window-expiry flush — proving the timeout
+    /// path, not the stream-end fallback. Uses paused time so the 5 ms window
+    /// is advanced instantly and deterministically.
+    #[tokio::test(start_paused = true)]
+    async fn ns_pump_coalesce_window_flushes_on_timer() {
+        use futures_util::stream::{self, StreamExt};
+        let (tx, mut rx) = broadcast::channel(8);
+        let replay = Arc::new(Mutex::new(VecDeque::new()));
+
+        // One event, then a stream tail that never yields and never ends.
+        let one: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
+            vec![Ok(Event::Apply(dyn_config("cfg", "ns", 1, "100")))];
+        let blocked = stream::iter(one).chain(stream::pending());
+
+        let window = Duration::from_millis(5);
+        let pump = tokio::spawn(async move {
+            pump_subscribe_namespace_events(blocked, "ns", &tx, &replay, window).await;
+        });
+
+        // Before the window elapses, nothing has been broadcast yet (the event
+        // is still buffered in the coalesce batch).
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "event must remain buffered until the window expires"
+        );
+
+        // Advance past the window — the timer flush fires.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let frame = rx
+            .recv()
+            .await
+            .expect("timer flush must broadcast the event");
+        assert_eq!(frame.event.event_type, EventType::Modified as i32);
+
+        // The pump is still running on the pending tail (stream never ended),
+        // confirming delivery came from the window timer, not stream-end.
+        assert!(!pump.is_finished(), "pump still alive on pending stream");
+        pump.abort();
+    }
+
+    /// Window > 0 with a batch that exceeds `COALESCE_MAX_BATCH`: the size cap
+    /// forces an early burst-flush mid-stream (not just on stream-end), and
+    /// every event is still delivered exactly once. Uses a long window so the
+    /// timer never fires — the only thing that can flush is the size cap and
+    /// the final stream-end flush of the remainder.
+    #[tokio::test]
+    async fn ns_pump_coalesce_max_batch_flushes_burst() {
+        use futures_util::stream;
+        let total = COALESCE_MAX_BATCH + 3;
+        let (tx, mut rx) = broadcast::channel(total + 8);
+        let replay = Arc::new(Mutex::new(VecDeque::new()));
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> = (0..total)
+            .map(|i| {
+                let rv = (1000 + i).to_string();
+                Ok(Event::Apply(dyn_config("cfg", "ns", i as u32, &rv)))
+            })
+            .collect();
+
+        pump_subscribe_namespace_events(
+            stream::iter(events),
+            "ns",
+            &tx,
+            &replay,
+            Duration::from_secs(3600),
+        )
+        .await;
+
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(
+            count, total,
+            "every event delivered across the cap-flush boundary"
+        );
+        let buf = crate::sync_util::lock_recovered(&replay);
+        assert_eq!(buf.len(), total);
     }
 }
