@@ -109,6 +109,55 @@ mod tests {
         assert!(!cfg.content_json.is_empty());
     }
 
+    /// Partition behaviour (CU-86ahzwgjz): when the watcher loses its K8s
+    /// connection it calls `cache.mark_all_stale()`, which stamps every
+    /// snapshot with `stale_since = Some(_)` but does NOT evict it. `Get`
+    /// must keep serving that last-known-good value (AP-on-read for an
+    /// already-cached key) rather than flipping to `NotFound` the moment the
+    /// control plane is unreachable. This is the repo-verifiable slice of the
+    /// partition row — the read path never touches kube, so no mock cluster
+    /// is needed. The Apply→`UNAVAILABLE` half is deferred (see
+    /// docs/cp-readiness.md).
+    #[tokio::test]
+    async fn get_serves_last_known_good_after_partition_marks_cache_stale() {
+        let cache = make_cache("default", "my-config", 3);
+
+        // Precondition: fresh entry, not stale.
+        assert!(
+            cache
+                .get("default", "my-config")
+                .unwrap()
+                .stale_since
+                .is_none(),
+            "precondition: entry starts fresh",
+        );
+
+        // Simulate the watcher losing its K8s connection.
+        cache.mark_all_stale();
+        assert!(
+            cache
+                .get("default", "my-config")
+                .unwrap()
+                .stale_since
+                .is_some(),
+            "partition: mark_all_stale must stamp stale_since",
+        );
+
+        // Get must still return the last-known-good config, not NotFound.
+        let req = GetRequest {
+            namespace: "default".into(),
+            name: "my-config".into(),
+        };
+        let resp = handle_get(cache, req)
+            .await
+            .expect("stale entry must still be served, not NotFound");
+        let cfg = resp.into_inner();
+        assert_eq!(
+            cfg.schema_version, 3,
+            "served snapshot must be the pre-partition last-known-good value",
+        );
+    }
+
     #[tokio::test]
     async fn get_returns_not_found_when_cache_empty() {
         let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
