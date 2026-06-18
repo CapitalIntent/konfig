@@ -331,6 +331,36 @@ mod tests {
         assert_eq!(cache.load().schema_version, 7);
     }
 
+    /// BOOKMARK / restart equivalent (CU-86ahzwgu4): kube-rs collapses a
+    /// relist-complete signal into `Event::InitDone`. It carries no object,
+    /// so the cache must be left exactly as the preceding applies left it —
+    /// `InitDone` is a cursor/lifecycle marker, never a cache mutation. (The
+    /// resourceVersion the cursor advances to lives inside the kube watcher
+    /// stream state, not in `handle_event`; this test pins that `handle_event`
+    /// itself is a no-op for the marker.)
+    #[test]
+    fn init_done_leaves_cache_unchanged() {
+        let obj = make_obj("cfg", 9, json!({"k": "v"}));
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        handle_event(Event::Apply(obj), &cache);
+        assert_eq!(cache.load().schema_version, 9, "precondition: apply landed");
+
+        // Init (relist start) then InitDone (relist complete) must not touch
+        // the last-known-good snapshot.
+        handle_event(Event::Init, &cache);
+        handle_event(Event::InitDone, &cache);
+        assert_eq!(
+            cache.load().schema_version,
+            9,
+            "Init/InitDone are lifecycle markers — cache must be untouched",
+        );
+        assert_eq!(
+            cache.get("default", "cfg").unwrap().schema_version,
+            9,
+            "named entry must still hold the pre-InitDone value",
+        );
+    }
+
     #[test]
     fn delete_event_leaves_cache_unchanged() {
         let obj = make_obj("cfg", 3, json!({}));

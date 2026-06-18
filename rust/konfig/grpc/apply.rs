@@ -64,7 +64,7 @@ pub async fn apply_spec(
 
     let current = fetch_current_schema_version(&api, name).await?;
 
-    if incoming <= current {
+    if let Err(status) = schema_version_decision(incoming, current) {
         warn!(
             incoming,
             current, "Apply rejected: schema_version not increasing"
@@ -75,9 +75,7 @@ pub async fn apply_spec(
         APPLY_DURATION
             .with_label_values(&[namespace, "rejected"])
             .observe(started.elapsed().as_secs_f64());
-        return Err(Status::failed_precondition(format!(
-            "schema_version must be > {current}; got {incoming}"
-        )));
+        return Err(status);
     }
 
     let patch_body = json!({
@@ -134,6 +132,26 @@ pub(crate) fn parse_schema_version_from_object(obj: &DynamicObject) -> u32 {
         .and_then(|s| s.get("schema_version"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32
+}
+
+/// Pure monotonicity gate — decide whether an incoming `schema_version` may
+/// overwrite the `current` one. CP guarantee: an Apply is accepted **only**
+/// when it strictly increases the version, so a stale or replayed write can
+/// never clobber a newer one.
+///
+/// Returns `Ok(())` when `incoming > current`; otherwise `Err` carrying a
+/// `Status::failed_precondition` with the same message the RPC surfaces.
+/// Extracted from `apply_spec` so the comparison + the exact gRPC code it
+/// maps to are unit-testable without a live kube `Api` (the I/O lives in
+/// `fetch_current_schema_version`, this is the decision).
+pub(crate) fn schema_version_decision(incoming: u32, current: u32) -> Result<(), Status> {
+    if incoming <= current {
+        Err(Status::failed_precondition(format!(
+            "schema_version must be > {current}; got {incoming}"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 /// Decision returned by `classify_patch_error` so the (un-mockable) kube I/O
@@ -225,19 +243,52 @@ where
 mod tests {
     use super::*;
 
+    // ── schema_version_decision: monotonicity gate + gRPC code mapping ──────
+    //
+    // CP guarantee (CU-86ahzwgjz): an Apply may only land when it strictly
+    // increases the stored schema_version, so a stale/replayed write can
+    // never clobber a newer one. These tests drive the extracted pure helper
+    // directly — no live kube `Api` — and assert BOTH the accept/reject
+    // decision AND that a reject maps to `Code::FailedPrecondition` (the
+    // contract consumers retry-or-abort on), not some other status.
+
     #[test]
-    fn schema_version_monotonicity_check() {
-        let incoming = 5u32;
-        let current = 5u32;
-        assert!(incoming <= current, "equal version must be rejected");
+    fn schema_version_equal_is_rejected_failed_precondition() {
+        let err = schema_version_decision(5, 5).expect_err("equal version must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("must be > 5"),
+            "message should name the current version; got {:?}",
+            err.message(),
+        );
+    }
 
-        let incoming = 3u32;
-        let current = 5u32;
-        assert!(incoming <= current, "lower version must be rejected");
+    #[test]
+    fn schema_version_lower_is_rejected_failed_precondition() {
+        let err = schema_version_decision(3, 5).expect_err("lower version must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
 
-        let incoming = 6u32;
-        let current = 5u32;
-        assert!(incoming > current, "higher version must be accepted");
+    #[test]
+    fn schema_version_higher_is_accepted() {
+        assert!(
+            schema_version_decision(6, 5).is_ok(),
+            "strictly higher version must be accepted",
+        );
+    }
+
+    #[test]
+    fn schema_version_first_write_over_zero_is_accepted() {
+        // `fetch_current_schema_version` returns 0 for a not-yet-existing CRD;
+        // the very first Apply (any version ≥ 1) must therefore be accepted.
+        assert!(schema_version_decision(1, 0).is_ok());
+        // version 0 over a 0 baseline is NOT an increase — still rejected.
+        assert_eq!(
+            schema_version_decision(0, 0)
+                .expect_err("0 over 0 is not an increase")
+                .code(),
+            tonic::Code::FailedPrecondition,
+        );
     }
 
     #[test]
