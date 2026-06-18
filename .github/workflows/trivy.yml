@@ -1,0 +1,74 @@
+name: Trivy image scan
+# CU-86aj08uxy — container vulnerability gate.
+#
+# Builds the production konfig image natively (amd64) via the same
+# `bazel run //docker/konfig:load_amd64` target the loadtest gate uses, then
+# scans the loaded image with Trivy and FAILS the PR on any fixable
+# HIGH/CRITICAL OS-package or library vulnerability.
+#
+# Why scan a locally-built image instead of a registry tag: `publish-images`
+# is disabled (no Docker Hub secrets on this repo), so there is no pushed
+# tag to pull. Building + loading into the local docker daemon and scanning
+# that is hermetic and needs no registry credentials.
+#
+# Scope note: the base is distroless/cc-debian13 (minimal OS surface). Trivy's
+# library scan does NOT see Rust crate CVEs (no Cargo.lock ships in the image,
+# and the binary is statically analysed only at the OS layer). Crate-level
+# auditing (cargo-audit / cargo-deny) is tracked separately; this gate covers
+# the OS + any detectable bundled libraries.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Trivy HIGH/CRITICAL gate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
+
+      - name: Build + load konfig image (amd64)
+        # Loads `kasa288/konfig:latest` into the local docker daemon.
+        run: bazel run //docker/konfig:load_amd64
+
+      - name: Trivy scan — fail on fixable HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: kasa288/konfig:latest
+          format: table
+          severity: HIGH,CRITICAL
+          # Don't fail on vulns with no upstream fix available — they are not
+          # actionable on our side and would block every PR indefinitely.
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: '1'
+        env:
+          # Pull the vuln DB from the GHCR mirror to avoid Docker Hub rate
+          # limits on the default trivy-db registry.
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
