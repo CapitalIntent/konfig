@@ -203,7 +203,7 @@ jobs:
         # without cert-manager.
         #
         # Also bump readiness/liveness `initialDelaySeconds` from 5 → 15 for
-        # the kind gate only. On the blacksmith-8vcpu runner the konfig
+        # the kind gate only. On the blacksmith-2vcpu runner the konfig
         # process can take longer than 5s to reach the listener bind under
         # heavy I/O contention (image-store + cluster init still settling),
         # and a single missed TCP probe inside the failureThreshold window
