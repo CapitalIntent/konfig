@@ -197,6 +197,12 @@ jobs:
         # can race the pod into CrashLoopBackOff before it ever serves.
         # Prod manifests stay tight (5s) — this is workflow-scoped only.
         # Refs CU-86aj3872a.
+        #
+        # Also (CU-86aj4guza): bump liveness `failureThreshold` 3 → 6 so a
+        # slow-to-bind pod under runner contention is not SIGKILLed prematurely
+        # (the recurring flake), and set `KONFIG_LOG_SYNC=1` so konfig logs
+        # synchronously — a SIGKILL leaves the prod non-blocking writer's buffer
+        # unflushed, making `kubectl logs` empty and the crash undiagnosable.
         run: |
           yq '
             (.spec.template.spec.containers[] | select(.name == "konfig")).imagePullPolicy = "IfNotPresent"
@@ -204,6 +210,8 @@ jobs:
                 ([.[] | select(test("^--tls") | not)] + ["--tls=false"])
             | (.spec.template.spec.containers[] | select(.name == "konfig")).readinessProbe.initialDelaySeconds = 15
             | (.spec.template.spec.containers[] | select(.name == "konfig")).livenessProbe.initialDelaySeconds = 15
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).livenessProbe.failureThreshold = 6
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).env += [{"name": "KONFIG_LOG_SYNC", "value": "1"}]
             | del(.spec.template.spec.containers[] | select(.name == "konfig").volumeMounts[] | select(.name == "konfig-tls"))
             | del(.spec.template.spec.volumes[] | select(.name == "konfig-tls"))
           ' infra/konfig/deployment.yaml \
@@ -279,8 +287,14 @@ jobs:
           kubectl get pods -A
           echo "=== konfig deployment describe ==="
           kubectl describe -n konfig-system deploy/konfig || true
-          echo "=== konfig pod logs ==="
+          echo "=== konfig pod describe ==="
+          kubectl describe -n konfig-system pod -l app=konfig || true
+          echo "=== konfig pod logs (current) ==="
           kubectl logs -n konfig-system -l app=konfig --tail=200 || true
+          echo "=== konfig pod logs (--previous: crashed instance) ==="
+          kubectl logs -n konfig-system -l app=konfig --previous --tail=200 || true
+          echo "=== node describe + capacity ==="
+          kubectl describe node || true
           echo "=== loadtest job describe ==="
           kubectl describe -n konfig-system job/konfig-loadtest || true
           echo "=== loadtest pod describe ==="
