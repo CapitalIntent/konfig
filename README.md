@@ -134,6 +134,7 @@ konfig server is down.
 - [Existing ConfigMaps and Secrets](docs/configmaps-secrets.md) — opt-in label, data formats, migration
 - [konfig-cli reference](docs/cli.md) — all commands and flags
 - [Runbook](docs/runbook.md) — health checks, metrics, partition recovery, upgrading
+- [mTLS rollout + cert rotation](docs/mtls-rollout.md) — dual-listener rollout, zero-downtime cert rotation, expiry alerting
 - [ADR-0001](docs/adr/0001-deployment-raw-yaml.md) — why raw YAML, not Helm
 
 ## Development
