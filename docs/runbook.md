@@ -129,6 +129,11 @@ self-signed root in `Secret/konfig-ca-key-pair`. The server reads its
 material at startup; cert-manager rewriting the underlying Secret does NOT
 hot-reload — the pod must restart to pick up new certs.
 
+> For the full **rollout plan** (turning mTLS on without breaking existing
+> plaintext consumers — dual-listener migration) and **zero-downtime rotation**
+> procedures, see [mtls-rollout.md](mtls-rollout.md). The quick-reference
+> commands below stay here.
+
 ### Verify cert expiry
 
 ```bash
