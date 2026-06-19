@@ -18,6 +18,22 @@ on:
 #                             (so the pin-back commit can land on main
 #                             past branch protection's default `GITHUB_TOKEN`).
 #
+# Supply-chain security (Phase 8 — CU-86aj08v23): cosign keyless signing +
+# SLSA L3 build provenance. These steps need NO long-lived key material —
+# they use GitHub's OIDC token via Sigstore (Fulcio short-lived certs +
+# Rekor transparency log). The ONLY thing they require is the job-level
+#   permissions:
+#     id-token: write    # mint the OIDC token cosign/attest exchange at Fulcio
+#     packages: write    # (ghcr only — not needed for Docker Hub push)
+#     contents: read     # checkout
+#     attestations: write  # actions/attest-build-provenance writes to the
+#                          #   GH attestations store (api.github.com)
+# No COSIGN_PRIVATE_KEY / COSIGN_PASSWORD secrets are used — keyless only.
+# Verification (`cosign verify` / `cosign verify-attestation`) needs NO
+# secrets at all; it pulls the signature + cert from the registry and checks
+# the Rekor inclusion proof. See the `verify_supply_chain` job below — its
+# header documents where the same checks slot into the deploy gate.
+#
 # Skips itself when the commit message contains `[skip publish]` so the
 # pin-back commit doesn't loop into another publish run.
 #
@@ -43,6 +59,15 @@ jobs:
           - arch: arm64
             runner: blacksmith-2vcpu-ubuntu-2404-arm
     runs-on: ${{ matrix.runner }}
+    # OIDC token is REQUIRED for cosign keyless signing + provenance
+    # attestation (CU-86aj08v23). `id-token: write` lets the job exchange
+    # GitHub's OIDC JWT for a short-lived Fulcio signing cert; no static
+    # keys. `attestations: write` lets actions/attest-build-provenance
+    # upload the SLSA provenance to the GH attestations store.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
       BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
     steps:
@@ -54,6 +79,9 @@ jobs:
 
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
 
       - name: Configure Bazel for CI (BuildBuddy remote cache)
         run: |
@@ -81,13 +109,54 @@ jobs:
       - name: Push konfig-loadtest (${{ matrix.arch }})
         run: bazel run --stamp //docker/konfig-loadtest:push_${{ matrix.arch }}
 
+      # ----------------------------------------------------------------------
+      # Supply-chain: sign + attest each per-arch digest (CU-86aj08v23).
+      #
+      # We resolve the immutable digest of the tag we just pushed (signing a
+      # mutable tag is meaningless — a later push could swap the bytes). cosign
+      # signs by `repo@sha256:...`; the manifest job re-signs the multi-arch
+      # index digest after fan-in so both the per-arch images AND the index a
+      # consumer actually pulls are covered.
+      # ----------------------------------------------------------------------
+      - name: Resolve short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: cosign sign per-arch digests (keyless)
+        env:
+          # cosign uploads the signature alongside the image; keyless means the
+          # Fulcio cert + Rekor entry are the trust root, no key file.
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.sha.outputs.short }}"
+          ARCH="${{ matrix.arch }}"
+          for repo in kasa288/konfig kasa288/konfig-cli kasa288/konfig-loadtest; do
+            tag="$repo:$SHA-$ARCH"
+            digest="$(docker buildx imagetools inspect "$tag" \
+              --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            echo "Signing $repo@$digest"
+            cosign sign --yes "$repo@$digest"
+          done
+      # Provenance attestation is emitted once per multi-arch INDEX digest in
+      # the assemble_manifests_and_pin job below (the index is what the
+      # deployment pins and consumers pull). Per-arch we only sign — the index
+      # signature + provenance transitively cover the child manifests.
+
   assemble_manifests_and_pin:
     name: Assemble multi-arch manifests + pin SHAs
     needs: build_push_per_arch
     if: "!contains(github.event.head_commit.message, '[skip publish]')"
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
-      contents: write
+      contents: write       # pin-back commit
+      id-token: write       # cosign keyless + provenance OIDC (CU-86aj08v23)
+      attestations: write   # actions/attest-build-provenance upload
+    outputs:
+      sha: ${{ steps.sha.outputs.short }}
+      digest_konfig: ${{ steps.digests.outputs.konfig }}
+      digest_konfig_cli: ${{ steps.digests.outputs.konfig_cli }}
+      digest_konfig_loadtest: ${{ steps.digests.outputs.konfig_loadtest }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -107,6 +176,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Assemble multi-arch manifests
         run: |
           set -euo pipefail
@@ -121,6 +193,62 @@ jobs:
                 "$repo:$SHA-arm64"
             done
           done
+
+      - name: Resolve multi-arch index digests
+        id: digests
+        # The SHA tag and latest tag point at the same index, so one inspect
+        # per repo. Digests feed both cosign (below) and the provenance
+        # attestation, which must reference the immutable digest, not a tag.
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.sha.outputs.short }}"
+          for repo in konfig konfig-cli konfig-loadtest; do
+            digest="$(docker buildx imagetools inspect "kasa288/$repo:$SHA" \
+              --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            # output key uses underscores (job-output / step-output naming)
+            key="$(echo "$repo" | tr '-' '_')"
+            echo "${key}=${digest}" >> "$GITHUB_OUTPUT"
+            echo "kasa288/$repo index digest: $digest"
+          done
+
+      - name: cosign sign multi-arch indexes (keyless)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          cosign sign --yes "kasa288/konfig@${{ steps.digests.outputs.konfig }}"
+          cosign sign --yes "kasa288/konfig-cli@${{ steps.digests.outputs.konfig_cli }}"
+          cosign sign --yes "kasa288/konfig-loadtest@${{ steps.digests.outputs.konfig_loadtest }}"
+
+      # SLSA build provenance — one attestation per multi-arch index.
+      # actions/attest-build-provenance generates a GitHub-native SLSA v1
+      # provenance predicate and (push-to-registry) stores it as a
+      # cosign-format attestation next to the image. Chosen over
+      # `cosign attest --type slsaprovenance --predicate <file>` because the
+      # action auto-derives builder id / invocation / source materials from
+      # the GH OIDC claims (SLSA L3 on isolated GH-hosted builders) — no
+      # hand-maintained predicate JSON. Three invocations: the action takes a
+      # single subject digest each.
+      - name: SLSA provenance — konfig
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: docker.io/kasa288/konfig
+          subject-digest: ${{ steps.digests.outputs.konfig }}
+          push-to-registry: true
+
+      - name: SLSA provenance — konfig-cli
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: docker.io/kasa288/konfig-cli
+          subject-digest: ${{ steps.digests.outputs.konfig_cli }}
+          push-to-registry: true
+
+      - name: SLSA provenance — konfig-loadtest
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: docker.io/kasa288/konfig-loadtest
+          subject-digest: ${{ steps.digests.outputs.konfig_loadtest }}
+          push-to-registry: true
 
       - name: Pin manifest tags to short SHA
         run: ./tools/pin-image-tags.sh "${{ steps.sha.outputs.short }}"
@@ -137,3 +265,61 @@ jobs:
                   infra/konfig-loadtest/job.yaml
           git commit -m "ci: pin image tags to ${{ steps.sha.outputs.short }} [skip publish]"
           git push origin HEAD:main
+
+  # =========================================================================
+  # DEPLOY GATE — cosign verify (CU-86aj08v23, Phase 8 Security).
+  #
+  # This job is the gate a promotion/deploy MUST pass before the pinned image
+  # is allowed into a cluster. It re-runs here as the in-CI proof; the SAME
+  # two commands belong in whatever actually rolls the Deployment:
+  #   * a pre-rollout step in a deploy workflow / ArgoCD PreSync hook, OR
+  #   * a Kyverno `verifyImages` admission policy in the cluster (the policy
+  #     equivalent of the cosign flags below — issuer + identity regex).
+  # Verification needs NO secrets and NO id-token: it pulls the signature +
+  # Fulcio cert + Rekor inclusion proof from the public log. The identity
+  # flags below are the security boundary — they assert the image was signed
+  # by THIS workflow running on main, not by any other Fulcio cert.
+  # =========================================================================
+  verify_supply_chain:
+    name: cosign verify (deploy gate)
+    needs: assemble_manifests_and_pin
+    if: "!contains(github.event.head_commit.message, '[skip publish]')"
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    env:
+      # Pin the expected signer identity. Fail closed if either drifts.
+      COSIGN_CERT_IDENTITY_REGEXP: "^https://github.com/jayakasadev/konfig/.github/workflows/publish-images.yml@refs/heads/main$"
+      COSIGN_CERT_OIDC_ISSUER: "https://token.actions.githubusercontent.com"
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify signatures + provenance on pinned indexes
+        run: |
+          set -euo pipefail
+          SHA="${{ needs.assemble_manifests_and_pin.outputs.sha }}"
+          declare -A DIGESTS=(
+            [kasa288/konfig]="${{ needs.assemble_manifests_and_pin.outputs.digest_konfig }}"
+            [kasa288/konfig-cli]="${{ needs.assemble_manifests_and_pin.outputs.digest_konfig_cli }}"
+            [kasa288/konfig-loadtest]="${{ needs.assemble_manifests_and_pin.outputs.digest_konfig_loadtest }}"
+          )
+          for repo in "${!DIGESTS[@]}"; do
+            ref="$repo@${DIGESTS[$repo]}"
+            echo "::group::verify $ref"
+            # 1. Signature: was it signed by our workflow's Fulcio identity?
+            cosign verify \
+              --certificate-identity-regexp "$COSIGN_CERT_IDENTITY_REGEXP" \
+              --certificate-oidc-issuer "$COSIGN_CERT_OIDC_ISSUER" \
+              "$ref"
+            # 2. Provenance: is there a SLSA v1 provenance attestation from the
+            #    same identity? `cosign verify-attestation` validates the
+            #    DSSE envelope + the same cert constraints.
+            cosign verify-attestation \
+              --type slsaprovenance \
+              --certificate-identity-regexp "$COSIGN_CERT_IDENTITY_REGEXP" \
+              --certificate-oidc-issuer "$COSIGN_CERT_OIDC_ISSUER" \
+              "$ref"
+            echo "::endgroup::"
+          done
+          echo "All images verified — safe to promote ${SHA}."
