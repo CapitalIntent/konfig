@@ -82,7 +82,7 @@ impl StreamDriver {
                             // immediately rather than treating it as a fault.
                         }
                         StreamEnd::Error => {
-                            self.mark_all_stale();
+                            mark_all_stale(&self.stores);
                         }
                     }
                 }
@@ -91,7 +91,7 @@ impl StreamDriver {
                         attempt,
                         "konfig-consumer: Subscribe RPC failed: {status} — marking stale"
                     );
-                    self.mark_all_stale();
+                    mark_all_stale(&self.stores);
                 }
             }
 
@@ -102,16 +102,12 @@ impl StreamDriver {
 
     /// Drain one connected stream until it ends or errors, publishing each
     /// event into the matching per-name store and advancing `resume_rv`.
-    async fn pump(
-        &self,
-        mut stream: Streaming<ConfigEvent>,
-        resume_rv: &mut String,
-    ) -> StreamEnd {
+    async fn pump(&self, mut stream: Streaming<ConfigEvent>, resume_rv: &mut String) -> StreamEnd {
         loop {
             match stream.message().await {
                 Ok(Some(event)) => {
                     self.last_event_at.touch();
-                    self.apply(event, resume_rv);
+                    apply(&self.stores, event, resume_rv);
                 }
                 Ok(None) => return StreamEnd::Clean,
                 Err(status) => {
@@ -121,70 +117,73 @@ impl StreamDriver {
             }
         }
     }
+}
 
-    /// Demux one event to its per-name store and update `resume_rv`.
-    fn apply(&self, event: ConfigEvent, resume_rv: &mut String) {
-        let event_type = event.event_type();
-        let Some(cfg) = event.config else {
-            debug!("konfig-consumer: ConfigEvent with no config payload — ignoring");
-            return;
-        };
+/// Demux one event to its per-name store and update `resume_rv`.
+///
+/// Free function (no client needed) so the demux logic is unit-testable
+/// without a `tonic` `Channel`.
+fn apply(stores: &HashMap<String, Store>, event: ConfigEvent, resume_rv: &mut String) {
+    let event_type = event.event_type();
+    let Some(cfg) = event.config else {
+        debug!("konfig-consumer: ConfigEvent with no config payload — ignoring");
+        return;
+    };
 
-        // Advance the resume cursor regardless of name match: the server
-        // streams in monotonic resource_version order, so resuming from the
-        // newest value we have seen never replays an event we already applied.
-        if !cfg.resource_version.is_empty() {
-            resume_rv.clone_from(&cfg.resource_version);
+    // Advance the resume cursor regardless of name match: the server
+    // streams in monotonic resource_version order, so resuming from the
+    // newest value we have seen never replays an event we already applied.
+    if !cfg.resource_version.is_empty() {
+        resume_rv.clone_from(&cfg.resource_version);
+    }
+
+    let Some(store) = stores.get(&cfg.name) else {
+        // Shouldn't happen — the server only streams names we asked for —
+        // but stay defensive against a future server-side fan-out change.
+        debug!(name = %cfg.name, "konfig-consumer: event for untracked name — ignoring");
+        return;
+    };
+
+    match event_type {
+        EventType::Deleted => {
+            // Retain last-known-good content (CP semantics) but record the
+            // delete in the resource_version so a resume is consistent.
+            debug!(name = %cfg.name, "konfig-consumer: DELETED — retaining last snapshot");
         }
-
-        let Some(store) = self.stores.get(&cfg.name) else {
-            // Shouldn't happen — the server only streams names we asked for —
-            // but stay defensive against a future server-side fan-out change.
-            debug!(name = %cfg.name, "konfig-consumer: event for untracked name — ignoring");
-            return;
-        };
-
-        match event_type {
-            EventType::Deleted => {
-                // Retain last-known-good content (CP semantics) but record the
-                // delete in the resource_version so a resume is consistent.
-                debug!(name = %cfg.name, "konfig-consumer: DELETED — retaining last snapshot");
-            }
-            EventType::Added | EventType::Modified | EventType::Snapshot => {
-                match snapshot_from_proto(&cfg) {
-                    Ok(snap) => {
-                        info!(
-                            name = %cfg.name,
-                            schema_version = snap.schema_version,
-                            rv = %snap.resource_version,
-                            ?event_type,
-                            "konfig-consumer: snapshot updated"
-                        );
-                        store.store(Arc::new(snap));
-                    }
-                    Err(e) => {
-                        warn!(
-                            name = %cfg.name,
-                            "konfig-consumer: dropping unparseable event, retaining previous: {e}"
-                        );
-                    }
+        EventType::Added | EventType::Modified | EventType::Snapshot => {
+            match snapshot_from_proto(&cfg) {
+                Ok(snap) => {
+                    info!(
+                        name = %cfg.name,
+                        schema_version = snap.schema_version,
+                        rv = %snap.resource_version,
+                        ?event_type,
+                        "konfig-consumer: snapshot updated"
+                    );
+                    store.store(Arc::new(snap));
+                }
+                Err(e) => {
+                    warn!(
+                        name = %cfg.name,
+                        "konfig-consumer: dropping unparseable event, retaining previous: {e}"
+                    );
                 }
             }
         }
     }
+}
 
-    /// Mark every tracked snapshot stale (connection lost). Preserves content.
-    fn mark_all_stale(&self) {
-        let now = Instant::now();
-        for store in self.stores.values() {
-            let current = store.load();
-            if current.stale_since.is_some() {
-                continue;
-            }
-            let mut next = (**current).clone();
-            next.stale_since = Some(now);
-            store.store(Arc::new(next));
+/// Mark every tracked snapshot stale (connection lost). Preserves content.
+fn mark_all_stale(stores: &HashMap<String, Store>) {
+    let now = Instant::now();
+    for store in stores.values() {
+        let current = store.load();
+        if current.stale_since.is_some() {
+            continue;
         }
+        let mut next = (**current).clone();
+        next.stale_since = Some(now);
+        store.store(Arc::new(next));
     }
 }
 
@@ -202,24 +201,19 @@ mod tests {
     use crate::proto::Config as ProtoConfig;
     use serde_json::json;
 
-    fn empty_store() -> Store {
-        Arc::new(ArcSwap::from_pointee(ConfigSnapshot::default()))
-    }
-
-    fn driver_with(names: &[&str]) -> StreamDriver {
-        // The client is never used in these unit tests (we exercise `apply` /
-        // `mark_all_stale` directly), but constructing one requires a Channel.
-        // `Channel::from_static(...).connect_lazy()` builds without any IO.
-        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
-        let stores: HashMap<String, Store> =
-            names.iter().map(|n| (n.to_string(), empty_store())).collect();
-        StreamDriver {
-            client: KonfigServiceClient::new(channel),
-            namespace: "ns".to_string(),
-            names: names.iter().map(|s| s.to_string()).collect(),
-            stores,
-            last_event_at: Arc::new(LastEventAt::new()),
-        }
+    /// Build a `name -> ArcSwap<default snapshot>` map. No `Channel`/client
+    /// needed: `apply` / `mark_all_stale` are free functions over the stores
+    /// map, so the demux logic is unit-testable without a tokio reactor.
+    fn stores_for(names: &[&str]) -> HashMap<String, Store> {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    (*n).to_string(),
+                    Arc::new(ArcSwap::from_pointee(ConfigSnapshot::default())) as Store,
+                )
+            })
+            .collect()
     }
 
     fn event(event_type: EventType, name: &str, rv: &str, content_json: &str) -> ConfigEvent {
@@ -247,75 +241,99 @@ mod tests {
 
     #[test]
     fn apply_demuxes_by_name() {
-        let driver = driver_with(&["a", "b"]);
+        let stores = stores_for(&["a", "b"]);
         let mut rv = String::new();
-        driver.apply(
+        apply(
+            &stores,
             event(EventType::Modified, "a", "10", r#"{"x": 1}"#),
             &mut rv,
         );
-        driver.apply(
+        apply(
+            &stores,
             event(EventType::Modified, "b", "11", r#"{"y": 2}"#),
             &mut rv,
         );
 
-        let a = driver.stores["a"].load();
-        let b = driver.stores["b"].load();
-        assert_eq!(a.content["x"], 1);
-        assert_eq!(b.content["y"], 2);
+        assert_eq!(stores["a"].load().content["x"], 1);
+        assert_eq!(stores["b"].load().content["y"], 2);
         assert_eq!(rv, "11", "resume cursor advances to newest rv");
     }
 
     #[test]
     fn snapshot_event_publishes() {
-        let driver = driver_with(&["a"]);
+        let stores = stores_for(&["a"]);
         let mut rv = String::new();
-        driver.apply(event(EventType::Snapshot, "a", "1", r#"{"k": 9}"#), &mut rv);
-        assert_eq!(driver.stores["a"].load().content["k"], 9);
+        apply(
+            &stores,
+            event(EventType::Snapshot, "a", "1", r#"{"k": 9}"#),
+            &mut rv,
+        );
+        assert_eq!(stores["a"].load().content["k"], 9);
     }
 
     #[test]
     fn delete_retains_last_known_good() {
-        let driver = driver_with(&["a"]);
+        let stores = stores_for(&["a"]);
         let mut rv = String::new();
-        driver.apply(event(EventType::Modified, "a", "1", r#"{"k": 5}"#), &mut rv);
-        driver.apply(event(EventType::Deleted, "a", "2", ""), &mut rv);
+        apply(
+            &stores,
+            event(EventType::Modified, "a", "1", r#"{"k": 5}"#),
+            &mut rv,
+        );
+        apply(&stores, event(EventType::Deleted, "a", "2", ""), &mut rv);
         // Content retained, cursor advanced.
-        assert_eq!(driver.stores["a"].load().content["k"], 5);
+        assert_eq!(stores["a"].load().content["k"], 5);
         assert_eq!(rv, "2");
     }
 
     #[test]
     fn unparseable_event_retains_previous() {
-        let driver = driver_with(&["a"]);
+        let stores = stores_for(&["a"]);
         let mut rv = String::new();
-        driver.apply(event(EventType::Modified, "a", "1", r#"{"k": 5}"#), &mut rv);
-        driver.apply(event(EventType::Modified, "a", "2", "not-json"), &mut rv);
-        assert_eq!(driver.stores["a"].load().content["k"], 5);
+        apply(
+            &stores,
+            event(EventType::Modified, "a", "1", r#"{"k": 5}"#),
+            &mut rv,
+        );
+        apply(
+            &stores,
+            event(EventType::Modified, "a", "2", "not-json"),
+            &mut rv,
+        );
+        assert_eq!(stores["a"].load().content["k"], 5);
     }
 
     #[test]
     fn event_for_untracked_name_ignored() {
-        let driver = driver_with(&["a"]);
+        let stores = stores_for(&["a"]);
         let mut rv = String::new();
-        driver.apply(event(EventType::Modified, "z", "1", r#"{"k": 1}"#), &mut rv);
+        apply(
+            &stores,
+            event(EventType::Modified, "z", "1", r#"{"k": 1}"#),
+            &mut rv,
+        );
         // 'a' untouched (still default null), cursor still advances.
-        assert!(driver.stores["a"].load().content.is_null());
+        assert!(stores["a"].load().content.is_null());
         assert_eq!(rv, "1");
     }
 
     #[test]
     fn mark_all_stale_sets_then_preserves() {
-        let driver = driver_with(&["a", "b"]);
+        let stores = stores_for(&["a", "b"]);
         let mut rv = String::new();
-        driver.apply(event(EventType::Modified, "a", "1", r#"{"k": 1}"#), &mut rv);
-        driver.mark_all_stale();
-        let a = driver.stores["a"].load();
+        apply(
+            &stores,
+            event(EventType::Modified, "a", "1", r#"{"k": 1}"#),
+            &mut rv,
+        );
+        mark_all_stale(&stores);
+        let a = stores["a"].load();
         assert!(a.stale_since.is_some());
         assert_eq!(a.content["k"], 1, "content preserved while stale");
         let first = a.stale_since;
         // Second mark is a no-op (already stale) — instant unchanged.
-        driver.mark_all_stale();
-        assert_eq!(driver.stores["a"].load().stale_since, first);
+        mark_all_stale(&stores);
+        assert_eq!(stores["a"].load().stale_since, first);
         let _ = json!({}); // keep serde_json import used in all cfgs
     }
 }

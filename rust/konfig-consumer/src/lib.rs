@@ -111,9 +111,7 @@ impl KonfigClient {
         endpoint: impl Into<String>,
         tls: ClientTlsConfig,
     ) -> Result<Self, ClientError> {
-        let channel = Self::endpoint(endpoint)?
-            .tls_config(tls)?
-            .connect_lazy();
+        let channel = Self::endpoint(endpoint)?.tls_config(tls)?.connect_lazy();
         Ok(Self::new(channel))
     }
 
