@@ -3,7 +3,7 @@
 //! The consumer crate does NOT touch the default Prometheus registry — callers
 //! must hand us a `prometheus::Registry` they own (so consumer pods can keep
 //! all their metrics in a single registry and avoid double-registration when
-//! more than one `KonfigConsumer` is spun up in-process).
+//! more than one config stream is driven in-process).
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -19,17 +19,17 @@ pub enum MetricsError {
 
 /// Register `konfig_stale_seconds` on the supplied registry and return the
 /// gauge handle.  Caller is expected to hold the returned `Gauge` for the
-/// lifetime of the watcher (the watcher loop writes it).
+/// lifetime of the stream (the sampler task writes it).
 pub fn register_stale_seconds(registry: &Registry) -> Result<Gauge, MetricsError> {
     let gauge = Gauge::with_opts(Opts::new(
         "konfig_stale_seconds",
-        "Seconds since the konfig watcher last received an event (0 = active / fresh)",
+        "Seconds since the konfig stream last received an event (0 = active / fresh)",
     ))?;
     registry.register(Box::new(gauge.clone()))?;
     Ok(gauge)
 }
 
-/// Shared timestamp of the most recent successfully-received watch event.
+/// Shared timestamp of the most recent successfully-received stream event.
 ///
 /// `None` = cold start (no event yet) — sampler treats this as 0.0 staleness.
 #[derive(Default, Debug)]
@@ -41,7 +41,7 @@ impl LastEventAt {
     }
 
     /// Record an event was just received.  Also clears any "stale" state
-    /// (the watcher uses `clear` on disconnect to make `elapsed_secs` grow
+    /// (the stream driver re-touches on every event so `elapsed_secs` grows
     /// from the disconnect instant rather than the last event instant).
     pub fn touch(&self) {
         *self.0.lock().expect("LastEventAt poisoned") = Some(Instant::now());
