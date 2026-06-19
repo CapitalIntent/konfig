@@ -1,29 +1,32 @@
-//! Owned snapshot of a single `Config.konfig.io/v1` CRD spec.
+//! Owned snapshot of a single `Config` as delivered over the konfig gRPC
+//! `Subscribe` stream.
 //!
-//! Lives behind `ArcSwap<ConfigSnapshot>` inside `KonfigConsumer` so reads are
-//! lock-free.  `content` is `serde_json::Value` so callers can do
+//! Lives behind `ArcSwap<ConfigSnapshot>` inside each [`crate::ConfigHandle`]
+//! so reads are lock-free. `content` is `serde_json::Value` (parsed once from
+//! the proto `content_json`) so callers can do
 //! `snap.content["risk"]["max"].as_u64()` without re-parsing on every access.
 
 use std::time::Instant;
 
-use kube::core::DynamicObject;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::proto::Config as ProtoConfig;
+
 #[derive(Debug, Error)]
 pub enum ParseError {
-    #[error("missing spec field on Config object")]
-    MissingSpec,
-    #[error("invalid spec JSON: {0}")]
-    InvalidSpec(#[from] serde_json::Error),
+    #[error("invalid content_json: {0}")]
+    InvalidContent(#[from] serde_json::Error),
 }
 
 fn default_content() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
+/// Logical spec carried by a Config: the monotonic schema version plus the
+/// arbitrary JSON content the consumer defines.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigSpec {
     pub schema_version: u32,
@@ -31,13 +34,19 @@ pub struct ConfigSpec {
     pub content: Value,
 }
 
+/// Immutable, lock-free-readable view of one Config at a point in time.
+///
+/// Published into a per-name `ArcSwap` by the stream driver task; read via
+/// [`crate::ConfigHandle::get`] (an `ArcSwap::load_full`).
 #[derive(Debug, Clone)]
 pub struct ConfigSnapshot {
     pub content: Value,
     pub schema_version: u32,
     pub resource_version: String,
     pub loaded_at: Instant,
-    /// Set when the watcher loses its K8s connection; cleared on reconnect.
+    /// Set when the stream driver loses its connection to the konfig service;
+    /// cleared on the next successfully-received event. Mirrors the server's
+    /// `Config.stale_since_ms` semantics.
     pub stale_since: Option<Instant>,
 }
 
@@ -82,60 +91,59 @@ impl ConfigSnapshot {
     }
 }
 
-/// Parse a `DynamicObject` (Config CRD) into a `ConfigSnapshot`.
+/// Parse a proto [`ProtoConfig`] (as delivered in a `ConfigEvent`) into a
+/// [`ConfigSnapshot`].
 ///
-/// Returns `None` if the spec is missing or fails to deserialise — caller
-/// retains the previous snapshot in that case (CP semantics).
-pub fn parse_config_object(obj: &DynamicObject) -> Option<ConfigSnapshot> {
-    let resource_version = obj.metadata.resource_version.clone().unwrap_or_default();
-    let name = obj.metadata.name.as_deref().unwrap_or("<unknown>");
-
-    let spec_value = obj.data.get("spec")?;
-    let spec: ConfigSpec = match serde_json::from_value(spec_value.clone()) {
-        Ok(spec) => spec,
-        Err(e) => {
-            warn!(name = %name, "konfig-consumer: failed to parse Config spec: {e}");
-            return None;
+/// Returns `Err` if `content_json` is non-empty but fails to parse as JSON —
+/// the stream driver retains the previous snapshot in that case (CP
+/// semantics). An empty `content_json` parses to an empty JSON object.
+pub fn snapshot_from_proto(cfg: &ProtoConfig) -> Result<ConfigSnapshot, ParseError> {
+    let content = if cfg.content_json.is_empty() {
+        default_content()
+    } else {
+        match serde_json::from_str(&cfg.content_json) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    namespace = %cfg.namespace,
+                    name = %cfg.name,
+                    "konfig-consumer: failed to parse content_json: {e}"
+                );
+                return Err(ParseError::InvalidContent(e));
+            }
         }
     };
 
-    Some(ConfigSnapshot::from_spec(spec, resource_version))
+    Ok(ConfigSnapshot {
+        content,
+        schema_version: cfg.schema_version,
+        resource_version: cfg.resource_version.clone(),
+        loaded_at: Instant::now(),
+        stale_since: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kube::api::ApiResource;
     use serde_json::json;
 
-    fn ar() -> ApiResource {
-        ApiResource {
-            group: "konfig.io".to_string(),
-            version: "v1".to_string(),
-            api_version: "konfig.io/v1".to_string(),
-            kind: "Config".to_string(),
-            plural: "configs".to_string(),
+    fn proto(name: &str, schema_version: u32, content_json: &str) -> ProtoConfig {
+        ProtoConfig {
+            namespace: "default".to_string(),
+            name: name.to_string(),
+            schema_version,
+            content_json: content_json.to_string(),
+            resource_version: "rv-7".to_string(),
+            age_ms: 0,
+            stale_since_ms: -1,
         }
     }
 
-    fn make_obj(name: &str, schema_version: u32, content: Value) -> DynamicObject {
-        let mut obj = DynamicObject::new(name, &ar());
-        obj.metadata.name = Some(name.to_string());
-        obj.metadata.namespace = Some("default".to_string());
-        obj.metadata.resource_version = Some("rv-7".to_string());
-        obj.data = json!({
-            "spec": {
-                "schema_version": schema_version,
-                "content": content,
-            }
-        });
-        obj
-    }
-
     #[test]
-    fn parse_valid_object() {
-        let obj = make_obj("risk-config", 5, json!({"risk": {"max": 100}}));
-        let snap = parse_config_object(&obj).expect("parses");
+    fn parse_valid_proto() {
+        let cfg = proto("risk-config", 5, r#"{"risk": {"max": 100}}"#);
+        let snap = snapshot_from_proto(&cfg).expect("parses");
         assert_eq!(snap.schema_version, 5);
         assert_eq!(snap.content["risk"]["max"], 100);
         assert_eq!(snap.resource_version, "rv-7");
@@ -143,26 +151,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_missing_spec_returns_none() {
-        let mut obj = DynamicObject::new("x", &ar());
-        obj.data = json!({});
-        assert!(parse_config_object(&obj).is_none());
-    }
-
-    #[test]
-    fn parse_default_content_when_field_missing() {
-        let mut obj = DynamicObject::new("x", &ar());
-        obj.data = json!({"spec": {"schema_version": 2}});
-        let snap = parse_config_object(&obj).expect("parses");
+    fn empty_content_json_yields_empty_object() {
+        let cfg = proto("x", 2, "");
+        let snap = snapshot_from_proto(&cfg).expect("parses");
         assert_eq!(snap.schema_version, 2);
         assert!(snap.content.is_object());
     }
 
     #[test]
-    fn parse_invalid_spec_returns_none() {
-        let mut obj = DynamicObject::new("x", &ar());
-        obj.data = json!({"spec": {"schema_version": "not-a-number"}});
-        assert!(parse_config_object(&obj).is_none());
+    fn invalid_content_json_returns_err() {
+        let cfg = proto("x", 1, "not-json");
+        assert!(snapshot_from_proto(&cfg).is_err());
     }
 
     #[test]
@@ -171,5 +170,17 @@ mod tests {
         assert_eq!(snap.content["k"], 1);
         assert_eq!(snap.schema_version, 0);
         assert!(snap.stale_since.is_none());
+    }
+
+    #[test]
+    fn from_spec_carries_fields() {
+        let spec = ConfigSpec {
+            schema_version: 9,
+            content: json!({"a": true}),
+        };
+        let snap = ConfigSnapshot::from_spec(spec, "rv-9".to_string());
+        assert_eq!(snap.schema_version, 9);
+        assert_eq!(snap.content["a"], true);
+        assert_eq!(snap.resource_version, "rv-9");
     }
 }

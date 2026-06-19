@@ -1434,13 +1434,15 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "futures-util",
- "k8s-openapi",
- "kube",
  "prometheus",
+ "prost 0.14.4",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tonic 0.14.6",
+ "tonic-prost",
+ "tonic-prost-build",
  "tracing",
 ]
 

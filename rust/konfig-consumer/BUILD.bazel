@@ -1,4 +1,21 @@
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
 load("@rules_rust//rust:defs.bzl", "rust_clippy", "rust_doc", "rust_doc_test", "rust_library", "rust_test", "rustfmt_test")
+
+# Client-only proto codegen for the konfig gRPC `Subscribe` RPC. Mirrors
+# //rust/konfig:konfig_bs but with build_server(false) (see build.rs). The
+# proto source is staged into the sandbox at ../../proto/konfig/v1/... via the
+# `data` dep, matching the relative path build.rs passes to tonic-prost-build
+# when CARGO_MANIFEST_DIR = <execroot>/rust/konfig-consumer.
+cargo_build_script(
+    name = "konfig_consumer_bs",
+    srcs = ["build.rs"],
+    build_script_env = {
+        "PROTOC": "$(execpath @protobuf//:protoc)",
+    },
+    data = ["//proto/konfig/v1:konfig_service.proto"],
+    tools = ["@protobuf//:protoc"],
+    deps = ["@konfig_crates//:tonic-prost-build"],
+)
 
 rust_library(
     name = "konfig_consumer",
@@ -6,15 +23,17 @@ rust_library(
     tags = ["konfig", "konfig-consumer", "rust"],
     visibility = ["//visibility:public"],
     deps = [
+        ":konfig_consumer_bs",
         "@konfig_crates//:arc-swap",
         "@konfig_crates//:futures-util",
-        "@konfig_crates//:k8s-openapi",
-        "@konfig_crates//:kube",
         "@konfig_crates//:prometheus",
+        "@konfig_crates//:prost",
         "@konfig_crates//:serde",
         "@konfig_crates//:serde_json",
         "@konfig_crates//:thiserror",
         "@konfig_crates//:tokio",
+        "@konfig_crates//:tonic",
+        "@konfig_crates//:tonic-prost",
         "@konfig_crates//:tracing",
     ],
 )
