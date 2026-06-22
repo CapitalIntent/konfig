@@ -241,7 +241,7 @@ fn record_status<T>(result: Result<T, Status>) -> Result<T, Status> {
 /// Best-effort extraction of the incoming `schema_version` from an `Apply`
 /// request's YAML body, for the audit record (CU-86ahrwd6h). Returns `None`
 /// when the YAML does not parse as a `ConfigSpec` — the authoritative parse
-/// + error happens inside `apply::handle_apply`; this is a cheap read-ahead
+/// and its error live in `apply::handle_apply`; this is a cheap read-ahead
 /// that must never affect the RPC outcome.
 fn parse_config_schema_version(yaml_content: &str) -> Option<u32> {
     serde_yaml::from_str::<crate::types::ConfigSpec>(yaml_content)
