@@ -20,6 +20,7 @@
 
 pub mod apply;
 pub mod audit;
+pub mod authz;
 pub mod get;
 pub mod identity;
 pub mod revert;
@@ -43,7 +44,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+use crate::acl::{AclSynced, AclTable};
 use crate::cache::ConfigCache;
+use crate::grpc::authz::{Mode as AuthzMode, Verb};
 use crate::grpc::subscribe::{
     MAX_BROADCAST_SHARDS, MIN_BROADCAST_SHARDS, ReplayBuffer, ShardSet, gc_task,
 };
@@ -125,6 +128,17 @@ pub struct ServerConfig {
     /// to one (round-robin), so an event wakes only ~1/N of subscribers. The
     /// shared replay buffer is intentionally NOT sharded.
     pub broadcast_shards: usize,
+    /// Per-tenant authorization mode (CU-86ahrwd6f). Resolved once from
+    /// `KONFIG_AUTHZ_MODE` at startup; `Disabled` (the default) makes every
+    /// RPC's authz guard a zero-overhead short-circuit.
+    pub authz_mode: AuthzMode,
+    /// Lock-free `identity → rules` ACL table populated by the cluster-scoped
+    /// `ConfigACL` watcher. Read by the per-RPC authz guard.
+    pub acl_table: Arc<AclTable>,
+    /// Initial-sync flag for `acl_table`. In `Enforce`, the guard returns
+    /// `UNAVAILABLE` until this flips `true` so the boot window cannot serve
+    /// un-authorized.
+    pub acl_synced: Arc<AclSynced>,
 }
 
 /// Type-erased shutdown future.  Boxed so the field doesn't push a generic
@@ -173,6 +187,14 @@ pub struct KonfigServer {
     /// effect when a namespace's `ShardSet` is first created. `1` = historical
     /// single-channel path.
     pub(crate) broadcast_shards: usize,
+    /// Per-tenant authorization mode (CU-86ahrwd6f). `Disabled` short-circuits
+    /// the guard before any ACL/identity work.
+    pub(crate) authz_mode: AuthzMode,
+    /// Lock-free `identity → rules` ACL table read by [`Self::authorize`].
+    pub(crate) acl_table: Arc<AclTable>,
+    /// Initial-sync flag for [`Self::acl_table`]; gates the enforce-mode
+    /// fail-safe.
+    pub(crate) acl_synced: Arc<AclSynced>,
 }
 
 impl KonfigServer {
@@ -204,6 +226,40 @@ impl KonfigServer {
     /// `notified().await` to detect drain.
     pub(crate) fn drain_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.drain_notify)
+    }
+
+    /// Per-tenant authorization guard (CU-86ahrwd6f). Called at the top of each
+    /// RPC handler, after `check_drain`, mirroring `log_rpc_entry`/`check_drain`.
+    ///
+    /// Extracts the mTLS [`identity::ClientIdentity`] from the request and
+    /// defers to [`authz::check`] with this server's mode + ACL table + sync
+    /// flag. In `Disabled` (the default) `check` short-circuits before any
+    /// identity work; only then does this method skip the cert parse too, so
+    /// the disabled path stays zero-overhead.
+    ///
+    /// `name` is `"*"` for the name-less RPCs (`get_all`/`subscribe`/…): they
+    /// require the verb across the whole namespace, which a `default/*`-style
+    /// pattern grants and a single-name pattern does not.
+    fn authorize<T>(
+        &self,
+        request: &Request<T>,
+        verb: Verb,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), Status> {
+        if self.authz_mode == AuthzMode::Disabled {
+            return Ok(());
+        }
+        let identity = identity::extract_identity(request);
+        authz::check(
+            self.authz_mode,
+            &self.acl_table,
+            self.acl_synced.is_synced(),
+            &identity,
+            verb,
+            namespace,
+            name,
+        )
     }
 }
 
@@ -371,6 +427,12 @@ impl KonfigService for KonfigServer {
             Some(&request.get_ref().name),
         );
         check_drain(&self.draining)?;
+        self.authorize(
+            &request,
+            Verb::Read,
+            &request.get_ref().namespace,
+            &request.get_ref().name,
+        )?;
         record_status(get::handle_get(Arc::clone(&self.cache), request.into_inner()).await)
     }
 
@@ -392,6 +454,8 @@ impl KonfigService for KonfigServer {
             None,
         );
         check_drain(&self.draining)?;
+        // Name-less RPC: require `read` across the whole namespace ("*").
+        self.authorize(&request, Verb::Read, &request.get_ref().namespace, "*")?;
         record_status(get::handle_get_all(Arc::clone(&self.cache), request.into_inner()).await)
     }
 
@@ -411,6 +475,12 @@ impl KonfigService for KonfigServer {
             Some(&request.get_ref().name),
         );
         check_drain(&self.draining)?;
+        self.authorize(
+            &request,
+            Verb::Write,
+            &request.get_ref().namespace,
+            &request.get_ref().name,
+        )?;
 
         // Audit (CU-86ahrwd6h): capture identity + request facets before
         // `into_inner()` consumes the request, run the handler, emit the record.
@@ -454,6 +524,12 @@ impl KonfigService for KonfigServer {
             Some(&request.get_ref().namespace),
             Some(&request.get_ref().name),
         );
+        self.authorize(
+            &request,
+            Verb::Write,
+            &request.get_ref().namespace,
+            &request.get_ref().name,
+        )?;
 
         // Audit (CU-86ahrwd6h). Revert derives its new schema_version
         // server-side, so the request carries none — `schema_version: None`.
@@ -499,6 +575,8 @@ impl KonfigService for KonfigServer {
             None,
         );
         check_drain(&self.draining)?;
+        // Name-less RPC: require `read` across the whole namespace ("*").
+        self.authorize(&request, Verb::Read, &request.get_ref().namespace, "*")?;
         record_status(
             subscribe::handle_subscribe(
                 Arc::clone(&self.cache),
@@ -533,6 +611,12 @@ impl KonfigService for KonfigServer {
             Some(&request.get_ref().name),
         );
         check_drain(&self.draining)?;
+        self.authorize(
+            &request,
+            Verb::Read,
+            &request.get_ref().namespace,
+            &request.get_ref().name,
+        )?;
         record_status(
             secret_get::handle_get_secret(Arc::clone(&self.secret_cache), request.into_inner())
                 .await,
@@ -557,6 +641,8 @@ impl KonfigService for KonfigServer {
             None,
         );
         check_drain(&self.draining)?;
+        // Name-less RPC: require `read` across the whole namespace ("*").
+        self.authorize(&request, Verb::Read, &request.get_ref().namespace, "*")?;
         record_status(
             secret_get::handle_get_all_secrets(
                 Arc::clone(&self.secret_cache),
@@ -582,6 +668,12 @@ impl KonfigService for KonfigServer {
             Some(&request.get_ref().name),
         );
         check_drain(&self.draining)?;
+        self.authorize(
+            &request,
+            Verb::Write,
+            &request.get_ref().namespace,
+            &request.get_ref().name,
+        )?;
 
         // Audit (CU-86ahrwd6h).
         let identity = identity::extract_identity(&request);
@@ -628,6 +720,8 @@ impl KonfigService for KonfigServer {
             None,
         );
         check_drain(&self.draining)?;
+        // Name-less RPC: require `read` across the whole namespace ("*").
+        self.authorize(&request, Verb::Read, &request.get_ref().namespace, "*")?;
         record_status(
             subscribe_secrets::handle_subscribe_secrets(
                 self.kube_client.clone(),
@@ -760,6 +854,8 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
     let draining = Arc::new(AtomicBool::new(false));
     let drain_notify = Arc::new(Notify::new());
 
+    info!(authz_mode = ?cfg.authz_mode, "per-tenant authorization mode");
+
     let server = KonfigServer {
         cache: cfg.cache,
         secret_cache: cfg.secret_cache,
@@ -772,6 +868,9 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         drain_notify: Arc::clone(&drain_notify),
         coalesce_window: cfg.coalesce_window,
         broadcast_shards,
+        authz_mode: cfg.authz_mode,
+        acl_table: cfg.acl_table,
+        acl_synced: cfg.acl_synced,
     };
     let svc = KonfigServiceServer::new(server);
 
@@ -1226,6 +1325,11 @@ mod tests {
             drain_notify: Arc::new(Notify::new()),
             coalesce_window: Duration::ZERO,
             broadcast_shards: 1,
+            // Authz disabled in the drain-plumbing tests — the guard
+            // short-circuits, so these tests exercise the original path.
+            authz_mode: AuthzMode::Disabled,
+            acl_table: Arc::new(AclTable::new()),
+            acl_synced: Arc::new(AclSynced::new()),
         }
     }
 

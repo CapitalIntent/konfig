@@ -1,0 +1,65 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: configacls.konfig.io
+  annotations:
+    # Establish before the Deployment so the cluster-scoped ConfigACL watcher
+    # (CU-86ahrwd6f) does not panic at startup, same as configs.konfig.io.
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  group: konfig.io
+  # Cluster-scoped: a ConfigACL grants a client identity access to
+  # `<namespace>/<name>` targets across the cluster, so the object itself is
+  # not namespaced. The watcher uses Api::all_with (vs Api::namespaced_with for
+  # Config). RBAC: see clusterrole.yaml (configacls get/list/watch).
+  scope: Cluster
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - identity
+              properties:
+                identity:
+                  type: string
+                  description: >-
+                    Client identity this ACL grants for. Must equal the
+                    ClientIdentity the server derives from the presented mTLS
+                    leaf cert — the first SAN URI (e.g. a SPIFFE id) or, absent
+                    that, the Subject CN.
+                rules:
+                  type: array
+                  description: >-
+                    Grant rules. A request is allowed when some rule lists its
+                    verb AND one of the rule's patterns matches its
+                    "<namespace>/<name>".
+                  items:
+                    type: object
+                    properties:
+                      verbs:
+                        type: array
+                        description: Subset of [read, write]. Unknown verbs are ignored.
+                        items:
+                          type: string
+                          enum: ["read", "write"]
+                      patterns:
+                        type: array
+                        description: >-
+                          "<namespace>/<name>" globs. '*' wildcards a whole
+                          segment ("default/*" = any name in default; "*/*" =
+                          everything). Name-less RPCs (GetAll/Subscribe/...)
+                          check the verb on "<namespace>/*".
+                        items:
+                          type: string
+  names:
+    plural: configacls
+    singular: configacl
+    kind: ConfigACL
+    shortNames:
+      - cacl
