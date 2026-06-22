@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Production HA overlay. Install: kubectl apply -k infra/konfig-prod
+#
+# Lives as a SIBLING of the base (infra/konfig/) rather than inside it:
+# Kustomize rejects an overlay nested under the directory it references as a
+# base ("cycle detected"), and restructuring the base into its own subdir
+# would break the `//infra/konfig:manifests` glob and every
+# `kubectl apply -k infra/konfig/` reference in the docs.
+#
+# The base intentionally ships replicas: 1 for accurate per-pod load-test
+# profiling (project rule). This overlay is the sanctioned HA path per
+# ADR-0001 (Kustomize overlays replace the deleted Helm chart): it bumps the
+# Deployment to 2 replicas. The base already provides:
+#   * podAntiAffinity (preferred, hostname topology) — spreads the 2 pods
+#   * PodDisruptionBudget maxUnavailable: 1 — rolling, drain-safe disruption
+# so no further patches are needed for HA-safe rollout + node drain.
+
+resources:
+  - ../konfig
+
+patches:
+  - target:
+      kind: Deployment
+      name: konfig
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2

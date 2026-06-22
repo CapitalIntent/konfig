@@ -4,7 +4,9 @@ metadata:
   name: konfig
   namespace: konfig-system
 spec:
-  # 1 replica for load testing (per project rule); HA deploys override via Helm.
+  # 1 replica for load testing (per project rule — accurate per-pod profiling).
+  # HA deploys use the Kustomize overlay `infra/konfig-prod` (replicas: 2), per
+  # ADR-0001 (raw YAML + Kustomize, not Helm): kubectl apply -k infra/konfig-prod
   replicas: 1
   strategy:
     type: RollingUpdate
