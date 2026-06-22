@@ -29,6 +29,10 @@ tonic = {version = "0.14.6", features = ["tls-ring"]}
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tracing = {version = "0.1.44", features = ["attributes", "log", "async-await"]}
+# mTLS client-identity extraction (Phase 8, CU-86ahrwd6h). Parses the peer
+# leaf cert presented on the gRPC mTLS handshake to derive a client identity
+# (SAN URI → Subject CN → "anonymous") for the audit log + later authz.
+x509-parser = "0.18.1"
 
 [profile.release]
 lto = "fat"

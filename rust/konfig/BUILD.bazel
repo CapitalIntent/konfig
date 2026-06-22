@@ -61,6 +61,7 @@ rust_library(
         "@konfig_crates//:tracing-appender",
         "@konfig_crates//:tracing-opentelemetry",
         "@konfig_crates//:tracing-subscriber",
+        "@konfig_crates//:x509-parser",
     ],
     proc_macro_deps = ["@konfig_crates//:async-trait"],
 )
@@ -120,6 +121,7 @@ rust_library(
         "@konfig_crates//:tracing-appender",
         "@konfig_crates//:tracing-opentelemetry",
         "@konfig_crates//:tracing-subscriber",
+        "@konfig_crates//:x509-parser",
         # Profiling-build allocator (jayakasadev fork) — required by the
         # `/debug/heap-profile.pprof` handler. The C archive carries
         # `SNMALLOC_PROFILE=ON` and the Rust surface exposes
