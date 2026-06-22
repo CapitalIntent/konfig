@@ -1,0 +1,5 @@
+filegroup(
+    name = "manifests",
+    srcs = glob(["*.yaml"]) + ["//infra/konfig:manifests"],
+    visibility = ["//visibility:public"],
+)

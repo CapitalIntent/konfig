@@ -4,7 +4,13 @@ metadata:
   name: konfig
   namespace: konfig-system
 spec:
-  maxUnavailable: 0
+  # maxUnavailable: 1 (NOT 0). A PDB of maxUnavailable:0 sets allowedDisruptions
+  # to 0 permanently, so `kubectl drain` / node upgrades / autoscaler scale-down
+  # can never voluntarily evict a konfig pod — the drain hangs forever. With
+  # maxUnavailable:1 the single-replica base can still be drained (brief gap,
+  # acceptable for dev/loadtest), and the infra/konfig-prod 2-replica deploy
+  # gets proper rolling disruption (one pod at a time, no full outage).
+  maxUnavailable: 1
   selector:
     matchLabels:
       app: konfig
