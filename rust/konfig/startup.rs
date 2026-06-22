@@ -30,7 +30,9 @@ use tokio::sync::{broadcast, oneshot};
 use tonic::transport::ServerTlsConfig;
 use tracing::info;
 
+use crate::acl::{AclSynced, AclTable, AclWatcher};
 use crate::cache::ConfigCache;
+use crate::grpc::authz::Mode as AuthzMode;
 use crate::grpc::tls::{TlsPaths, build_server_tls_config, warn_tls_disabled};
 use crate::grpc::{ServerConfig, serve};
 use crate::metrics::{LastEventAtMap, last_event_at_for, spawn_tokio_runtime_sampler};
@@ -247,6 +249,34 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .await;
     });
 
+    // Spawn the cluster-scoped ConfigACL watcher (CU-86ahrwd6f). It populates
+    // the per-tenant ACL table read by the gRPC authz guard and flips the
+    // `acl_synced` flag once its initial list completes. Resolve the mode once;
+    // when `Disabled` (the default) the guard short-circuits, but we still run
+    // the watcher so flipping `KONFIG_AUTHZ_MODE` to permissive/enforce via a
+    // rolling restart finds a warm, synced table.
+    let authz_mode = AuthzMode::from_env();
+    let acl_table = Arc::new(AclTable::new());
+    let acl_synced = Arc::new(AclSynced::new());
+    {
+        let acl_client = kube_client.clone();
+        let acl_table = Arc::clone(&acl_table);
+        let acl_synced = Arc::clone(&acl_synced);
+        tokio::spawn(async move {
+            run_with_reconnect(
+                "configacl",
+                // ConfigACL is cluster-scoped — no namespace; pass empty.
+                String::new(),
+                || {},
+                |_attempt| {
+                    AclWatcher::new(acl_client.clone())
+                        .run(Arc::clone(&acl_table), Arc::clone(&acl_synced))
+                },
+            )
+            .await;
+        });
+    }
+
     // Spawn Secret namespace watchers.
     let secret_namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>> =
         Arc::new(DashMap::with_capacity(NAMESPACE_MAP_INITIAL_CAPACITY));
@@ -321,6 +351,9 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         h2_max_concurrent_streams: args.h2_max_concurrent_streams,
         coalesce_window: std::time::Duration::from_millis(args.coalesce_window_ms),
         broadcast_shards: args.broadcast_shards,
+        authz_mode,
+        acl_table,
+        acl_synced,
     })
     .await?;
 

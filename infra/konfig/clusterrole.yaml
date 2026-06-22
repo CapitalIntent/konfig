@@ -6,6 +6,12 @@ rules:
   - apiGroups: ["konfig.io"]
     resources: ["configs"]
     verbs: ["get", "list", "watch", "patch", "create"]
+  # Per-tenant authz (CU-86ahrwd6f): the cluster-scoped ConfigACL watcher needs
+  # to list/watch ConfigACLs across the whole cluster. Read-only — konfig never
+  # mutates ACLs, operators manage them out-of-band.
+  - apiGroups: ["konfig.io"]
+    resources: ["configacls"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch"]

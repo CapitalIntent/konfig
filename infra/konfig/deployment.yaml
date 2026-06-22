@@ -177,6 +177,32 @@ spec:
             # ----------------------------------------------------------------
             - name: KONFIG_AUDIT_K8S_EVENTS
               value: "false"
+            # ----------------------------------------------------------------
+            # Per-tenant authorization (Phase 8 PR2: CU-86ahrwd6f).
+            #
+            # Binds the mTLS client identity to a cluster-scoped ConfigACL so a
+            # valid cert no longer grants full read/write to every
+            # (namespace, name). Modes:
+            #   disabled   (DEFAULT) — guard short-circuits; every RPC allowed,
+            #                          zero overhead. The pre-rollout default.
+            #   permissive            — evaluate + log would-deny via the audit
+            #                          path, but ALLOW. Use to size the blast
+            #                          radius from logs before enforcing.
+            #   enforce               — deny (PERMISSION_DENIED) on no match;
+            #                          anonymous (no/unparseable cert) is denied.
+            #
+            # Rollout order (do NOT jump straight to enforce):
+            #   1. Create ConfigACLs for every client identity FIRST. enforce
+            #      with no ACLs denies everything (anonymous + unmatched).
+            #   2. Set "permissive", redeploy, watch the konfig::authz::audit
+            #      would-deny log lines until they reach zero.
+            #   3. Set "enforce", redeploy. During the boot window before the
+            #      ACL cache syncs, enforce returns UNAVAILABLE (never allow,
+            #      never deny-by-default-panic) so clients retry, not bypass.
+            # Unset / unknown values resolve to "disabled".
+            # ----------------------------------------------------------------
+            - name: KONFIG_AUTHZ_MODE
+              value: "disabled"
           ports:
             - name: grpc
               containerPort: 50051

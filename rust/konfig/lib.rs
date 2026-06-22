@@ -3,6 +3,7 @@
 //! # Modules
 //!
 //! - [`types`] — `ConfigSnapshot`, `ConfigSpec`, `SecretSnapshot`
+//! - [`acl`] — cluster-scoped `ConfigACL.konfig.io/v1` table + watcher (authz)
 //! - [`cache`] — DashMap-backed multi-key lock-free config cache
 //! - [`secret_cache`] — DashMap-backed multi-key lock-free secret cache
 //! - [`watcher`] — kube-rs watcher for `Config.konfig.io/v1` CRDs
@@ -12,6 +13,7 @@
 //! - [`import`] — CLI helper: onboard existing ConfigMaps as Config CRDs
 //! - [`telemetry`] — optional OTLP/gRPC trace export (tracing-opentelemetry bridge)
 
+pub mod acl;
 pub mod cache;
 pub mod cache_key;
 pub mod configmap_watcher;
