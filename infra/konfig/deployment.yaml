@@ -163,6 +163,20 @@ spec:
             # human-readable local dev.
             - name: RUST_LOG_FORMAT
               value: "json"
+            # ----------------------------------------------------------------
+            # Audit log (Phase 8: CU-86ahrwd6h).
+            #
+            # Every mutating RPC (Apply / ApplySecret / Revert) ALWAYS writes
+            # one JSON audit line to stdout (who/what/result) — that sink is
+            # unconditional and not governed by this flag.
+            #
+            # KONFIG_AUDIT_K8S_EVENTS additionally mirrors each audit record as
+            # a Kubernetes Event on the affected namespace. OFF by default
+            # ("false"): Events add etcd write load and require the pod's
+            # ServiceAccount to hold create on events. Set "true" to enable.
+            # ----------------------------------------------------------------
+            - name: KONFIG_AUDIT_K8S_EVENTS
+              value: "false"
           ports:
             - name: grpc
               containerPort: 50051

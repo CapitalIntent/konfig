@@ -84,6 +84,9 @@ tokio-stream = "0.1"
 tonic = {workspace = true}
 tonic-health = "0.14.6"
 tracing = {workspace = true}
+# Peer-cert identity extraction for the audit log (CU-86ahrwd6h). Parses the
+# DER leaf cert from `tonic::Request::peer_certs` to read SAN URI / Subject CN.
+x509-parser = {workspace = true}
 # `json` feature: `RUST_LOG_FORMAT=json` selects the JSON event encoder for
 # log aggregation (CU-86ahrwd64); the default human format keeps `env-filter`.
 tracing-subscriber = {version = "0.3", features = ["env-filter", "json"]}

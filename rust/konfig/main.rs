@@ -163,7 +163,9 @@ fn init_tracing() -> Result<Option<SdkTracerProvider>, Box<dyn std::error::Error
     // same `make_writer` (sync vs non-blocking, gated by `KONFIG_LOG_SYNC`)
     // and compose identically with the optional OTEL layer below.
     let json_logs = telemetry::log_format_is_json(
-        std::env::var(telemetry::RUST_LOG_FORMAT_ENV).ok().as_deref(),
+        std::env::var(telemetry::RUST_LOG_FORMAT_ENV)
+            .ok()
+            .as_deref(),
     );
     let fmt_layer = if json_logs {
         tracing_subscriber::fmt::layer()

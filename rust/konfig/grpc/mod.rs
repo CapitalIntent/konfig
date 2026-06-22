@@ -19,7 +19,9 @@
 //! orchestrate the transitions then call `Server::serve_with_shutdown`.
 
 pub mod apply;
+pub mod audit;
 pub mod get;
+pub mod identity;
 pub mod revert;
 pub mod secret_apply;
 pub mod secret_get;
@@ -236,6 +238,27 @@ fn record_status<T>(result: Result<T, Status>) -> Result<T, Status> {
     result
 }
 
+/// Best-effort extraction of the incoming `schema_version` from an `Apply`
+/// request's YAML body, for the audit record (CU-86ahrwd6h). Returns `None`
+/// when the YAML does not parse as a `ConfigSpec` — the authoritative parse
+/// and its error live in `apply::handle_apply`; this is a cheap read-ahead
+/// that must never affect the RPC outcome.
+fn parse_config_schema_version(yaml_content: &str) -> Option<u32> {
+    serde_yaml::from_str::<crate::types::ConfigSpec>(yaml_content)
+        .ok()
+        .map(|spec| spec.schema_version)
+}
+
+/// Best-effort extraction of the incoming `schema_version` from an
+/// `ApplySecret` request's YAML body (a `key→value` string map with a
+/// `schema_version` entry), mirroring `secret_apply::apply_secret_inner`'s
+/// parse. `None` on any parse / missing-key failure — never gates the RPC.
+fn parse_secret_schema_version(yaml_content: &str) -> Option<u32> {
+    serde_yaml::from_str::<std::collections::BTreeMap<String, String>>(yaml_content)
+        .ok()
+        .and_then(|m| m.get("schema_version").and_then(|v| v.parse().ok()))
+}
+
 /// Monotonic counter for the locally-generated request-id suffix. Combined
 /// with [`PROCESS_START_NANOS`] this yields a process-unique id without
 /// pulling in a `uuid` dep (CU-86ahrwd64): collisions would require two RPCs
@@ -388,7 +411,32 @@ impl KonfigService for KonfigServer {
             Some(&request.get_ref().name),
         );
         check_drain(&self.draining)?;
-        record_status(apply::handle_apply(self.kube_client.clone(), request.into_inner()).await)
+
+        // Audit (CU-86ahrwd6h): capture identity + request facets before
+        // `into_inner()` consumes the request, run the handler, emit the record.
+        let identity = identity::extract_identity(&request);
+        let addr = client_addr(&request);
+        let rid = request_id(&request);
+        let ns = request.get_ref().namespace.clone();
+        let name = request.get_ref().name.clone();
+        let schema_version = parse_config_schema_version(&request.get_ref().yaml_content);
+
+        let result = apply::handle_apply(self.kube_client.clone(), request.into_inner()).await;
+        let rec = audit::AuditRecord {
+            rpc: "Apply".into(),
+            namespace: ns,
+            name,
+            client_identity: identity.id,
+            client_addr: addr,
+            result: audit::result_str(&result),
+            schema_version,
+            resource_version: audit::resource_version_of(&result, |r| &r.resource_version),
+            timestamp_ms: audit::now_ms(),
+            request_id: rid,
+        };
+        audit::emit(&rec);
+        audit::maybe_emit_k8s_event(&self.kube_client, &rec).await;
+        record_status(result)
     }
 
     #[tracing::instrument(
@@ -406,7 +454,31 @@ impl KonfigService for KonfigServer {
             Some(&request.get_ref().namespace),
             Some(&request.get_ref().name),
         );
-        record_status(revert::handle_revert(self.kube_client.clone(), request.into_inner()).await)
+
+        // Audit (CU-86ahrwd6h). Revert derives its new schema_version
+        // server-side, so the request carries none — `schema_version: None`.
+        let identity = identity::extract_identity(&request);
+        let addr = client_addr(&request);
+        let rid = request_id(&request);
+        let ns = request.get_ref().namespace.clone();
+        let name = request.get_ref().name.clone();
+
+        let result = revert::handle_revert(self.kube_client.clone(), request.into_inner()).await;
+        let rec = audit::AuditRecord {
+            rpc: "Revert".into(),
+            namespace: ns,
+            name,
+            client_identity: identity.id,
+            client_addr: addr,
+            result: audit::result_str(&result),
+            schema_version: None,
+            resource_version: audit::resource_version_of(&result, |r| &r.resource_version),
+            timestamp_ms: audit::now_ms(),
+            request_id: rid,
+        };
+        audit::emit(&rec);
+        audit::maybe_emit_k8s_event(&self.kube_client, &rec).await;
+        record_status(result)
     }
 
     type SubscribeStream = ReceiverStream<Result<ConfigEvent, Status>>;
@@ -510,9 +582,32 @@ impl KonfigService for KonfigServer {
             Some(&request.get_ref().name),
         );
         check_drain(&self.draining)?;
-        record_status(
-            secret_apply::handle_apply_secret(self.kube_client.clone(), request.into_inner()).await,
-        )
+
+        // Audit (CU-86ahrwd6h).
+        let identity = identity::extract_identity(&request);
+        let addr = client_addr(&request);
+        let rid = request_id(&request);
+        let ns = request.get_ref().namespace.clone();
+        let name = request.get_ref().name.clone();
+        let schema_version = parse_secret_schema_version(&request.get_ref().yaml_content);
+
+        let result =
+            secret_apply::handle_apply_secret(self.kube_client.clone(), request.into_inner()).await;
+        let rec = audit::AuditRecord {
+            rpc: "ApplySecret".into(),
+            namespace: ns,
+            name,
+            client_identity: identity.id,
+            client_addr: addr,
+            result: audit::result_str(&result),
+            schema_version,
+            resource_version: audit::resource_version_of(&result, |r| &r.resource_version),
+            timestamp_ms: audit::now_ms(),
+            request_id: rid,
+        };
+        audit::emit(&rec);
+        audit::maybe_emit_k8s_event(&self.kube_client, &rec).await;
+        record_status(result)
     }
 
     type SubscribeSecretsStream = ReceiverStream<Result<SecretEvent, Status>>;
