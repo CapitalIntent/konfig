@@ -725,6 +725,8 @@ async fn s1_subscriber_sustained(
     let mut client = KonfigServiceClient::new(ch);
     let stream = match client
         .subscribe(tonic::Request::new(SubscribeRequest {
+            // Loadtest does not exercise server-side label filtering.
+            label_selector: String::new(),
             namespace: namespace.clone(),
             names: vec![config_name.clone()],
             resume_resource_version: String::new(),
@@ -781,6 +783,8 @@ async fn s1_subscriber(
     let mut client = KonfigServiceClient::new(ch);
     let stream = match client
         .subscribe(tonic::Request::new(SubscribeRequest {
+            // Loadtest does not exercise server-side label filtering.
+            label_selector: String::new(),
             namespace: namespace.clone(),
             names: vec![config_name.clone()],
             resume_resource_version: String::new(),
@@ -1170,6 +1174,8 @@ async fn s3_subscriber_phase1(
     let mut client = KonfigServiceClient::new(ch);
     let stream = match client
         .subscribe(tonic::Request::new(SubscribeRequest {
+            // Loadtest does not exercise server-side label filtering.
+            label_selector: String::new(),
             namespace: namespace.clone(),
             names: vec![config_name.clone()],
             resume_resource_version: String::new(),
@@ -1222,6 +1228,8 @@ async fn s3_subscriber_phase2(
     let mut client = KonfigServiceClient::new(ch);
     let stream = match client
         .subscribe(tonic::Request::new(SubscribeRequest {
+            // Loadtest does not exercise server-side label filtering.
+            label_selector: String::new(),
             namespace: namespace.clone(),
             names: vec![config_name.clone()],
             resume_resource_version: resume_rv.clone(),
@@ -1703,6 +1711,8 @@ async fn s5_subscriber(
     let mut client = KonfigServiceClient::new(ch);
     let stream = match client
         .subscribe(tonic::Request::new(SubscribeRequest {
+            // Loadtest does not exercise server-side label filtering.
+            label_selector: String::new(),
             namespace: namespace.clone(),
             names: vec![config_name.clone()],
             resume_resource_version: String::new(),

@@ -64,6 +64,9 @@ impl StreamDriver {
                 namespace: self.namespace.clone(),
                 names: self.names.clone(),
                 resume_resource_version: resume_rv.clone(),
+                // No label filtering from the consumer client (server-side
+                // feature; the consumer does not expose a selector yet).
+                label_selector: String::new(),
             };
 
             match self.client.subscribe(req).await {

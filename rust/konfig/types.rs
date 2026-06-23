@@ -62,6 +62,14 @@ pub struct ConfigSnapshot {
     /// All snapshots in the cache share the same stale instant (set by
     /// `ConfigCache::mark_all_stale` when the watcher disconnects).
     pub stale_since: Option<Instant>,
+    /// K8s object labels (`metadata.labels`), captured once at parse time in
+    /// `crate::watcher::parse_config_object`.  Kept INTERNALLY only — never
+    /// emitted on the wire (the proto `Config` message carries no labels) —
+    /// so the high-fanout `Subscribe` broadcast path stays lean.  Behind
+    /// `Arc` so the per-event `BroadcastFrame` / `ReplayEntry` clone is a
+    /// refcount bump, not a `BTreeMap` deep copy.  Server-side
+    /// `label_selector` filtering matches against this map.
+    pub labels: Arc<std::collections::BTreeMap<String, String>>,
     /// Memoised JSON encoding of `content`.  Reset on every `Clone` would
     /// be wasteful, so we put it behind `Arc<OnceLock<…>>`: clones share
     /// the same cell and the first reader wins.  Public to keep struct-
@@ -82,6 +90,7 @@ impl Default for ConfigSnapshot {
             resource_version: String::new(),
             loaded_at: Instant::now(),
             stale_since: None,
+            labels: Arc::new(std::collections::BTreeMap::new()),
             content_json_cache: Arc::new(OnceLock::new()),
         }
     }
@@ -102,6 +111,10 @@ impl ConfigSnapshot {
             resource_version,
             loaded_at: Instant::now(),
             stale_since: None,
+            // `from_spec` carries no label context — the single label source
+            // is `crate::watcher::parse_config_object`, which sets `labels`
+            // from `obj.metadata.labels` after constructing the snapshot.
+            labels: Arc::new(std::collections::BTreeMap::new()),
             content_json_cache: Arc::new(OnceLock::new()),
         }
     }

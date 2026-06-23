@@ -1559,6 +1559,7 @@ mod tests {
             namespace: "default".into(),
             names: Vec::new(),
             resume_resource_version: String::new(),
+            label_selector: String::new(),
         });
         let err = server
             .subscribe(req)

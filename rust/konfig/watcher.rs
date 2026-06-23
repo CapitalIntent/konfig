@@ -271,12 +271,17 @@ pub fn parse_config_object(obj: &DynamicObject) -> Option<ConfigSnapshot> {
         .map_err(|e| warn!(name = %name, "Failed to parse Config spec: {e}"))
         .ok()?;
 
-    Some(ConfigSnapshot::from_spec(
-        name,
-        namespace,
-        spec,
-        resource_version,
-    ))
+    let mut snap = ConfigSnapshot::from_spec(name, namespace, spec, resource_version);
+    // Capture `metadata.labels` once, here, as the single label source for
+    // server-side `Subscribe` label-selector filtering. `ObjectMeta.labels`
+    // is `Option<BTreeMap<String, String>>`; absent ⇒ empty map (the default
+    // set by `from_spec`), so unlabeled objects match only label-free
+    // selectors. Wrapped in `Arc` so downstream broadcast/replay clones are
+    // refcount bumps, not deep copies.
+    if let Some(labels) = obj.metadata.labels.clone() {
+        snap.labels = Arc::new(labels);
+    }
+    Some(snap)
 }
 
 #[cfg(test)]
