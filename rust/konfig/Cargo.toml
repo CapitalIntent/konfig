@@ -83,6 +83,10 @@ tokio = {workspace = true, features = ["full", "tracing"]}
 tokio-stream = "0.1"
 tonic = {workspace = true}
 tonic-health = "0.14.6"
+# grpc-Web translation layer mounted on the gRPC server (CU-86ahzwhg4) so the
+# Backstage browser plugin can hit konfig directly on port 50051. See
+# `grpc::serve` — composed with `accept_http1(true)` to serve h2 + grpc-Web (h1).
+tonic-web = {workspace = true}
 tracing = {workspace = true}
 # Peer-cert identity extraction for the audit log (CU-86ahrwd6h). Parses the
 # DER leaf cert from `tonic::Request::peer_certs` to read SAN URI / Subject CN.

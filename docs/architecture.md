@@ -17,7 +17,8 @@ konfig server
     ├─ ConfigMapCache (shared with ConfigCache, opt-in)
     │
     ├─ gRPC :50051   broadcast::channel per namespace (O(1) fan-out)
-    │                 └─► consumer pods — p50 < 2 ms
+    │                 ├─► consumer pods — p50 < 2 ms
+    │                 └─► grpc-Web (same port) — Backstage browser plugin
     └─ Prometheus /metrics :9090
 ```
 
@@ -25,6 +26,13 @@ Consumer pods connect to konfig's gRPC endpoint and call `Subscribe`. The
 server starts a single kube watch stream per namespace and fans events out to
 all subscribers over a `broadcast::channel` — delivery time is independent of
 subscriber count.
+
+Port 50051 serves **both** standard gRPC (HTTP/2) and **grpc-Web** (HTTP/1.1)
+on the same listener: the tonic server is built with `accept_http1(true)` and a
+`tonic_web::GrpcWebLayer` (CU-86ahzwhg4). This lets the Backstage browser plugin
+call konfig directly — no Envoy/grpc-web proxy sidecar. Standard h2 gRPC clients
+are unaffected; the layer only translates requests whose `content-type` is
+`application/grpc-web*`.
 
 ## Config sources
 

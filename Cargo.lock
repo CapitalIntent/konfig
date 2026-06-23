@@ -649,6 +649,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "direct-cargo-bazel-deps"
+version = "0.0.1"
+dependencies = [
+ "console-subscriber",
+ "pyroscope",
+ "pyroscope_pprofrs",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1457,6 +1466,7 @@ dependencies = [
  "tonic-health",
  "tonic-prost",
  "tonic-prost-build",
+ "tonic-web",
  "tracing",
  "tracing-appender",
  "tracing-opentelemetry",
@@ -3290,6 +3300,24 @@ dependencies = [
  "prost 0.14.4",
  "prost-types 0.14.4",
  "tonic 0.14.6",
+]
+
+[[package]]
+name = "tonic-web"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e6a1b6319ca4b61a4c0f0c94d439c8f3ed344cca56fe0df40e1fe4be11380b"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "http",
+ "http-body",
+ "pin-project",
+ "tokio-stream",
+ "tonic 0.14.6",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]

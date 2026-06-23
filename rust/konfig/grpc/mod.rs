@@ -876,7 +876,14 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
 
     let mut builder = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
-        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)));
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+        // Accept HTTP/1.1 in addition to the default h2 prior-knowledge path so
+        // grpc-Web clients (the Backstage browser plugin, CU-86ahzwhg4) can
+        // reach konfig directly on port 50051 without an Envoy proxy. Standard
+        // gRPC clients still negotiate h2 unchanged — h1 is purely additive.
+        // The actual grpc-Web ⇄ gRPC frame translation is the `GrpcWebLayer`
+        // mounted below via `.layer(..)`. Enabling h1 has no effect on h2 RPCs.
+        .accept_http1(true);
 
     builder = apply_h2_overrides(
         builder,
@@ -929,17 +936,26 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         warn!("Drain timeout elapsed — forcing server shutdown");
     };
 
+    // Mount the grpc-Web translation layer (CU-86ahzwhg4). In tonic 0.14
+    // `.layer(..)` wraps every service added *after* it, so it must precede
+    // the `.add_service(..)` calls. `GrpcWebLayer` inspects the request
+    // `content-type`: `application/grpc-web*` requests are translated to/from
+    // standard gRPC, while plain `application/grpc` (h2) requests pass through
+    // untouched — so existing gRPC clients, the `tonic_health` service, the
+    // mTLS path, and the `serve_with_shutdown` drain all keep working.
     if let Some(reporter) = cfg.health_reporter {
         let health_svc = tonic_health::pb::health_server::HealthServer::new(
             tonic_health::server::HealthService::from_health_reporter(reporter),
         );
         builder
+            .layer(tonic_web::GrpcWebLayer::new())
             .add_service(health_svc)
             .add_service(svc)
             .serve_with_shutdown(cfg.addr, shutdown_future)
             .await
     } else {
         builder
+            .layer(tonic_web::GrpcWebLayer::new())
             .add_service(svc)
             .serve_with_shutdown(cfg.addr, shutdown_future)
             .await
@@ -1088,6 +1104,168 @@ mod tests {
         // Drop the channel before shutting down so the server's graceful
         // shutdown does not race with an in-flight handshake.
         drop(channel);
+
+        let _ = shutdown_tx.send(());
+        let res = tokio::time::timeout(Duration::from_secs(2), server_handle)
+            .await
+            .expect("server task must terminate within 2s after shutdown");
+        res.expect("join").expect("server must shut down cleanly");
+    }
+
+    /// grpc-Web enablement (CU-86ahzwhg4): the production `serve()` builder
+    /// mounts `accept_http1(true)` + `tonic_web::GrpcWebLayer` so port 50051
+    /// serves BOTH standard gRPC (h2) AND grpc-Web (h1) on one listener. This
+    /// test mirrors the prod builder pipeline (apply_h2_overrides → layer →
+    /// add_service) and asserts a STANDARD gRPC h2 client still completes the
+    /// HTTP/2 preface + SETTINGS handshake through the layered server — i.e.
+    /// the grpc-Web layer + h1 acceptance did not regress the existing gRPC
+    /// transport. A true browser grpc-Web round-trip needs a JS/grpc-web
+    /// client + CORS preflight and is not feasible headless; the h1-acceptance
+    /// half is covered by `grpc_web_accepts_http1_request` below.
+    #[tokio::test]
+    async fn grpc_web_layer_builder_binds_and_serves_standard_grpc() {
+        use tokio::net::TcpListener;
+        use tonic::transport::Server as TonicServer;
+
+        let addr: SocketAddr = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            l.local_addr().expect("local_addr")
+        };
+
+        let (reporter, health_server) = tonic_health::server::health_reporter();
+        reporter
+            .set_service_status("ping", tonic_health::ServingStatus::Serving)
+            .await;
+
+        // Same builder shape `serve()` uses: h2 overrides, then accept_http1,
+        // then the grpc-Web layer, then the service.
+        let builder = apply_h2_overrides(TonicServer::builder(), Some(1_048_576), Some(2_048))
+            .accept_http1(true);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            builder
+                .layer(tonic_web::GrpcWebLayer::new())
+                .add_service(health_server)
+                .serve_with_shutdown(addr, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        // Standard gRPC over h2 must still connect through the layered server.
+        let channel = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+                    .expect("endpoint")
+                    .connect()
+                    .await
+                {
+                    Ok(ch) => break ch,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("standard gRPC h2 handshake must still succeed with grpc-Web layer mounted");
+        drop(channel);
+
+        let _ = shutdown_tx.send(());
+        let res = tokio::time::timeout(Duration::from_secs(2), server_handle)
+            .await
+            .expect("server task must terminate within 2s after shutdown");
+        res.expect("join").expect("server must shut down cleanly");
+    }
+
+    /// grpc-Web enablement (CU-86ahzwhg4): assert the layered server actually
+    /// speaks HTTP/1.1 + grpc-Web on the same port. We send a raw HTTP/1.1
+    /// request carrying `content-type: application/grpc-web` (the frame a
+    /// browser grpc-web client uses) over a plain TCP socket and assert the
+    /// server returns an HTTP/1.1 response rather than rejecting the
+    /// connection / falling back to an h2-only error.
+    ///
+    /// A bare-TCP HTTP/1.1 probe (no hyper/reqwest dev-dep, keeping the Bazel
+    /// crate lockfile unchanged) is the strongest dep-free signal: WITHOUT
+    /// `accept_http1(true)` + the web layer, tonic's h2-only server cannot
+    /// parse an HTTP/1.1 request line and the connection yields no HTTP/1.1
+    /// status line. WITH them mounted, the grpc-Web layer answers over h1.
+    /// We assert only that a well-formed `HTTP/1.1 <status>` line comes back
+    /// (the gRPC status itself rides in trailers and depends on the unary
+    /// payload, which we deliberately do not construct here).
+    #[tokio::test]
+    async fn grpc_web_accepts_http1_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tonic::transport::Server as TonicServer;
+
+        let addr: SocketAddr = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            l.local_addr().expect("local_addr")
+        };
+
+        let (reporter, health_server) = tonic_health::server::health_reporter();
+        reporter
+            .set_service_status("ping", tonic_health::ServingStatus::Serving)
+            .await;
+
+        let builder = TonicServer::builder().accept_http1(true);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            builder
+                .layer(tonic_web::GrpcWebLayer::new())
+                .add_service(health_server)
+                .serve_with_shutdown(addr, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        // Send a minimal grpc-web framed HTTP/1.1 POST and read the status line.
+        let status_line = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let Ok(mut stream) = TcpStream::connect(addr).await else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                };
+                // 5-byte gRPC length-prefixed frame with a zero-length body —
+                // enough for the grpc-web layer to accept and start a response.
+                let body: [u8; 5] = [0, 0, 0, 0, 0];
+                let req = format!(
+                    "POST /grpc.health.v1.Health/Check HTTP/1.1\r\n\
+                     Host: {addr}\r\n\
+                     content-type: application/grpc-web\r\n\
+                     accept: application/grpc-web\r\n\
+                     content-length: {len}\r\n\
+                     connection: close\r\n\r\n",
+                    len = body.len(),
+                );
+                if stream.write_all(req.as_bytes()).await.is_err()
+                    || stream.write_all(&body).await.is_err()
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                let mut buf = Vec::new();
+                // Read just the status line; close-delimited response.
+                if stream.read_to_end(&mut buf).await.is_err() || buf.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&buf);
+                break text.lines().next().unwrap_or("").to_string();
+            }
+        })
+        .await
+        .expect("grpc-Web HTTP/1.1 request must get a response within 3s");
+
+        // The h2-only server (no accept_http1 / no web layer) would never emit
+        // a parseable HTTP/1.1 status line. Its presence proves grpc-Web/h1 is
+        // live on the port.
+        assert!(
+            status_line.starts_with("HTTP/1.1 "),
+            "expected an HTTP/1.1 status line from the grpc-Web layer, got: {status_line:?}",
+        );
 
         let _ = shutdown_tx.send(());
         let res = tokio::time::timeout(Duration::from_secs(2), server_handle)
