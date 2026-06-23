@@ -11,16 +11,19 @@ build --@rules_rust//:extra_rustc_flags=-Cforce-frame-pointers=yes
 # CI profile — disable disk cache path expansion for remote runners.
 build:ci --disk_cache=
 
-# EXPERIMENT (CU-86aj4guza root-cause probe — NOT a permanent change): pin the
-# konfig binary's rust instruction baseline to a portable floor. If a hidden
-# high target-cpu/target-feature is reaching the CI rust build, this overrides
-# it → the loadtest-acceptance run goes green (rust codegen was the SIGILL
-# source). If the exit-132 SIGILL is in the snmalloc C++ allocator init or a
-# partial image load, this is a no-op → still red, cleanly ruling out rust
-# codegen. x86-64-v2 = cx16 + sse4.2 + popcnt, supported by every runner CPU
-# observed (AMD EPYC 7763, Intel Xeon). Release builds keep -Ctarget-cpu=native
-# (applied later → last-wins), so prod images are unaffected by this probe.
-build:ci --@rules_rust//:extra_rustc_flags=-Ctarget-cpu=x86-64-v2
+# Portable x86-64 instruction floor for SHIPPED x86_64 binaries (CU-86aj4guza).
+# Confirmed root cause of the recurring loadtest-gate exit-132 SIGILL: without a
+# pinned target-cpu the konfig rust binary's effective baseline resolved ABOVE
+# some runner/prod CPUs and executed an illegal instruction during pre-main init
+# (empty logs, deterministic on non-AVX512 pools — proven by acceptance run
+# 28059825635 going green once pinned). x86-64-v2 (cx16 + sse4.2 + popcnt) is the
+# HONEST floor: snmalloc already requires CMPXCHG16B (cx16), so the binary cannot
+# run below v2 anyway — pinning v1 would buy no portability and only cost perf.
+#
+# x86_64-ONLY: the cpu name is invalid for aarch64, so this MUST NOT be a global
+# `build` flag — publish-images builds an arm64 matrix leg with --config=ci. Only
+# the amd64 image/build steps opt in via `--config=x86-baseline`; arm64 never does.
+build:x86-baseline --@rules_rust//:extra_rustc_flags=-Ctarget-cpu=x86-64-v2
 
 # Release profile — optimised binaries with native CPU tuning.
 build:release -c opt
