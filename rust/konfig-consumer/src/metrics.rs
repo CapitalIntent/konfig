@@ -1,4 +1,4 @@
-//! `konfig_stale_seconds` gauge helper for konfig consumers.
+//! `konfig_consumer_stale_seconds` gauge helper for konfig consumers.
 //!
 //! The consumer crate does NOT touch the default Prometheus registry — callers
 //! must hand us a `prometheus::Registry` they own (so consumer pods can keep
@@ -17,12 +17,12 @@ pub enum MetricsError {
     Register(#[from] prometheus::Error),
 }
 
-/// Register `konfig_stale_seconds` on the supplied registry and return the
+/// Register `konfig_consumer_stale_seconds` on the supplied registry and return the
 /// gauge handle.  Caller is expected to hold the returned `Gauge` for the
 /// lifetime of the stream (the sampler task writes it).
 pub fn register_stale_seconds(registry: &Registry) -> Result<Gauge, MetricsError> {
     let gauge = Gauge::with_opts(Opts::new(
-        "konfig_stale_seconds",
+        "konfig_consumer_stale_seconds",
         "Seconds since the konfig stream last received an event (0 = active / fresh)",
     ))?;
     registry.register(Box::new(gauge.clone()))?;
@@ -85,7 +85,7 @@ mod tests {
         let families = registry.gather();
         let found = families
             .iter()
-            .find(|mf| mf.name() == "konfig_stale_seconds")
+            .find(|mf| mf.name() == "konfig_consumer_stale_seconds")
             .expect("metric present");
         assert_eq!(found.get_metric()[0].get_gauge().get_value(), 7.5);
     }
