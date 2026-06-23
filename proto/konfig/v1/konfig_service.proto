@@ -39,6 +39,27 @@ message ApplyResponse {
   string resource_version = 1;
 }
 
+// Same fields as ApplyRequest — DryRunApply previews this exact payload.
+message DryRunApplyRequest {
+  string namespace = 1;
+  string name = 2;
+  // Full config as YAML. Must contain a top-level `schema_version` key.
+  string yaml_content = 3;
+}
+
+// Preview of an Apply: current vs proposed content/version. Never the product
+// of a write — the server computes this without patching K8s or the cache.
+message DryRunApplyResponse {
+  // JSON-encoded current `spec.content` ("" when the Config does not exist).
+  string current_content_json = 1;
+  // JSON-encoded `spec.content` from the submitted YAML.
+  string proposed_content_json = 2;
+  // Current stored schema_version (0 when the Config does not exist).
+  uint32 current_schema_version = 3;
+  // schema_version from the submitted YAML.
+  uint32 proposed_schema_version = 4;
+}
+
 message RevertRequest {
   string namespace = 1;
   string name = 2;
@@ -129,6 +150,11 @@ service KonfigService {
   rpc GetAll(GetAllRequest) returns (stream Config);
   // Create or update a config (YAML → CRD patch with schema_version check).
   rpc Apply(ApplyRequest) returns (ApplyResponse);
+  // Preview what an Apply would change WITHOUT touching the K8s API or cache.
+  // Runs the same schema_version monotonicity gate as Apply and returns the
+  // current vs proposed content/version. Non-mutating + idempotent: N calls
+  // produce byte-identical output and zero kube-apiserver writes.
+  rpc DryRunApply(DryRunApplyRequest) returns (DryRunApplyResponse);
   // Roll back a Config to a historical resourceVersion.  Looks up the historical
   // content via a K8s list with resourceVersionMatch=Exact, bumps the
   // schema_version above the current value to preserve monotonicity, and

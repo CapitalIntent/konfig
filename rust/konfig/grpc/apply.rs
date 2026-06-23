@@ -18,7 +18,7 @@ use tracing::{Instrument, debug, info, warn};
 
 use crate::grpc::jittered_retry_ms;
 use crate::metrics::{APPLY_DURATION, APPLY_TOTAL};
-use crate::proto::{ApplyRequest, ApplyResponse};
+use crate::proto::{ApplyRequest, ApplyResponse, DryRunApplyRequest, DryRunApplyResponse};
 use crate::types::ConfigSpec;
 use crate::watcher::{GROUP, VERSION, config_api_resource};
 
@@ -43,6 +43,90 @@ pub async fn apply_inner(
         .map_err(|e| Status::invalid_argument(format!("invalid YAML: {e}")))?;
 
     apply_spec(namespace, name, spec, kube_client).await
+}
+
+/// `DryRunApply` handler — preview what an `Apply` would change WITHOUT ever
+/// patching K8s or touching the cache (CU-86ahrg731).
+///
+/// Flow:
+/// 1. Parse `yaml_content` as `ConfigSpec` (`INVALID_ARGUMENT` on parse error,
+///    same gate as `Apply`).
+/// 2. `api.get(name)` to read the CURRENT Config (404 → current absent: empty
+///    content, schema_version 0). This is the ONLY kube call — a read.
+/// 3. Run the SAME `schema_version_decision` monotonicity gate as `Apply`
+///    (`FAILED_PRECONDITION` when proposed ≤ current).
+/// 4. Assemble the current vs proposed diff and return it.
+///
+/// Never calls `api.patch` / any write; never updates the cache; never touches
+/// the `APPLY_TOTAL` / `APPLY_DURATION` counters (those are reserved for real
+/// applies). Idempotent: identical request → byte-identical response.
+pub async fn handle_dry_run_apply(
+    kube_client: Client,
+    req: DryRunApplyRequest,
+) -> Result<Response<DryRunApplyResponse>, Status> {
+    debug!(namespace = %req.namespace, name = %req.name, "DryRunApply RPC");
+
+    let spec: ConfigSpec = serde_yaml::from_str(&req.yaml_content)
+        .map_err(|e| Status::invalid_argument(format!("invalid YAML: {e}")))?;
+
+    let ar = config_api_resource();
+    let api: Api<DynamicObject> = Api::namespaced_with(kube_client, &req.namespace, &ar);
+
+    // READ-ONLY: fetch the current object. 404 → current absent (None).
+    let current = match api.get(&req.name).await {
+        Ok(obj) => Some(obj),
+        Err(kube::Error::Api(ref ae)) if ae.code == 404 => None,
+        Err(e) => return Err(Status::unavailable(format!("kube error: {e}"))),
+    };
+
+    // Pure assembly + monotonicity gate — no further I/O, no writes.
+    dry_run_response(current.as_ref(), &spec).map(Response::new)
+}
+
+/// Pure dry-run assembler — given the CURRENT object (or `None` when absent)
+/// and the PROPOSED `ConfigSpec`, build the `DryRunApplyResponse` or return the
+/// `FAILED_PRECONDITION` the monotonicity gate would surface.
+///
+/// Separated from the single `api.get` call in `handle_dry_run_apply` so the
+/// content-extraction + the reused [`schema_version_decision`] gate are
+/// unit-testable without a kube mock. Critically, this fn is structurally
+/// incapable of a kube write: it takes no `Api`/`Client`, so it can only read
+/// the borrowed object and serialize JSON.
+pub(crate) fn dry_run_response(
+    current: Option<&DynamicObject>,
+    spec: &ConfigSpec,
+) -> Result<DryRunApplyResponse, Status> {
+    let current_schema_version = current.map(parse_schema_version_from_object).unwrap_or(0);
+    let current_content_json = current
+        .map(extract_current_content_json)
+        .transpose()?
+        .unwrap_or_default();
+
+    let proposed_schema_version = spec.schema_version;
+    let proposed_content_json = serde_json::to_string(&spec.content)
+        .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
+
+    // SAME gate as Apply — proposed must strictly exceed current.
+    schema_version_decision(proposed_schema_version, current_schema_version)?;
+
+    Ok(DryRunApplyResponse {
+        current_content_json,
+        proposed_content_json,
+        current_schema_version,
+        proposed_schema_version,
+    })
+}
+
+/// Pure extractor — serialize a current object's `spec.content` to a JSON
+/// string. Returns `""` when `spec.content` is absent (mirrors the empty/absent
+/// convention for a 404 current). Separated from the kube call so it is
+/// unit-testable.
+pub(crate) fn extract_current_content_json(obj: &DynamicObject) -> Result<String, Status> {
+    match obj.data.get("spec").and_then(|s| s.get("content")) {
+        Some(content) => serde_json::to_string(content)
+            .map_err(|e| Status::internal(format!("serialize error: {e}"))),
+        None => Ok(String::new()),
+    }
 }
 
 /// Apply a parsed `ConfigSpec` to the cluster via server-side apply.
@@ -392,6 +476,131 @@ mod tests {
     fn parse_schema_version_non_numeric() {
         let obj = dyn_obj(serde_json::json!({"schema_version": "v3"}));
         assert_eq!(parse_schema_version_from_object(&obj), 0);
+    }
+
+    // ── dry_run_response: content extraction + reused monotonicity gate ─────
+    //
+    // CU-86ahrg731 DryRunApply previews an Apply without any kube write. These
+    // tests drive the PURE assembler `dry_run_response` directly (no kube `Api`
+    // — the fn takes no Client, so it is structurally incapable of a write) and
+    // assert: (a) proposed > current → Ok with the right current/proposed
+    // fields, (b) proposed ≤ current → FAILED_PRECONDITION (SAME gate as
+    // Apply), (c) absent current (the 404 path) → schema_version 0 + empty
+    // current content, (d) idempotency — N calls → byte-identical response.
+
+    /// Build a current Config object carrying `spec.schema_version` +
+    /// `spec.content`, mirroring what `api.get` returns for an existing CRD.
+    fn current_obj(schema_version: u64, content: serde_json::Value) -> DynamicObject {
+        dyn_obj(serde_json::json!({
+            "schema_version": schema_version,
+            "content": content,
+        }))
+    }
+
+    fn spec(schema_version: u32, content: serde_json::Value) -> ConfigSpec {
+        ConfigSpec {
+            schema_version,
+            content,
+        }
+    }
+
+    #[test]
+    fn dry_run_higher_version_returns_diff_ok() {
+        let cur = current_obj(5, serde_json::json!({"k": "old"}));
+        let proposed = spec(6, serde_json::json!({"k": "new"}));
+
+        let resp = dry_run_response(Some(&cur), &proposed).expect("proposed > current must be Ok");
+
+        assert_eq!(resp.current_schema_version, 5);
+        assert_eq!(resp.proposed_schema_version, 6);
+        assert_eq!(resp.current_content_json, r#"{"k":"old"}"#);
+        assert_eq!(resp.proposed_content_json, r#"{"k":"new"}"#);
+    }
+
+    #[test]
+    fn dry_run_equal_version_is_failed_precondition() {
+        let cur = current_obj(5, serde_json::json!({"k": "v"}));
+        let proposed = spec(5, serde_json::json!({"k": "v2"}));
+
+        let err = dry_run_response(Some(&cur), &proposed)
+            .expect_err("proposed == current must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("must be > 5"),
+            "got {:?}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn dry_run_lower_version_is_failed_precondition() {
+        let cur = current_obj(5, serde_json::json!({}));
+        let proposed = spec(3, serde_json::json!({}));
+
+        let err = dry_run_response(Some(&cur), &proposed)
+            .expect_err("proposed < current must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn dry_run_absent_current_is_zero_version_empty_content() {
+        // The 404 path: `handle_dry_run_apply` passes `None` for the current.
+        let proposed = spec(1, serde_json::json!({"first": true}));
+
+        let resp =
+            dry_run_response(None, &proposed).expect("first write (1 > 0) over absent must be Ok");
+
+        assert_eq!(resp.current_schema_version, 0);
+        assert_eq!(resp.current_content_json, "");
+        assert_eq!(resp.proposed_schema_version, 1);
+        assert_eq!(resp.proposed_content_json, r#"{"first":true}"#);
+    }
+
+    #[test]
+    fn dry_run_absent_current_version_zero_proposed_still_rejected() {
+        // proposed 0 over absent (current 0) is NOT an increase — rejected,
+        // same as the first-write-over-zero Apply gate.
+        let proposed = spec(0, serde_json::json!({}));
+        let err = dry_run_response(None, &proposed).expect_err("0 over 0 must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn dry_run_current_missing_content_field_yields_empty_string() {
+        // Existing object with schema_version but no `spec.content`.
+        let cur = dyn_obj(serde_json::json!({"schema_version": 2}));
+        let proposed = spec(3, serde_json::json!({"a": 1}));
+
+        let resp = dry_run_response(Some(&cur), &proposed).expect("ok");
+        assert_eq!(resp.current_schema_version, 2);
+        assert_eq!(resp.current_content_json, "");
+    }
+
+    #[test]
+    fn dry_run_is_idempotent_byte_identical() {
+        // Idempotency invariant: N calls on the same inputs → identical bytes.
+        let cur = current_obj(4, serde_json::json!({"nested": {"x": [1, 2, 3]}}));
+        let proposed = spec(7, serde_json::json!({"nested": {"x": [4, 5]}}));
+
+        let a = dry_run_response(Some(&cur), &proposed).expect("ok");
+        let b = dry_run_response(Some(&cur), &proposed).expect("ok");
+
+        assert_eq!(a.current_content_json, b.current_content_json);
+        assert_eq!(a.proposed_content_json, b.proposed_content_json);
+        assert_eq!(a.current_schema_version, b.current_schema_version);
+        assert_eq!(a.proposed_schema_version, b.proposed_schema_version);
+    }
+
+    #[test]
+    fn extract_current_content_json_serializes_content() {
+        let obj = current_obj(1, serde_json::json!({"k": "v"}));
+        assert_eq!(extract_current_content_json(&obj).unwrap(), r#"{"k":"v"}"#);
+    }
+
+    #[test]
+    fn extract_current_content_json_absent_content_is_empty() {
+        let obj = dyn_obj(serde_json::json!({"schema_version": 1}));
+        assert_eq!(extract_current_content_json(&obj).unwrap(), "");
     }
 
     #[test]
