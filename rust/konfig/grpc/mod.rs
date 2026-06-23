@@ -52,10 +52,10 @@ use crate::grpc::subscribe::{
 };
 use crate::metrics::{LastEventAtMap, REPLAY_BUFFER_DEPTH, STALE_SECONDS};
 use crate::proto::{
-    ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, Config, ConfigEvent,
-    DryRunApplyRequest, DryRunApplyResponse, GetAllRequest, GetAllSecretsRequest, GetRequest,
-    GetSecretRequest, RevertRequest, RevertResponse, SecretEvent, SecretResponse, SubscribeRequest,
-    SubscribeSecretsRequest,
+    ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, BatchApplyRequest,
+    BatchApplyResponse, Config, ConfigEvent, DryRunApplyRequest, DryRunApplyResponse,
+    GetAllRequest, GetAllSecretsRequest, GetRequest, GetSecretRequest, RevertRequest,
+    RevertResponse, SecretEvent, SecretResponse, SubscribeRequest, SubscribeSecretsRequest,
     konfig_service_server::{KonfigService, KonfigServiceServer},
 };
 use crate::schema::SchemaTable;
@@ -522,6 +522,94 @@ impl KonfigService for KonfigServer {
         };
         audit::emit(&rec);
         audit::maybe_emit_k8s_event(&self.kube_client, &rec).await;
+        record_status(result)
+    }
+
+    // `BatchApply` — apply several configs as ONE atomic-GATE batch. All items
+    // are validated (parse + JSON Schema + schema_version monotonicity) before
+    // any write; a single gate failure rejects the whole batch with zero
+    // writes. Honest caveat (see `apply::handle_batch_apply` + the proto rpc
+    // doc): K8s server-side apply has no cross-object transaction, so a
+    // mid-batch apiserver error AFTER the gate can still leave a partial apply.
+    // The gate eliminates the COMMON stale-version cause, not the writes'
+    // non-transactionality.
+    #[tracing::instrument(
+        name = "konfig.BatchApply",
+        skip_all,
+        fields(item_count = request.get_ref().items.len(), client_addr = tracing::field::Empty, request_id = tracing::field::Empty, status_code = tracing::field::Empty),
+    )]
+    async fn batch_apply(
+        &self,
+        request: Request<BatchApplyRequest>,
+    ) -> Result<Response<BatchApplyResponse>, Status> {
+        // No single namespace/name for the whole batch — pass `None, None`.
+        log_rpc_entry("konfig.BatchApply", &request, None, None);
+        check_drain(&self.draining)?;
+        // Per-item authz: EVERY target must be writable — any denial rejects the
+        // whole batch (no write happens). When authz is Disabled this is a fast
+        // no-op per item, same as `apply`.
+        for item in &request.get_ref().items {
+            self.authorize(&request, Verb::Write, &item.namespace, &item.name)?;
+        }
+
+        // Audit (CU-86ahrwd6h): the mutation log must cover EVERY target, so we
+        // emit one record per item. Capture each item's (namespace, name,
+        // schema_version) plus the shared request facets before `into_inner()`
+        // consumes the request.
+        let identity = identity::extract_identity(&request);
+        let addr = client_addr(&request);
+        let rid = request_id(&request);
+        let item_facets: Vec<(String, String, Option<u32>)> = request
+            .get_ref()
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.namespace.clone(),
+                    item.name.clone(),
+                    parse_config_schema_version(&item.yaml_content),
+                )
+            })
+            .collect();
+
+        let result = apply::handle_batch_apply(
+            self.kube_client.clone(),
+            Arc::clone(&self.schema_table),
+            request.into_inner(),
+        )
+        .await;
+
+        // One audit record per item. On success each record's resource_version
+        // is that item's rv, looked up by (namespace, name) from the response
+        // results; on a gate failure every record carries the same error string
+        // and `resource_version: None`. Borrow `&result` for the lookup BEFORE
+        // it is moved into `record_status`.
+        let result_str = audit::result_str(&result);
+        let now = audit::now_ms();
+        for (namespace, name, schema_version) in item_facets {
+            let resource_version = result.as_ref().ok().and_then(|resp| {
+                resp.get_ref()
+                    .results
+                    .iter()
+                    .find(|r| r.namespace == namespace && r.name == name)
+                    .map(|r| r.resource_version.clone())
+                    .filter(|rv| !rv.is_empty())
+            });
+            let rec = audit::AuditRecord {
+                rpc: "BatchApply".into(),
+                namespace,
+                name,
+                client_identity: identity.id.clone(),
+                client_addr: addr.clone(),
+                result: result_str.clone(),
+                schema_version,
+                resource_version,
+                timestamp_ms: now,
+                request_id: rid.clone(),
+            };
+            audit::emit(&rec);
+            audit::maybe_emit_k8s_event(&self.kube_client, &rec).await;
+        }
         record_status(result)
     }
 
