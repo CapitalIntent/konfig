@@ -39,6 +39,25 @@ message ApplyResponse {
   string resource_version = 1;
 }
 
+message BatchApplyRequest {
+  // Configs to apply as one batch. Every item is gated (YAML parse, JSON
+  // Schema, schema_version monotonicity) BEFORE any write; if ANY item fails
+  // the gate the whole batch is rejected and zero writes occur.
+  repeated ApplyRequest items = 1;
+}
+
+message BatchApplyResult {
+  string namespace = 1;
+  string name = 2;
+  string resource_version = 3;
+}
+
+message BatchApplyResponse {
+  // One result per applied item, ORDERED by (namespace, name) — the same order
+  // the writes landed and subscribers observe the events.
+  repeated BatchApplyResult results = 1;
+}
+
 // Same fields as ApplyRequest — DryRunApply previews this exact payload.
 message DryRunApplyRequest {
   string namespace = 1;
@@ -150,6 +169,20 @@ service KonfigService {
   rpc GetAll(GetAllRequest) returns (stream Config);
   // Create or update a config (YAML → CRD patch with schema_version check).
   rpc Apply(ApplyRequest) returns (ApplyResponse);
+  // Apply several configs as one atomic-GATE batch. Every item is validated
+  // (YAML parse, JSON Schema, schema_version monotonicity) BEFORE any write;
+  // if ANY item fails the gate the whole batch is rejected and ZERO writes
+  // occur. After the gate passes, items are applied sequentially in
+  // (namespace, name) order, so the writes land — and subscribers observe the
+  // events — in that deterministic order.
+  //
+  // NOT a true cross-object transaction: Kubernetes server-side apply has no
+  // atomic multi-resource write, so "all-or-none" holds only at the gate. The
+  // gate eliminates the common stale-version torn-read cause of a partial
+  // apply, but a mid-batch apiserver error (e.g. exhausted-409, concurrent
+  // writer) AFTER the gate can still leave a partial apply. Do not rely on this
+  // for true atomicity.
+  rpc BatchApply(BatchApplyRequest) returns (BatchApplyResponse);
   // Preview what an Apply would change WITHOUT touching the K8s API or cache.
   // Runs the same schema_version monotonicity gate as Apply and returns the
   // current vs proposed content/version. Non-mutating + idempotent: N calls

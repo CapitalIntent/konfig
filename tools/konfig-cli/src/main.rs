@@ -6,6 +6,8 @@
 //! # Commands
 //!
 //! - `apply <namespace> <name> <yaml-file>` — create/update a Config CRD
+//! - `batch-apply --item NS:NAME:YAML_PATH …` — apply several Configs as one
+//!   atomic-GATE batch (all items validated before any write)
 //! - `dry-run <namespace> <name> <yaml-file>` — preview an apply (no write)
 //! - `get <namespace> <name>` — print a Config CRD spec as YAML
 //! - `revert <namespace> <name> <resource-version>` — roll back to a historical RV
@@ -37,6 +39,18 @@ enum Commands {
         namespace: String,
         name: String,
         yaml_file: PathBuf,
+    },
+    /// Apply several Config CRDs as one atomic-GATE batch.
+    ///
+    /// Every item is validated (YAML parse + schema_version monotonicity)
+    /// BEFORE any write; if ANY item fails the gate the whole batch is rejected
+    /// and zero writes occur. After the gate passes, items are applied in
+    /// (namespace, name) order. NOT a true cross-object transaction — a
+    /// mid-batch apiserver error after the gate can still leave a partial apply.
+    BatchApply {
+        /// A batch item as `NAMESPACE:NAME:YAML_PATH`. Repeat for each config.
+        #[arg(long = "item", required = true, value_name = "NS:NAME:YAML_PATH")]
+        items: Vec<String>,
     },
     /// Preview what an apply would change WITHOUT writing to K8s.
     ///
@@ -118,6 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             cmd_apply(client, &namespace, &name, &yaml_file).await?;
         }
+        Commands::BatchApply { items } => {
+            cmd_batch_apply(client, &items).await?;
+        }
         Commands::DryRun {
             namespace,
             name,
@@ -185,6 +202,49 @@ async fn cmd_apply(
             .map_err(|s| format!("Apply failed: {s}"))?;
     let rv = result.into_inner().resource_version;
     println!("Applied {namespace}/{name} (resource_version: {rv})");
+    Ok(())
+}
+
+async fn cmd_batch_apply(
+    client: Client,
+    items: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use konfig::proto::{ApplyRequest, BatchApplyRequest};
+
+    // Each `--item` is `NAMESPACE:NAME:YAML_PATH`. Split on the first two
+    // colons only, so a path containing a colon still works.
+    let mut requests = Vec::with_capacity(items.len());
+    for item in items {
+        let mut parts = item.splitn(3, ':');
+        let (Some(namespace), Some(name), Some(yaml_path)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(
+                format!("malformed --item {item:?}; expected NAMESPACE:NAME:YAML_PATH").into(),
+            );
+        };
+        let yaml_content = std::fs::read_to_string(yaml_path)
+            .map_err(|e| format!("cannot read {yaml_path} for {namespace}/{name}: {e}"))?;
+        requests.push(ApplyRequest {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            yaml_content,
+        });
+    }
+
+    // The CLI applies directly (no server-side watcher / schema registry), so
+    // it passes an empty `SchemaTable` — no schema for any key ⇒ accept
+    // anything, mirroring `cmd_apply`. Server-side schema validation
+    // (CU-86ahrwd5g) is enforced by the konfig server's BatchApply RPC.
+    let schema_table = std::sync::Arc::new(konfig::schema::SchemaTable::new());
+    let req = BatchApplyRequest { items: requests };
+    let result = konfig::grpc::apply::handle_batch_apply(client, schema_table, req)
+        .await
+        .map_err(|s| format!("BatchApply failed: {s}"))?;
+
+    for r in result.into_inner().results {
+        println!("{}/{} -> {}", r.namespace, r.name, r.resource_version);
+    }
     Ok(())
 }
 

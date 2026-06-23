@@ -30,7 +30,10 @@ use tracing::{Instrument, debug, info, warn};
 
 use crate::grpc::jittered_retry_ms;
 use crate::metrics::{APPLY_DURATION, APPLY_TOTAL};
-use crate::proto::{ApplyRequest, ApplyResponse, DryRunApplyRequest, DryRunApplyResponse};
+use crate::proto::{
+    ApplyRequest, ApplyResponse, BatchApplyRequest, BatchApplyResponse, BatchApplyResult,
+    DryRunApplyRequest, DryRunApplyResponse,
+};
 use crate::schema::SchemaTable;
 use crate::types::ConfigSpec;
 use crate::watcher::{GROUP, VERSION, config_api_resource};
@@ -70,6 +73,190 @@ pub async fn apply_inner(
     validate_against_schema(schema_table, namespace, name, &spec)?;
 
     apply_spec(namespace, name, spec, kube_client).await
+}
+
+/// One parsed item of a [`handle_batch_apply`] batch — the `(namespace, name)`
+/// target plus its parsed `ConfigSpec`. Produced by the pure [`parse_batch_items`]
+/// gate (which also rejects duplicate targets) so the rest of the batch flow
+/// works on validated, deduped items.
+#[derive(Debug, Clone)]
+pub(crate) struct BatchItem {
+    pub namespace: String,
+    pub name: String,
+    pub spec: ConfigSpec,
+}
+
+/// `BatchApply` handler — apply several configs as one atomic-GATE batch.
+///
+/// ## Honest atomicity note (read this before relying on "all-or-none")
+///
+/// Kubernetes server-side apply has **no cross-object transaction**: there is
+/// no single atomic multi-resource write. So "all-or-none" is achievable ONLY
+/// at the **gate** layer below. Every item is validated (YAML parse, JSON
+/// Schema, schema_version monotonicity) BEFORE any write; if ANY item fails the
+/// gate the whole batch is rejected with the matching `Status` and performs
+/// ZERO writes. After the gate passes, items are applied sequentially. A
+/// mid-batch apiserver error (e.g. exhausted-409, a concurrent writer) AFTER
+/// the gate can still leave a PARTIAL apply — the gate eliminates the common
+/// stale-version torn-read cause of a partial write but cannot make the writes
+/// themselves transactional. This is NOT true atomicity.
+///
+/// ## Why apply in (namespace, name) order ⇒ deterministic broadcast order
+///
+/// Broadcast is watcher-driven: `apply_spec` just patches the CRD; the kube
+/// watcher observes the etcd change and broadcasts it (default coalesce window
+/// 0 = immediate). So WRITE order = etcd order = watch-event order = broadcast
+/// order. Applying items in `(namespace, name)` order therefore makes every
+/// subscriber observe a deterministic event sequence. The handler controls
+/// broadcast order purely by controlling write order — it never broadcasts
+/// directly.
+///
+/// ## Flow
+/// 1. Empty batch → `INVALID_ARGUMENT`.
+/// 2. Parse + dedup every item ([`parse_batch_items`]): per-item YAML parse
+///    (`INVALID_ARGUMENT` naming the offender) and a duplicate-target reject
+///    (two writes to one `(namespace, name)` is ambiguous).
+/// 3. Schema gate (all-or-none): [`validate_against_schema`] for every item;
+///    first violation rejects the whole batch (`FAILED_PRECONDITION`), zero
+///    writes.
+/// 4. Monotonicity gate (all-or-none): read the current schema_version for
+///    every item ([`fetch_current_schema_version`], read-only gets), then the
+///    pure [`gate_batch_versions`] checks [`schema_version_decision`] for each;
+///    first failure rejects the whole batch (`FAILED_PRECONDITION`), still zero
+///    writes.
+/// 5. Sort items by `(namespace, name)` ([`sort_batch_items`]).
+/// 6. Apply each sorted item via [`apply_spec`] (which re-checks monotonicity
+///    per item — defense-in-depth against a TOCTOU concurrent writer between
+///    the gate read and the write; that re-check is intentional).
+/// 7. Return one [`BatchApplyResult`] per item, already in sorted order.
+pub async fn handle_batch_apply(
+    kube_client: Client,
+    schema_table: Arc<SchemaTable>,
+    req: BatchApplyRequest,
+) -> Result<Response<BatchApplyResponse>, Status> {
+    debug!(item_count = req.items.len(), "BatchApply RPC");
+
+    // (1)+(2) Parse + dedup. Empty batch is rejected inside the helper.
+    let mut items = parse_batch_items(&req.items)?;
+
+    // (3) Schema gate — all-or-none. First violation rejects the whole batch
+    // with FAILED_PRECONDITION and performs ZERO writes (no write happens until
+    // step 6 below).
+    for item in &items {
+        validate_against_schema(&schema_table, &item.namespace, &item.name, &item.spec)?;
+    }
+
+    // (4) Monotonicity gate — all-or-none. Read the current schema_version for
+    // EVERY item first (read-only kube gets; sequential to avoid pulling in a
+    // concurrency dep), then run the pure decision over all of them. First
+    // stale item rejects the whole batch — still ZERO writes performed.
+    let ar = config_api_resource();
+    let mut currents = Vec::with_capacity(items.len());
+    for item in &items {
+        let api: Api<DynamicObject> =
+            Api::namespaced_with(kube_client.clone(), &item.namespace, &ar);
+        currents.push(fetch_current_schema_version(&api, &item.name).await?);
+    }
+    gate_batch_versions(&items, &currents)?;
+
+    // (5) Sort so writes land — and subscribers observe events — in a
+    // deterministic (namespace, name) order.
+    sort_batch_items(&mut items);
+
+    // (6) Apply each item. The gate above guarantees the COMMON failure causes
+    // are eliminated; a per-item apiserver error here still surfaces (and can
+    // leave a partial apply — see the honesty note in the module/fn docs).
+    // `apply_spec` re-checks monotonicity per item (defense-in-depth).
+    let mut results = Vec::with_capacity(items.len());
+    for item in items {
+        let BatchItem {
+            namespace,
+            name,
+            spec,
+        } = item;
+        let resp = apply_spec(&namespace, &name, spec, kube_client.clone()).await?;
+        results.push(BatchApplyResult {
+            namespace,
+            name,
+            resource_version: resp.into_inner().resource_version,
+        });
+    }
+
+    Ok(Response::new(BatchApplyResponse { results }))
+}
+
+/// Pure parse + dedup gate for a [`handle_batch_apply`] batch — no kube I/O, so
+/// the parse-error and duplicate-target contracts are unit-testable.
+///
+/// Rejects, in order:
+///   - an empty batch (`INVALID_ARGUMENT` — a batch must apply something);
+///   - any item whose `yaml_content` does not parse as a `ConfigSpec`
+///     (`INVALID_ARGUMENT` naming the offending `namespace/name`);
+///   - a duplicate `(namespace, name)` target within the batch
+///     (`INVALID_ARGUMENT` — two writes to one target is ambiguous).
+///
+/// On success returns the parsed [`BatchItem`]s in INPUT order (the caller
+/// sorts later via [`sort_batch_items`]).
+pub(crate) fn parse_batch_items(items: &[ApplyRequest]) -> Result<Vec<BatchItem>, Status> {
+    if items.is_empty() {
+        return Err(Status::invalid_argument(
+            "batch must contain at least one item",
+        ));
+    }
+
+    let mut parsed = Vec::with_capacity(items.len());
+    let mut seen = std::collections::HashSet::with_capacity(items.len());
+    for req in items {
+        if !seen.insert((req.namespace.as_str(), req.name.as_str())) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate item {}/{} in batch — two writes to one target is ambiguous",
+                req.namespace, req.name
+            )));
+        }
+        let spec: ConfigSpec = serde_yaml::from_str(&req.yaml_content).map_err(|e| {
+            Status::invalid_argument(format!(
+                "invalid YAML for {}/{}: {e}",
+                req.namespace, req.name
+            ))
+        })?;
+        parsed.push(BatchItem {
+            namespace: req.namespace.clone(),
+            name: req.name.clone(),
+            spec,
+        });
+    }
+    Ok(parsed)
+}
+
+/// Pure monotonicity gate over a whole batch — given the parsed `items` and the
+/// `currents[i]` = stored schema_version for `items[i]` (positionally aligned),
+/// return `Ok(())` only when EVERY item strictly increases its current version.
+///
+/// All-or-none: the FIRST stale item (incoming ≤ current) returns its
+/// `FAILED_PRECONDITION` and the whole batch is rejected — by contract the
+/// caller has performed ZERO writes at this point. Reuses the same
+/// [`schema_version_decision`] gate as the single-item Apply path, so the per
+/// item accept/reject decision is identical. No kube I/O (the reads live in
+/// [`fetch_current_schema_version`]); this is the decision, so it is
+/// unit-testable without a live `Api`.
+pub(crate) fn gate_batch_versions(items: &[BatchItem], currents: &[u32]) -> Result<(), Status> {
+    for (item, &current) in items.iter().zip(currents.iter()) {
+        schema_version_decision(item.spec.schema_version, current)?;
+    }
+    Ok(())
+}
+
+/// Pure sort — reorder a batch into `(namespace, name)` ascending so the writes
+/// land (and subscribers observe the events) in a deterministic order. The
+/// secondary key is `name`, so items in the same namespace are name-ordered.
+/// Separated from [`handle_batch_apply`] so the ordering is unit-testable
+/// without kube.
+pub(crate) fn sort_batch_items(items: &mut [BatchItem]) {
+    items.sort_by(|a, b| {
+        a.namespace
+            .cmp(&b.namespace)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 }
 
 /// Validate a proposed `ConfigSpec`'s `content` against the schema registered
@@ -832,5 +1019,205 @@ mod tests {
             upper,
             SUM_MS,
         );
+    }
+
+    // ── BatchApply pure gates: parse+dedup, monotonicity, sort (CU-86ahrwd5c) ─
+    //
+    // BatchApply is an atomic-GATE multi-config apply: every item is validated
+    // BEFORE any write, so a single gate failure rejects the whole batch with
+    // zero writes. These tests drive the PURE helpers directly (no kube) and
+    // lock in the all-or-none + ordering contract:
+    //   - parse_batch_items: empty/parse-error/duplicate rejection + input order
+    //   - gate_batch_versions: one stale among many → whole batch rejected
+    //   - sort_batch_items: deterministic (namespace, name) ordering
+    // (apply_spec re-checks monotonicity per item as defense-in-depth against a
+    // TOCTOU concurrent writer — exercised on the live kube path, not here.)
+    //
+    // Acceptance: the ticket's "one stale schema_version → entire batch
+    // rejected" is `gate_batch_versions_one_stale_among_many_rejects_all`.
+    // The live "BatchApply N configs, all subscribers see consecutive
+    // resource_versions" check is a kind e2e gate (CI / linux) — there is no
+    // Rust integration harness in this repo, so it is not runnable here.
+
+    fn apply_req(namespace: &str, name: &str, yaml_content: &str) -> ApplyRequest {
+        ApplyRequest {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            yaml_content: yaml_content.to_string(),
+        }
+    }
+
+    /// Minimal valid `ConfigSpec` YAML carrying the given schema_version.
+    fn item_yaml(schema_version: u32) -> String {
+        format!("schema_version: {schema_version}\ncontent:\n  k: v\n")
+    }
+
+    #[test]
+    fn parse_batch_items_empty_is_invalid_argument() {
+        let err = parse_batch_items(&[]).expect_err("empty batch must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("at least one item"),
+            "got {:?}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn parse_batch_items_valid_multi_preserves_input_order() {
+        let reqs = [
+            apply_req("trading", "limits", &item_yaml(3)),
+            apply_req("risk", "caps", &item_yaml(7)),
+        ];
+        let items = parse_batch_items(&reqs).expect("valid batch parses");
+        assert_eq!(items.len(), 2);
+        // Input order preserved (the caller sorts later).
+        assert_eq!(
+            (items[0].namespace.as_str(), items[0].name.as_str()),
+            ("trading", "limits")
+        );
+        assert_eq!(items[0].spec.schema_version, 3);
+        assert_eq!(
+            (items[1].namespace.as_str(), items[1].name.as_str()),
+            ("risk", "caps")
+        );
+        assert_eq!(items[1].spec.schema_version, 7);
+    }
+
+    #[test]
+    fn parse_batch_items_bad_yaml_is_invalid_argument_naming_offender() {
+        let reqs = [
+            apply_req("trading", "limits", &item_yaml(1)),
+            apply_req("risk", "broken", "not: [valid: yaml: here"),
+        ];
+        let err = parse_batch_items(&reqs).expect_err("bad YAML must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("risk/broken"),
+            "message must name the offending item; got {:?}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn parse_batch_items_duplicate_target_is_invalid_argument() {
+        let reqs = [
+            apply_req("trading", "limits", &item_yaml(1)),
+            apply_req("trading", "limits", &item_yaml(2)),
+        ];
+        let err = parse_batch_items(&reqs).expect_err("duplicate target must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("duplicate") && err.message().contains("trading/limits"),
+            "message must flag the duplicate target; got {:?}",
+            err.message()
+        );
+    }
+
+    /// Build a `BatchItem` directly for the version-gate / sort tests.
+    fn batch_item(namespace: &str, name: &str, schema_version: u32) -> BatchItem {
+        BatchItem {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            spec: ConfigSpec {
+                schema_version,
+                content: serde_json::json!({}),
+            },
+        }
+    }
+
+    #[test]
+    fn gate_batch_versions_all_increasing_is_ok() {
+        let items = [
+            batch_item("a", "x", 2),
+            batch_item("b", "y", 5),
+            batch_item("c", "z", 1),
+        ];
+        // currents positionally aligned: every incoming strictly exceeds.
+        let currents = [1u32, 4, 0];
+        assert!(
+            gate_batch_versions(&items, &currents).is_ok(),
+            "all incoming > current must pass the batch gate"
+        );
+    }
+
+    #[test]
+    fn gate_batch_versions_one_stale_among_many_rejects_all() {
+        // Ticket acceptance: ONE stale schema_version → entire batch rejected.
+        let items = [
+            batch_item("a", "1", 5),
+            batch_item("a", "2", 6),
+            batch_item("a", "3", 4), // stale: 4 ≤ current 4
+            batch_item("a", "4", 9),
+            batch_item("a", "5", 10),
+        ];
+        let currents = [1u32, 2, 4, 8, 0];
+        let err = gate_batch_versions(&items, &currents)
+            .expect_err("one stale item must reject the whole batch");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        // The error names the failing version pair (current 4, got 4) so the
+        // reject is attributable to the offending item.
+        assert!(
+            err.message().contains("must be > 4") && err.message().contains("got 4"),
+            "message must name the failing version; got {:?}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn gate_batch_versions_first_write_over_zero_is_accepted() {
+        // current 0 (CRD does not exist yet) — the first write (any version ≥ 1)
+        // is accepted, same as the single-item Apply gate.
+        let items = [batch_item("a", "x", 1), batch_item("b", "y", 1)];
+        let currents = [0u32, 0];
+        assert!(gate_batch_versions(&items, &currents).is_ok());
+    }
+
+    #[test]
+    fn sort_batch_items_orders_by_namespace_then_name() {
+        // Deliberately scrambled input across namespaces + names.
+        let mut items = vec![
+            batch_item("trading", "limits", 1),
+            batch_item("risk", "caps", 1),
+            batch_item("trading", "alerts", 1),
+            batch_item("audit", "rules", 1),
+            batch_item("risk", "alerts", 1),
+        ];
+        sort_batch_items(&mut items);
+        let order: Vec<(&str, &str)> = items
+            .iter()
+            .map(|i| (i.namespace.as_str(), i.name.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("audit", "rules"),
+                ("risk", "alerts"),
+                ("risk", "caps"),
+                ("trading", "alerts"),
+                ("trading", "limits"),
+            ],
+            "items must be reordered to (namespace, name) ascending"
+        );
+    }
+
+    #[test]
+    fn parse_then_sort_reorders_regardless_of_input() {
+        // End-to-end of the pure pipeline: parse (input order) → sort. A reverse
+        // sorted input ends up forward-sorted.
+        let reqs = [
+            apply_req("zeta", "b", &item_yaml(1)),
+            apply_req("zeta", "a", &item_yaml(1)),
+            apply_req("alpha", "z", &item_yaml(1)),
+        ];
+        let mut items = parse_batch_items(&reqs).expect("parses");
+        // parse preserves input order:
+        assert_eq!(items[0].namespace, "zeta");
+        sort_batch_items(&mut items);
+        let order: Vec<(&str, &str)> = items
+            .iter()
+            .map(|i| (i.namespace.as_str(), i.name.as_str()))
+            .collect();
+        assert_eq!(order, vec![("alpha", "z"), ("zeta", "a"), ("zeta", "b")],);
     }
 }
