@@ -1,0 +1,325 @@
+name: Loadtest Acceptance (manual)
+
+# Dedicated, on-demand acceptance run for the Phase 5 loadtest tickets that the
+# per-PR smoke gate (loadtest-integration.yml) deliberately does NOT cover:
+#
+#   * CU-86ahzwhat — 100 subscribers, 10 Apply/min for 10 min, p99 < 1000ms,
+#     zero missed events. (The smoke gate runs ~20s at a 500ms p99 bar.)
+#   * CU-86ahrg75h — run against a 2-replica cluster; commit p50/p95/p99.
+#
+# This is a SEPARATE workflow from the smoke gate on purpose: it is a ~10-minute
+# sustained run that would wreck per-PR latency and add a noisy, non-required
+# perf assertion to merge. It is `workflow_dispatch` (manual) only — trigger it
+# from the Actions tab, tweak inputs as needed, and download the
+# `loadtest-acceptance-results` artifact (acceptance.json) to commit the numbers
+# per CU-86ahrg75h. (A bot auto-commit is intentionally NOT done — the repo's
+# branch→PR workflow forbids CI pushing to main; commit the artifact via a PR.)
+#
+# All the kind / image-load / crashloop flake mitigations are inherited verbatim
+# from loadtest-integration.yml (CU-86aj3872a, CU-86aj4guza). The differences
+# are: a bigger runner, N replicas, the acceptance load shape via env, and
+# results extraction.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label (ubuntu-latest is GH-hosted 4-vCPU; blacksmith-4vcpu/8vcpu-ubuntu-2404 use the org pool + BuildBuddy cache)
+        type: string
+        default: ubuntu-latest
+      replicas:
+        description: konfig Deployment replica count (CU-86ahrg75h wants 2)
+        type: string
+        default: "2"
+      subscribers:
+        description: S1_SUBSCRIBERS — concurrent Subscribe streams
+        type: string
+        default: "100"
+      applies:
+        description: S1_APPLIES — total Apply RPCs (100 @ 6000ms interval = 10/min x 10 min)
+        type: string
+        default: "100"
+      interval_ms:
+        description: S1_INTERVAL_MS — ms between applies (6000 = 10/min)
+        type: string
+        default: "6000"
+      p99_limit_ms:
+        description: S1_P99_LIMIT_MS — scenario-1 p99 gate (1000 per CU-86ahzwhat)
+        type: string
+        default: "1000"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: konfig-loadtest acceptance (kind, ${{ inputs.replicas }} replicas)
+    runs-on: ${{ inputs.runner }}
+    # 10-min sustained run + cold image build (cache-warmed via BuildBuddy) +
+    # kind bring-up. Generous ceiling so a slow build does not false-fail.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+      CLUSTER: konfig-acceptance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler
+
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
+
+      - name: CPU capability probe (CU-86aj4guza — confirm CMPXCHG16B/cx16)
+        # snmalloc compiles with `-mcx16`; a CPU model without it makes konfig
+        # SIGILL (exit 132) at allocator init before any log. Print the flag so
+        # a failing run proves whether the instruction is absent (rerun once on
+        # a different runner). `|| true` so a missing flag never fails the probe.
+        run: |
+          echo "=== host CPU ==="
+          grep -m1 'model name' /proc/cpuinfo || true
+          if grep -qm1 cx16 /proc/cpuinfo; then echo "host: cx16 PRESENT"; else echo "host: cx16 MISSING"; fi
+          echo "flags: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(cx16|lm|avx|avx2|avx512f|sse4_2|popcnt)$' | tr '\n' ' ')"
+
+      - name: Build konfig + konfig-loadtest OCI images (linux/amd64)
+        run: |
+          bazel run //docker/konfig:load_amd64
+          bazel run //docker/konfig-loadtest:load_amd64
+
+      - name: Create kind cluster (1 node)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: konfig-acceptance
+          wait: 120s
+
+      - name: Load images into kind
+        # `kind load` returns before containerd's image store is consistent;
+        # poll the CRI view until both tags resolve (CU-86aj3872a) so the
+        # Deployment cannot land in the ImagePull/CrashLoop window.
+        run: |
+          kind load docker-image kasa288/konfig:latest --name "$CLUSTER"
+          kind load docker-image kasa288/konfig-loadtest:latest --name "$CLUSTER"
+          for img in kasa288/konfig:latest kasa288/konfig-loadtest:latest; do
+            repo="${img%:*}"
+            tag="${img##*:}"
+            echo "Waiting for $img to appear in kind containerd image store..."
+            ok=0
+            for i in $(seq 1 60); do
+              if docker exec "${CLUSTER}-control-plane" crictl images 2>/dev/null \
+                   | awk -v r="docker.io/$repo" -v t="$tag" \
+                       '$1 == r && $2 == t { found=1 } END { exit !found }'; then
+                echo "  -> $img visible in containerd after ${i}s"
+                ok=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "::error::Timeout waiting for $img in containerd image store"
+              docker exec "${CLUSTER}-control-plane" crictl images || true
+              exit 1
+            fi
+          done
+
+      - name: Apply CRDs (Config) and wait for establishment
+        run: |
+          kubectl apply -f infra/konfig/crd.yaml
+          kubectl wait --for=condition=Established crd/configs.konfig.io --timeout=60s
+
+      - name: Apply namespace, RBAC, ServiceAccount, Service
+        run: |
+          kubectl apply -f infra/konfig/namespace.yaml
+          kubectl apply -f infra/konfig/serviceaccount.yaml
+          kubectl apply -f infra/konfig/clusterrole.yaml
+          kubectl apply -f infra/konfig/clusterrole-configmap.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding-configmap.yaml
+          kubectl apply -f infra/konfig/role-secret.yaml
+          kubectl apply -f infra/konfig/service.yaml
+
+      - name: Apply konfig ConfigMap (override watched Config name for loadtest)
+        run: |
+          kubectl create configmap konfig-config \
+            --namespace=konfig-system \
+            --from-literal=namespace=konfig-system \
+            --from-literal=name=konfig-loadtest \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Pre-seed Config CR (must exist before konfig starts)
+        run: |
+          kubectl apply -f infra/konfig-loadtest/seed-config.yaml
+
+      - name: Verify locally-loaded image is linux/amd64
+        run: |
+          for img in kasa288/konfig:latest kasa288/konfig-loadtest:latest; do
+            arch=$(docker inspect --format '{{.Architecture}}' "$img")
+            os=$(docker inspect --format '{{.Os}}' "$img")
+            echo "$img -> $os/$arch"
+            if [ "$os" != "linux" ] || [ "$arch" != "amd64" ]; then
+              echo "::error::Expected linux/amd64 for $img, got $os/$arch"
+              exit 1
+            fi
+          done
+
+      - name: Wait for node Ready (CNI plugin posted Ready condition)
+        run: |
+          kubectl wait --for=condition=Ready node --all --timeout=120s
+
+      - name: Apply konfig Deployment (force IfNotPresent, disable TLS for loadtest)
+        # Identical mTLS-off + IfNotPresent + probe-delay + KONFIG_LOG_SYNC
+        # patches as the smoke gate (CU-86aj3872a, CU-86aj4guza). The harness
+        # speaks plaintext; cert-manager is not in the kind cluster.
+        run: |
+          yq '
+            (.spec.template.spec.containers[] | select(.name == "konfig")).imagePullPolicy = "IfNotPresent"
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).args |=
+                ([.[] | select(test("^--tls") | not)] + ["--tls=false"])
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).readinessProbe.initialDelaySeconds = 15
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).livenessProbe.initialDelaySeconds = 15
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).livenessProbe.failureThreshold = 6
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).env += [{"name": "KONFIG_LOG_SYNC", "value": "1"}]
+            | del(.spec.template.spec.containers[] | select(.name == "konfig").volumeMounts[] | select(.name == "konfig-tls"))
+            | del(.spec.template.spec.volumes[] | select(.name == "konfig-tls"))
+          ' infra/konfig/deployment.yaml \
+          | kubectl apply -f -
+
+      - name: Scale konfig to ${{ inputs.replicas }} replicas (CU-86ahrg75h)
+        # deployment.yaml ships replicas: 1 (per-pod profiling default). Scale to
+        # the acceptance count. podAntiAffinity is `preferred`, so >1 pod can
+        # co-schedule on the single kind node.
+        run: |
+          kubectl scale -n konfig-system deploy/konfig --replicas=${{ inputs.replicas }}
+
+      - name: Wait for all konfig replicas Ready (cache populated)
+        # Ready only flips after the gRPC health probe passes, which requires the
+        # Config-cache populator to observe the watched CR at least once.
+        run: |
+          kubectl rollout status -n konfig-system deploy/konfig --timeout=240s
+          kubectl wait --for=condition=Available -n konfig-system deploy/konfig --timeout=240s
+          kubectl wait --for=condition=Ready -n konfig-system pod -l app=konfig --timeout=240s
+          echo "=== konfig replicas ==="
+          kubectl get pods -n konfig-system -l app=konfig -o wide
+
+      - name: Apply konfig-loadtest acceptance Job
+        # Patch the smoke Job into the acceptance shape:
+        #   * IfNotPresent (locally-loaded :latest, no registry pull)
+        #   * --results-json /results/acceptance.json  (machine-readable output)
+        #   * S1_* env = the CU-86ahzwhat shape (100 subs, 100 applies @6000ms,
+        #     p99 gate 1000ms). Scenario stays `all` (default) so get/secrets
+        #     percentiles are captured too — only scenario-1 is the 10-min run.
+        #   * hostPath volume so acceptance.json survives the Job pod's exit and
+        #     is readable from the kind node via `docker exec` afterwards.
+        #   * bumped CPU/mem so a throttled CLIENT pod does not inflate p99.
+        run: |
+          yq '
+            (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).imagePullPolicy = "IfNotPresent"
+            | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).args += ["--results-json", "/results/acceptance.json"]
+            | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).env = [
+                {"name": "S1_SUBSCRIBERS", "value": "${{ inputs.subscribers }}"},
+                {"name": "S1_APPLIES", "value": "${{ inputs.applies }}"},
+                {"name": "S1_INTERVAL_MS", "value": "${{ inputs.interval_ms }}"},
+                {"name": "S1_P99_LIMIT_MS", "value": "${{ inputs.p99_limit_ms }}"}
+              ]
+            | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).resources.limits.cpu = "4"
+            | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).resources.limits.memory = "1Gi"
+            | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).volumeMounts = [{"name": "results", "mountPath": "/results"}]
+            | .spec.template.spec.volumes = [{"name": "results", "hostPath": {"path": "/tmp/konfig-acceptance-results", "type": "DirectoryOrCreate"}}]
+          ' infra/konfig-loadtest/job.yaml \
+          | kubectl apply -f -
+
+      - name: Stream loadtest logs and wait for completion
+        # Same wait-then-stream-then-check-Job-status pattern as the smoke gate.
+        # The loadtest binary exits non-zero on any FAIL row (p99 over budget /
+        # missed events), which the Job surfaces as status.failed.
+        run: |
+          for _ in $(seq 1 60); do
+            PHASE=$(kubectl get pods -n konfig-system -l job-name=konfig-loadtest \
+                      -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+            if [ "$PHASE" = "Running" ] || [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "Failed" ]; then
+              break
+            fi
+            sleep 2
+          done
+          echo "loadtest pod phase: ${PHASE:-unknown}"
+          # 10-min run: --pod-running-timeout / log-follow must outlast it.
+          kubectl logs -n konfig-system -f job/konfig-loadtest --all-containers=true --pod-running-timeout=20m || true
+          sleep 5
+          for _ in $(seq 1 30); do
+            SUCCEEDED=$(kubectl get job/konfig-loadtest -n konfig-system -o jsonpath='{.status.succeeded}' 2>/dev/null || true)
+            FAILED=$(kubectl get job/konfig-loadtest -n konfig-system -o jsonpath='{.status.failed}' 2>/dev/null || true)
+            if [ -n "$SUCCEEDED" ] && [ "$SUCCEEDED" != "0" ]; then
+              echo "Acceptance job succeeded"
+              exit 0
+            fi
+            if [ -n "$FAILED" ] && [ "$FAILED" != "0" ]; then
+              echo "Acceptance job failed (status.failed=$FAILED)"
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Job status never settled — treating as failure"
+          kubectl get job/konfig-loadtest -n konfig-system -o yaml
+          exit 1
+
+      - name: Extract acceptance results JSON from kind node
+        # The Job pod has exited, so `kubectl cp` is unavailable. The hostPath
+        # volume put acceptance.json on the kind NODE's filesystem (the node is a
+        # docker container) — read it back from there. `if: always()` so a gate
+        # FAIL still surfaces the captured percentiles for triage.
+        if: always()
+        run: |
+          if docker exec "${CLUSTER}-control-plane" test -f /tmp/konfig-acceptance-results/acceptance.json; then
+            docker exec "${CLUSTER}-control-plane" cat /tmp/konfig-acceptance-results/acceptance.json > acceptance.json
+            echo "=== acceptance.json ==="
+            cat acceptance.json
+          else
+            echo "::warning::acceptance.json not found on the kind node (loadtest may have crashed before writing it)"
+          fi
+
+      - name: Upload acceptance results artifact
+        # Durable output for CU-86ahrg75h. Download from the run summary and
+        # commit via a normal PR (CI does not push to the repo).
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-acceptance-results
+          path: acceptance.json
+          if-no-files-found: warn
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods -A
+          echo "=== konfig deployment describe ==="
+          kubectl describe -n konfig-system deploy/konfig || true
+          echo "=== konfig pod describe ==="
+          kubectl describe -n konfig-system pod -l app=konfig || true
+          echo "=== konfig pod logs (current) ==="
+          kubectl logs -n konfig-system -l app=konfig --tail=200 || true
+          echo "=== konfig pod logs (--previous: crashed instance) ==="
+          kubectl logs -n konfig-system -l app=konfig --previous --tail=200 || true
+          echo "=== node describe + capacity ==="
+          kubectl describe node || true
+          echo "=== loadtest job describe ==="
+          kubectl describe -n konfig-system job/konfig-loadtest || true
+          echo "=== loadtest pod describe ==="
+          kubectl describe -n konfig-system pod -l job-name=konfig-loadtest || true
+          echo "=== loadtest pod logs (full) ==="
+          kubectl logs -n konfig-system -l job-name=konfig-loadtest --tail=-1 || true
+          echo "=== events ==="
+          kubectl get events -n konfig-system --sort-by=.lastTimestamp || true
