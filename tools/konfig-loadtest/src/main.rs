@@ -15,6 +15,17 @@
 //!   --duration N        — when set, scenario_subscribe_flood loops applies for
 //!      N seconds (no per-event accounting, drain-only check). Designed for
 //!      steady-state RSS / allocator decay runs.
+//!
+//! Tunables (env, defaults preserve historical shape):
+//!   S1_SUBSCRIBERS / S1_APPLIES / S1_INTERVAL_MS — scenario-1 shape
+//!     (100 / 200 / 100 ms). For CU-86ahzwhat set 100 / 100 / 6000 (10/min × 10 min).
+//!   S1_P99_LIMIT_MS — scenario-1 p99 gate in ms (default 500; set 1000 for
+//!     CU-86ahzwhat's budget).
+//!
+//! Result output:
+//!   --results-json PATH (or KONFIG_LOADTEST_RESULTS_JSON env) — opt-in; writes
+//!     a JSON summary of per-scenario pass/fail + p50/p95/p99/max for committing
+//!     acceptance results (CU-86ahrg75h). Unset = no file, unchanged behavior.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,6 +66,13 @@ struct Args {
     /// and allocator-decay observation, not a CI gate.
     #[arg(long)]
     duration: Option<u64>,
+    /// Optional path to write a machine-readable JSON summary of every
+    /// scenario's pass/fail + latency percentiles. Opt-in: when unset (and
+    /// `KONFIG_LOADTEST_RESULTS_JSON` is also unset) no file is written and
+    /// behavior is unchanged. Intended for the acceptance run to commit
+    /// p50/p95/p99 results (CU-86ahrg75h).
+    #[arg(long)]
+    results_json: Option<String>,
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -110,6 +128,19 @@ struct ScenarioResult {
     name: &'static str,
     pass: bool,
     failures: Vec<String>,
+    /// Latency percentiles (ms) for the JSON summary. None for scenarios that
+    /// do not capture per-event latency (e.g. sustained soak). Does not affect
+    /// pass/fail logic — purely for machine-readable result output.
+    metrics: Option<LatencyMetrics>,
+}
+
+#[derive(Clone, Copy)]
+struct LatencyMetrics {
+    samples: usize,
+    p50_ms: u128,
+    p95_ms: u128,
+    p99_ms: u128,
+    max_ms: u128,
 }
 
 impl ScenarioResult {
@@ -118,6 +149,7 @@ impl ScenarioResult {
             name,
             pass: true,
             failures: Vec::new(),
+            metrics: None,
         }
     }
 
@@ -126,7 +158,13 @@ impl ScenarioResult {
             name,
             pass: false,
             failures,
+            metrics: None,
         }
+    }
+
+    fn with_metrics(mut self, metrics: LatencyMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -324,11 +362,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     info!("└─────────────────────────────┴──────────┘");
 
+    // Opt-in machine-readable summary (CU-86ahrg75h: commit p50/p95/p99). CLI
+    // flag takes precedence over the env var; when neither is set nothing is
+    // written and behavior is unchanged.
+    let results_json_path = args
+        .results_json
+        .clone()
+        .or_else(|| std::env::var("KONFIG_LOADTEST_RESULTS_JSON").ok());
+    if let Some(path) = results_json_path {
+        match write_results_json(&path, &results, any_fail) {
+            Ok(()) => info!(path = %path, "wrote results JSON"),
+            // A write failure must not mask a scenario PASS, but it should be
+            // loud — surface it as a process-level error after the gate check.
+            Err(e) => error!(path = %path, "failed to write results JSON: {e}"),
+        }
+    }
+
     if any_fail {
         std::process::exit(1);
     }
     info!("konfig-loadtest ALL PASSED");
     Ok(())
+}
+
+/// Write a machine-readable JSON summary of all scenario results to `path`.
+/// Hand-rolled (no serde dep) — the schema is small and stable:
+///
+///   {"all_passed":bool,"scenarios":[
+///     {"name":str,"pass":bool,
+///      "metrics":{"samples":n,"p50_ms":n,"p95_ms":n,"p99_ms":n,"max_ms":n}|null,
+///      "failures":[str,...]}
+///   ]}
+fn write_results_json(
+    path: &str,
+    results: &[ScenarioResult],
+    any_fail: bool,
+) -> std::io::Result<()> {
+    fn esc(s: &str) -> String {
+        // Minimal JSON string escaping: backslash, quote, and control chars
+        // that appear in our failure messages. Sufficient for this fixed set
+        // of programmatically-built strings.
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    let mut json = String::new();
+    json.push_str(&format!("{{\"all_passed\":{},\"scenarios\":[", !any_fail));
+    for (i, r) in results.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"name\":\"{}\",\"pass\":{},",
+            esc(r.name),
+            r.pass
+        ));
+        match &r.metrics {
+            Some(m) => json.push_str(&format!(
+                "\"metrics\":{{\"samples\":{},\"p50_ms\":{},\"p95_ms\":{},\"p99_ms\":{},\"max_ms\":{}}},",
+                m.samples, m.p50_ms, m.p95_ms, m.p99_ms, m.max_ms
+            )),
+            None => json.push_str("\"metrics\":null,"),
+        }
+        json.push_str("\"failures\":[");
+        for (j, f) in r.failures.iter().enumerate() {
+            if j > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!("\"{}\"", esc(f)));
+        }
+        json.push_str("]}");
+    }
+    json.push_str("]}\n");
+
+    std::fs::write(path, json)
 }
 
 // ── Scenario 1: Subscribe flood + rapid apply ─────────────────────────────────
@@ -354,6 +471,12 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
 }
+fn env_u128(key: &str, default: u128) -> u128 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
 
 async fn scenario_subscribe_flood(
     addr: &str,
@@ -366,6 +489,9 @@ async fn scenario_subscribe_flood(
     let s1_subscribers: usize = env_usize("S1_SUBSCRIBERS", 100);
     let s1_applies: u32 = env_u32("S1_APPLIES", 200);
     let s1_interval_ms: u64 = env_u64("S1_INTERVAL_MS", 100);
+    // p99 gate is env-tunable so the acceptance run (CU-86ahzwhat) can set the
+    // 1000 ms budget without a recompile. Default preserves the 500 ms bar.
+    let s1_p99_limit_ms: u128 = env_u128("S1_P99_LIMIT_MS", S1_P99_LIMIT_MS);
 
     if let Some(secs) = duration_secs {
         return scenario_subscribe_flood_sustained(
@@ -523,17 +649,24 @@ async fn scenario_subscribe_flood(
     );
 
     let mut failures = Vec::new();
-    if p99 >= S1_P99_LIMIT_MS {
-        failures.push(format!("p99 {p99} ms >= gate {S1_P99_LIMIT_MS} ms"));
+    if p99 >= s1_p99_limit_ms {
+        failures.push(format!("p99 {p99} ms >= gate {s1_p99_limit_ms} ms"));
     }
     if missed > 0 {
         failures.push(format!("{missed} missed events"));
     }
 
+    let metrics = LatencyMetrics {
+        samples: lat.samples.len(),
+        p50_ms: p50,
+        p95_ms: p95,
+        p99_ms: p99,
+        max_ms: max,
+    };
     if failures.is_empty() {
-        ScenarioResult::pass("subscribe_flood")
+        ScenarioResult::pass("subscribe_flood").with_metrics(metrics)
     } else {
-        ScenarioResult::fail("subscribe_flood", failures)
+        ScenarioResult::fail("subscribe_flood", failures).with_metrics(metrics)
     }
 }
 
@@ -882,10 +1015,17 @@ async fn scenario_get_flood(addr: &str, namespace: &str, config_name: &str) -> S
         failures.push(format!("p99 {p99} ms >= gate {S2_P99_LIMIT_MS} ms"));
     }
 
+    let metrics = LatencyMetrics {
+        samples: lat.samples.len(),
+        p50_ms: p50,
+        p95_ms: p95,
+        p99_ms: p99,
+        max_ms: max,
+    };
     if failures.is_empty() {
-        ScenarioResult::pass("get_flood")
+        ScenarioResult::pass("get_flood").with_metrics(metrics)
     } else {
-        ScenarioResult::fail("get_flood", failures)
+        ScenarioResult::fail("get_flood", failures).with_metrics(metrics)
     }
 }
 
@@ -1412,10 +1552,17 @@ async fn scenario_secrets_flood(addr: &str, namespace: &str, secret_name: &str) 
         failures.push(format!("{missed} missed secret events"));
     }
 
+    let metrics = LatencyMetrics {
+        samples: lat.samples.len(),
+        p50_ms: p50,
+        p95_ms: p95,
+        p99_ms: p99,
+        max_ms: max,
+    };
     if failures.is_empty() {
-        ScenarioResult::pass("secrets_flood")
+        ScenarioResult::pass("secrets_flood").with_metrics(metrics)
     } else {
-        ScenarioResult::fail("secrets_flood", failures)
+        ScenarioResult::fail("secrets_flood", failures).with_metrics(metrics)
     }
 }
 
