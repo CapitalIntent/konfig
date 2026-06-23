@@ -28,6 +28,11 @@ tokio = {version = "1.52.3", features = ["full"], default-features = false}
 tonic = {version = "0.14.6", features = ["tls-ring"]}
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
+# grpc-Web protocol translation (CU-86ahzwhg4) so the Backstage browser plugin
+# can reach konfig's gRPC server directly on port 50051 (no Envoy proxy). Pinned
+# to 0.14.6 to track the workspace tonic 0.14.6 — tonic-web depends on
+# `tonic ^0.14.6`, so a mismatched (e.g. 0.12) tonic-web would not compile.
+tonic-web = "0.14.6"
 tracing = {version = "0.1.44", features = ["attributes", "log", "async-await"]}
 # mTLS client-identity extraction (Phase 8, CU-86ahrwd6h). Parses the peer
 # leaf cert presented on the gRPC mTLS handshake to derive a client identity
