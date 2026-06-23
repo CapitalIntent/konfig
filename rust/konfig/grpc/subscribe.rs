@@ -15,14 +15,14 @@
 //!    current cache as MODIFIED events then join the live broadcast.  No error
 //!    is returned; the client gets a consistent snapshot and continues normally.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures_util::{StreamExt, TryStreamExt};
-use kube::core::DynamicObject;
+use kube::core::{DynamicObject, Expression, Selector, SelectorExt};
 use kube::runtime::watcher::{self as kube_watcher, Event, watcher as kube_watch_stream};
 use kube::{Api, Client};
 use tokio::sync::mpsc::error::TrySendError;
@@ -55,6 +55,12 @@ use prost::Message as _;
 pub struct BroadcastFrame {
     pub sent_at: Instant,
     pub event: Arc<ConfigEvent>,
+    /// The source object's `metadata.labels`, carried alongside the event so
+    /// the per-subscriber bridge can apply `label_selector` filtering without
+    /// re-parsing the `DynamicObject` or bloating the wire-format
+    /// `ConfigEvent`.  Shared `Arc` clone from `ConfigSnapshot::labels` — a
+    /// refcount bump per frame, not a `BTreeMap` deep copy.
+    pub labels: Arc<BTreeMap<String, String>>,
 }
 
 /// Per-subscriber mpsc capacity — back-pressure for slow readers.
@@ -198,6 +204,11 @@ pub struct ReplayEntry {
     pub resource_version: String,
     pub resource_version_u64: u64,
     pub event: Arc<ConfigEvent>,
+    /// The source object's `metadata.labels`, mirroring `BroadcastFrame::
+    /// labels`.  Kept so the resume/snapshot replay paths can apply
+    /// `label_selector` filtering on buffered events without re-parsing.
+    /// Shared `Arc` clone — refcount bump, not a deep copy.
+    pub labels: Arc<BTreeMap<String, String>>,
 }
 
 /// Per-namespace replay buffer: a bounded FIFO ring of the last
@@ -209,7 +220,16 @@ pub type ReplayBuffer = Arc<Mutex<VecDeque<ReplayEntry>>>;
 /// `resource_version` is parsed as `u64` at push time so resume can
 /// binary-search the buffer.  An unparseable RV (kube only emits decimal
 /// strings, so this signals upstream malformation) is logged and dropped.
-fn push_replay(buf: &ReplayBuffer, resource_version: &str, event: Arc<ConfigEvent>) {
+///
+/// `labels` is the source object's `metadata.labels` (an `Arc` clone — a
+/// refcount bump, not a deep copy) so the resume/snapshot replay paths can
+/// apply `label_selector` filtering on buffered events.
+fn push_replay(
+    buf: &ReplayBuffer,
+    resource_version: &str,
+    event: Arc<ConfigEvent>,
+    labels: Arc<BTreeMap<String, String>>,
+) {
     let Ok(resource_version_u64) = resource_version.parse::<u64>() else {
         warn!(
             resource_version = %resource_version,
@@ -230,7 +250,267 @@ fn push_replay(buf: &ReplayBuffer, resource_version: &str, event: Arc<ConfigEven
         resource_version: resource_version.to_owned(),
         resource_version_u64,
         event,
+        labels,
     });
+}
+
+// ── Subscribe filtering: `names` + `label_selector` ─────────────────────────
+
+/// Parse a K8s label-selector string into a [`Selector`].
+///
+/// kube 0.98 ships the selector *matcher* (`Selector` / `Expression` /
+/// `SelectorExt`) but NO string→`Selector` parser, so we hand-roll the
+/// equality + set-based grammar subset that K8s accepts on a `Subscribe`
+/// request.  Kept a pure `&str → Result<Selector, Status>` fn so every branch
+/// is unit-testable with no kube client or cache.
+///
+/// Grammar (comma-separated requirements, ANDed):
+///
+/// - `key in (v1, v2, ...)`    → [`Expression::In`]
+/// - `key notin (v1, ...)`     → [`Expression::NotIn`]
+/// - `key = value` / `key == value` → [`Expression::Equal`]
+/// - `key != value`            → [`Expression::NotEqual`]
+/// - `!key`                    → [`Expression::DoesNotExist`]
+/// - bare `key`                → [`Expression::Exists`]
+///
+/// An empty / whitespace-only input yields an empty `Selector`, which matches
+/// everything (the no-filter case).  Whitespace around keys, operators, and
+/// values is trimmed.  Malformed input (unbalanced parens, empty key, empty
+/// value where a value is required, unknown operator) returns
+/// `Status::invalid_argument` so the RPC fails fast with a clear reason.
+fn parse_label_selector(input: &str) -> Result<Selector, Status> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        // Empty Selector — `Selector::selects_all()` is true, matches all.
+        return Ok(Selector::default());
+    }
+
+    let requirements = split_top_level_requirements(trimmed)?;
+    let mut expressions: Vec<Expression> = Vec::with_capacity(requirements.len());
+    for req in requirements {
+        expressions.push(parse_requirement(req.trim())?);
+    }
+    // `impl FromIterator<Expression> for Selector` (kube 0.98) — collects the
+    // expression list via `Selector::from_expressions`.
+    Ok(expressions.into_iter().collect())
+}
+
+/// Split a selector string on top-level commas, treating commas inside
+/// `( ... )` as value-list separators rather than requirement separators.
+/// Errors on unbalanced parentheses.
+fn split_top_level_requirements(input: &str) -> Result<Vec<&str>, Status> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(Status::invalid_argument(
+                        "invalid label_selector: unbalanced parentheses",
+                    ));
+                }
+            }
+            ',' if depth == 0 => {
+                parts.push(&input[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(Status::invalid_argument(
+            "invalid label_selector: unbalanced parentheses",
+        ));
+    }
+    parts.push(&input[start..]);
+    Ok(parts)
+}
+
+/// Parse one trimmed requirement into an [`Expression`].
+fn parse_requirement(req: &str) -> Result<Expression, Status> {
+    if req.is_empty() {
+        return Err(Status::invalid_argument(
+            "invalid label_selector: empty requirement",
+        ));
+    }
+
+    // Set-based: `key in (...)` / `key notin (...)`. Detected by a top-level
+    // `(` after an `in` / `notin` keyword token.
+    if let Some(open) = req.find('(') {
+        let head = req[..open].trim();
+        let close = req.rfind(')').ok_or_else(|| {
+            Status::invalid_argument("invalid label_selector: unbalanced parentheses")
+        })?;
+        if close < open {
+            return Err(Status::invalid_argument(
+                "invalid label_selector: unbalanced parentheses",
+            ));
+        }
+        let values_str = &req[open + 1..close];
+        // Split the head into `key` and the `in` / `notin` operator.
+        let (key, op) = split_set_head(head)?;
+        let values = parse_value_set(values_str)?;
+        return match op {
+            SetOp::In => Ok(Expression::In(key, values)),
+            SetOp::NotIn => Ok(Expression::NotIn(key, values)),
+        };
+    }
+
+    // Equality / inequality. Order matters: check the two-char operators
+    // (`==`, `!=`) before the single-char `=`.
+    if let Some((k, v)) = req.split_once("==") {
+        return Ok(Expression::Equal(parse_key(k)?, parse_value(v)?));
+    }
+    if let Some((k, v)) = req.split_once("!=") {
+        return Ok(Expression::NotEqual(parse_key(k)?, parse_value(v)?));
+    }
+    if let Some((k, v)) = req.split_once('=') {
+        return Ok(Expression::Equal(parse_key(k)?, parse_value(v)?));
+    }
+
+    // Existence: `!key` (does-not-exist) or bare `key` (exists).
+    if let Some(rest) = req.strip_prefix('!') {
+        return Ok(Expression::DoesNotExist(parse_key(rest)?));
+    }
+    Ok(Expression::Exists(parse_key(req)?))
+}
+
+/// The two set-based operators.
+enum SetOp {
+    In,
+    NotIn,
+}
+
+/// Split a set-requirement head (`"key in"` / `"key notin"`) into its key and
+/// operator.  The operator is the final whitespace-delimited token.
+fn split_set_head(head: &str) -> Result<(String, SetOp), Status> {
+    let (key_part, op_token) = head.rsplit_once(char::is_whitespace).ok_or_else(|| {
+        Status::invalid_argument("invalid label_selector: missing in/notin operator")
+    })?;
+    let op = match op_token.trim() {
+        "in" => SetOp::In,
+        "notin" => SetOp::NotIn,
+        other => {
+            return Err(Status::invalid_argument(format!(
+                "invalid label_selector: unknown set operator '{other}'"
+            )));
+        }
+    };
+    Ok((parse_key(key_part)?, op))
+}
+
+/// Parse a comma-separated value list inside `( ... )` into a `BTreeSet`.
+/// (kube 0.98 `Expression::In` / `NotIn` carry `BTreeSet<String>`.)
+fn parse_value_set(values_str: &str) -> Result<BTreeSet<String>, Status> {
+    let mut set = BTreeSet::new();
+    for v in values_str.split(',') {
+        let v = v.trim();
+        if v.is_empty() {
+            return Err(Status::invalid_argument(
+                "invalid label_selector: empty value in set",
+            ));
+        }
+        set.insert(v.to_owned());
+    }
+    if set.is_empty() {
+        return Err(Status::invalid_argument(
+            "invalid label_selector: empty value set",
+        ));
+    }
+    Ok(set)
+}
+
+/// Trim and validate a label key — must be non-empty after trimming.
+fn parse_key(key: &str) -> Result<String, Status> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(Status::invalid_argument(
+            "invalid label_selector: empty key",
+        ));
+    }
+    Ok(key.to_owned())
+}
+
+/// Trim and validate an equality value — must be non-empty after trimming.
+fn parse_value(value: &str) -> Result<String, Status> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Status::invalid_argument(
+            "invalid label_selector: empty value",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+/// Pure predicate combining the `Subscribe` request's `names` and
+/// `label_selector` constraints, ANDed.  An event is delivered iff it passes
+/// BOTH: its config name is in `names` (or `names` is unconstrained) AND its
+/// labels match `selector` (an empty `Selector` matches everything).
+///
+/// Constructed once per `Subscribe` RPC and shared (`Arc`) across the
+/// resume/snapshot/live paths, so the parse + `HashSet` build happen once, not
+/// per event.
+#[derive(Debug)]
+pub(crate) struct SubscribeFilter {
+    /// `None` ⇒ no name constraint (empty `names` request — historical
+    /// behaviour).  `Some(set)` ⇒ event passes only if its config name is in
+    /// the set.
+    names: Option<HashSet<String>>,
+    /// An empty `Selector` matches every label map.
+    selector: Selector,
+}
+
+impl SubscribeFilter {
+    /// Build a filter from a `Subscribe` request's `names` + `label_selector`.
+    ///
+    /// An empty `names` slice ⇒ no name constraint.  A malformed
+    /// `label_selector` propagates as `INVALID_ARGUMENT` so the RPC fails fast
+    /// before any stream is spawned.
+    pub(crate) fn new(names: &[String], label_selector: &str) -> Result<Self, Status> {
+        let names = if names.is_empty() {
+            None
+        } else {
+            Some(names.iter().cloned().collect())
+        };
+        let selector = parse_label_selector(label_selector)?;
+        Ok(Self { names, selector })
+    }
+
+    /// Returns true iff the event for `config_name` with `labels` passes BOTH
+    /// the name and label-selector constraints.
+    pub(crate) fn allow(&self, config_name: &str, labels: &BTreeMap<String, String>) -> bool {
+        let name_ok = match &self.names {
+            None => true,
+            Some(set) => set.contains(config_name),
+        };
+        name_ok && self.selector.matches(labels)
+    }
+}
+
+/// Extract the config name from a `ConfigEvent` for filtering.  Returns `None`
+/// when the event carries no inner `Config` (defensive — every emitted event
+/// sets `config: Some(..)`, but a `None` is treated as non-matching by the
+/// caller so a malformed event is filtered out rather than leaked).
+fn config_event_name(event: &ConfigEvent) -> Option<&str> {
+    event.config.as_ref().map(|c| c.name.as_str())
+}
+
+/// Apply the [`SubscribeFilter`] to a `ConfigEvent` + its `labels`.  An event
+/// with no inner `Config` name is treated as non-matching (filtered out)
+/// rather than leaked.  Shared by the replay, post-snapshot, and live paths so
+/// the name-extraction + AND logic lives in one unit-tested place.
+fn filter_allows_event(
+    filter: &SubscribeFilter,
+    event: &ConfigEvent,
+    labels: &BTreeMap<String, String>,
+) -> bool {
+    match config_event_name(event) {
+        Some(name) => filter.allow(name, labels),
+        None => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -250,6 +530,16 @@ pub async fn handle_subscribe(
     if !cache.is_populated() {
         return Err(Status::unavailable("cache not yet populated"));
     }
+
+    // Build the per-subscription filter BEFORE spawning so a malformed
+    // `label_selector` surfaces as the RPC's `INVALID_ARGUMENT` result rather
+    // than a silently-dropped stream.  `names` + `label_selector` are ANDed;
+    // an empty `names` slice keeps the historical "all configs" behaviour for
+    // the name dimension, and an empty `label_selector` adds no label
+    // constraint.  NOTE: a non-empty `names` now actually filters — clients
+    // that previously sent `names` received every config in the namespace
+    // (the filter was never applied); they now receive only the named ones.
+    let filter = Arc::new(SubscribeFilter::new(&req.names, &req.label_selector)?);
 
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     // Move req fields out instead of cloning — req is dropped at function exit.
@@ -285,6 +575,7 @@ pub async fn handle_subscribe(
         bcast_rx,
         tx,
         drain_notify,
+        filter,
     ));
     Ok(Response::new(ReceiverStream::new(rx)))
 }
@@ -638,6 +929,10 @@ fn process_namespace_event(
         event_type,
         config: Some(snapshot_to_proto(&snap)),
     });
+    // Carry the parsed labels alongside the event for `label_selector`
+    // filtering downstream — an `Arc` clone (refcount bump) shared by both
+    // the replay entry and the broadcast frame.
+    let labels = Arc::clone(&snap.labels);
 
     H2_DATA_FRAME_BYTES.observe(config_event.encoded_len() as f64);
 
@@ -649,6 +944,7 @@ fn process_namespace_event(
         replay_buf,
         &snap.resource_version,
         Arc::clone(&config_event),
+        Arc::clone(&labels),
     );
 
     let sent_at = Instant::now();
@@ -657,6 +953,7 @@ fn process_namespace_event(
     Some(Arc::new(BroadcastFrame {
         sent_at,
         event: config_event,
+        labels,
     }))
 }
 
@@ -835,6 +1132,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
 ///
 /// After draining the buffer (or snapshot), the subscriber joins the shared
 /// broadcast channel for future events — no kube watch is opened.
+#[allow(clippy::too_many_arguments)]
 async fn resume_from_buffer(
     resume_rv: String,
     replay_buf: ReplayBuffer,
@@ -843,6 +1141,7 @@ async fn resume_from_buffer(
     bcast_rx: broadcast::Receiver<Arc<BroadcastFrame>>,
     tx: mpsc::Sender<Result<ConfigEvent, Status>>,
     drain_notify: Arc<Notify>,
+    filter: Arc<SubscribeFilter>,
 ) {
     // Parse the resume RV once.  An empty string falls through as a buffer
     // miss (used by fresh subscribers); a non-empty non-numeric value is an
@@ -872,7 +1171,11 @@ async fn resume_from_buffer(
     // monotonically increasing resource_version order, so the buffer is
     // already sorted by `resource_version_u64`.  Use `binary_search_by_key`
     // (O(log N)) instead of the prior O(N) `position()` scan.
-    let (replay_slice, found_in_buffer): (Vec<Arc<ConfigEvent>>, bool) = {
+    // Each replay item carries its labels alongside the event so the
+    // `label_selector` filter can be applied at the emit point below without
+    // re-locking the buffer.  Both fields are `Arc` clones — refcount bumps.
+    type ReplayItem = (Arc<ConfigEvent>, Arc<BTreeMap<String, String>>);
+    let (replay_slice, found_in_buffer): (Vec<ReplayItem>, bool) = {
         let guard = crate::sync_util::lock_recovered(&replay_buf);
         let lookup = resume_rv_u64.and_then(|target| {
             guard
@@ -887,8 +1190,13 @@ async fn resume_from_buffer(
                 // appear in the CU-86aj360ae heap profile on every
                 // reconnect that hits the replay buffer. CU-86aj3m1bd.
                 let cap = guard.len().saturating_sub(idx + 1);
-                let mut slice: Vec<Arc<ConfigEvent>> = Vec::with_capacity(cap);
-                slice.extend(guard.iter().skip(idx + 1).map(|e| Arc::clone(&e.event)));
+                let mut slice: Vec<ReplayItem> = Vec::with_capacity(cap);
+                slice.extend(
+                    guard
+                        .iter()
+                        .skip(idx + 1)
+                        .map(|e| (Arc::clone(&e.event), Arc::clone(&e.labels))),
+                );
                 debug!(
                     namespace = %namespace,
                     resume_rv = %resume_rv,
@@ -919,7 +1227,9 @@ async fn resume_from_buffer(
         );
         let mut snapshot_events: Vec<ConfigEvent> = Vec::with_capacity(snapshots.len());
         // Track the max snapshot RV inline so we don't re-walk + re-parse the
-        // snapshot list to compute it after the send phase.
+        // snapshot list to compute it after the send phase.  Computed across
+        // ALL snapshots (even filtered-out ones) so the race-window boundary
+        // stays correct regardless of the per-subscriber filter.
         let mut max_snapshot_rv: u64 = 0;
         for snap in &snapshots {
             // K8s emits decimal-string RVs; non-numeric here means we already
@@ -928,6 +1238,11 @@ async fn resume_from_buffer(
                 && rv > max_snapshot_rv
             {
                 max_snapshot_rv = rv;
+            }
+            // Apply the `names` + `label_selector` filter — only configs that
+            // pass BOTH constraints are emitted to this subscriber.
+            if !filter.allow(&snap.name, &snap.labels) {
+                continue;
             }
             snapshot_events.push(ConfigEvent {
                 event_type: EventType::Snapshot as i32,
@@ -947,12 +1262,12 @@ async fn resume_from_buffer(
         // snapshot was taken but before this subscriber joins the broadcast.
         // RVs are pre-parsed in `ReplayEntry::resource_version_u64`, so this
         // filter is O(N) loads with no string→u64 work.
-        let post_snapshot_events: Vec<Arc<ConfigEvent>> = {
+        let post_snapshot_events: Vec<ReplayItem> = {
             let guard = crate::sync_util::lock_recovered(&replay_buf);
             guard
                 .iter()
                 .filter(|e| e.resource_version_u64 > max_snapshot_rv)
-                .map(|e| Arc::clone(&e.event))
+                .map(|e| (Arc::clone(&e.event), Arc::clone(&e.labels)))
                 .collect()
         }; // mutex released here
 
@@ -962,7 +1277,12 @@ async fn resume_from_buffer(
             "Resume: sending post-snapshot buffer events to close race window"
         );
 
-        for event in post_snapshot_events {
+        for (event, labels) in post_snapshot_events {
+            // Apply the `names` + `label_selector` filter; a filtered-out
+            // event is normal — skip it (do not disconnect the stream).
+            if !filter_allows_event(&filter, &event, &labels) {
+                continue;
+            }
             // Use try_send + disconnect-on-Full, matching the buffer-hit path
             // below.  The previous blocking `.send().await` here was the
             // last remaining starvation vector: a slow subscriber could hold
@@ -975,7 +1295,11 @@ async fn resume_from_buffer(
         // Buffer hit — send only the missed events.
         // Arc clones collected above are dereferenced here to produce ConfigEvent
         // values for the per-subscriber mpsc — no extra serialisation.
-        for event in replay_slice {
+        for (event, labels) in replay_slice {
+            // Same per-event filter as the snapshot/post-snapshot paths.
+            if !filter_allows_event(&filter, &event, &labels) {
+                continue;
+            }
             if try_send_or_disconnect(&tx, (*event).clone(), "replay").is_break() {
                 return;
             }
@@ -983,7 +1307,7 @@ async fn resume_from_buffer(
     }
 
     // Join the live broadcast for future events.
-    bridge_broadcast(bcast_rx, tx, namespace, drain_notify).await;
+    bridge_broadcast(bcast_rx, tx, namespace, drain_notify, filter).await;
 }
 
 /// Single try_send + disconnect-on-Full helper shared by the resume snapshot,
@@ -1049,6 +1373,7 @@ async fn bridge_broadcast(
     tx: mpsc::Sender<Result<ConfigEvent, Status>>,
     namespace: String,
     drain_notify: Arc<Notify>,
+    filter: Arc<SubscribeFilter>,
 ) {
     ACTIVE_SUBSCRIBERS.with_label_values(&[&namespace]).inc();
     // Decrement on every exit path — including early returns from break.
@@ -1072,6 +1397,15 @@ async fn bridge_broadcast(
             }
             recv = bcast_rx.recv() => match recv {
                 Ok(frame) => {
+                    // Apply the per-subscriber `names` + `label_selector`
+                    // filter.  A filtered-out frame is NORMAL — `continue` to
+                    // keep the stream alive (never `break`); only back-pressure
+                    // / lag / drain close the stream.  Checked before the
+                    // latency observations so a non-matching frame is not
+                    // counted as a delivered event.
+                    if !filter_allows_event(&filter, &frame.event, &frame.labels) {
+                        continue;
+                    }
                     // OBS-2 stage 2: time from `broadcast::send` (stamped on
                     // `sent_at` by `run_namespace_watcher`) to this `recv()`
                     // return.  Measures broadcast fan-out hop latency only.
@@ -1145,18 +1479,32 @@ mod tests {
     }
 
     /// Wrap a `ConfigEvent` in a fresh `BroadcastFrame` for tests that need
-    /// to inject events into a broadcast channel.
+    /// to inject events into a broadcast channel.  Empty labels — label-
+    /// selector filtering is exercised by the dedicated parser / filter unit
+    /// tests and the resume-path end-to-end test below.
     fn make_frame(event: ConfigEvent) -> Arc<BroadcastFrame> {
         Arc::new(BroadcastFrame {
             sent_at: Instant::now(),
             event: Arc::new(event),
+            labels: Arc::new(BTreeMap::new()),
         })
+    }
+
+    /// An allow-all filter (no `names`, empty `label_selector`) for tests that
+    /// drive the resume/bridge paths without exercising filtering.
+    fn allow_all_filter() -> Arc<SubscribeFilter> {
+        Arc::new(SubscribeFilter::new(&[], "").expect("empty filter is valid"))
     }
 
     fn make_replay_buf(entries: &[(&str, u32)]) -> ReplayBuffer {
         let buf = Arc::new(Mutex::new(VecDeque::new()));
         for (rv, sv) in entries {
-            push_replay(&buf, rv, Arc::new(make_event(rv, *sv)));
+            push_replay(
+                &buf,
+                rv,
+                Arc::new(make_event(rv, *sv)),
+                Arc::new(BTreeMap::new()),
+            );
         }
         buf
     }
@@ -1204,13 +1552,23 @@ mod tests {
         let buf: ReplayBuffer = Arc::new(Mutex::new(VecDeque::new()));
         for i in 0..REPLAY_BUFFER_SIZE {
             let rv = format!("{i}");
-            push_replay(&buf, &rv, Arc::new(make_event(&rv, i as u32)));
+            push_replay(
+                &buf,
+                &rv,
+                Arc::new(make_event(&rv, i as u32)),
+                Arc::new(BTreeMap::new()),
+            );
         }
         // Buffer is exactly full — oldest is rv-0.
         assert_eq!(buf.lock().unwrap().front().unwrap().resource_version, "0");
 
         // Push one more — rv-0 must be evicted.
-        push_replay(&buf, "9999", Arc::new(make_event("9999", 9999)));
+        push_replay(
+            &buf,
+            "9999",
+            Arc::new(make_event("9999", 9999)),
+            Arc::new(BTreeMap::new()),
+        );
         let guard = buf.lock().unwrap();
         assert_eq!(guard.len(), REPLAY_BUFFER_SIZE);
         assert_eq!(guard.front().unwrap().resource_version, "1");
@@ -1239,6 +1597,7 @@ mod tests {
             bcast_rx,
             tx,
             Arc::new(Notify::new()),
+            allow_all_filter(),
         ));
 
         let mut received_schema_versions: Vec<u32> = Vec::new();
@@ -1274,6 +1633,7 @@ mod tests {
             bcast_rx,
             tx,
             Arc::new(Notify::new()),
+            allow_all_filter(),
         ));
 
         let mut received: Vec<u32> = Vec::new();
@@ -1323,6 +1683,7 @@ mod tests {
                     bcast_rx,
                     tx,
                     Arc::new(Notify::new()),
+                    allow_all_filter(),
                 )
                 .await;
                 while rx.recv().await.is_some() {}
@@ -1373,6 +1734,7 @@ mod tests {
             bcast_rx,
             tx,
             Arc::new(Notify::new()),
+            allow_all_filter(),
         ));
 
         // Wait for the resume task to be live; only then push the broadcast
@@ -1433,6 +1795,7 @@ mod tests {
             bcast_rx,
             tx,
             Arc::new(Notify::new()),
+            allow_all_filter(),
         ));
 
         let mut received_schema_versions: Vec<u32> = Vec::new();
@@ -1480,6 +1843,7 @@ mod tests {
         let frame = Arc::new(BroadcastFrame {
             sent_at: Instant::now(),
             event,
+            labels: Arc::new(BTreeMap::new()),
         });
         bcast_tx.send(frame).expect("send failed");
 
@@ -1630,6 +1994,7 @@ mod tests {
             tx,
             ns.to_string(),
             Arc::new(Notify::new()),
+            allow_all_filter(),
         ));
 
         // Broadcast 5 frames with the send timestamp slightly in the past so
@@ -1639,6 +2004,7 @@ mod tests {
             let frame = Arc::new(BroadcastFrame {
                 sent_at: Instant::now() - Duration::from_millis(1),
                 event,
+                labels: Arc::new(BTreeMap::new()),
             });
             bcast_tx.send(frame).expect("send failed");
         }
@@ -1693,6 +2059,7 @@ mod tests {
             tx,
             ns.to_string(),
             Arc::new(Notify::new()),
+            allow_all_filter(),
         ));
 
         for i in 0..3 {
@@ -1700,6 +2067,7 @@ mod tests {
             let frame = Arc::new(BroadcastFrame {
                 sent_at: Instant::now() - Duration::from_millis(1),
                 event,
+                labels: Arc::new(BTreeMap::new()),
             });
             bcast_tx.send(frame).expect("send failed");
         }
@@ -1775,7 +2143,14 @@ mod tests {
 
         let drain_clone = Arc::clone(&drain_notify);
         let bridge = tokio::spawn(async move {
-            bridge_broadcast(bcast_rx, tx, "default".into(), drain_clone).await;
+            bridge_broadcast(
+                bcast_rx,
+                tx,
+                "default".into(),
+                drain_clone,
+                allow_all_filter(),
+            )
+            .await;
         });
 
         // Give the bridge a tick to park on the select.
@@ -1806,13 +2181,23 @@ mod tests {
     #[test]
     fn push_replay_drops_non_numeric_rv() {
         let buf: ReplayBuffer = Arc::new(Mutex::new(VecDeque::new()));
-        push_replay(&buf, "not-a-number", Arc::new(make_event("0", 0)));
+        push_replay(
+            &buf,
+            "not-a-number",
+            Arc::new(make_event("0", 0)),
+            Arc::new(BTreeMap::new()),
+        );
         assert!(
             buf.lock().unwrap().is_empty(),
             "push_replay must drop entries with non-numeric resource_version",
         );
         // Valid RV still pushes.
-        push_replay(&buf, "42", Arc::new(make_event("42", 42)));
+        push_replay(
+            &buf,
+            "42",
+            Arc::new(make_event("42", 42)),
+            Arc::new(BTreeMap::new()),
+        );
         assert_eq!(buf.lock().unwrap().len(), 1);
     }
 
@@ -1839,6 +2224,7 @@ mod tests {
             bcast_rx,
             tx,
             Arc::new(Notify::new()),
+            allow_all_filter(),
         ));
 
         // Must receive a single SNAPSHOT event for cfg-a (sv 12), not a
@@ -2351,5 +2737,255 @@ mod tests {
             "send_to_all must report false when no shard has a receiver"
         );
         assert_eq!(shards.total_receiver_count(), 0);
+    }
+
+    // ── parse_label_selector: pure parser ────────────────────────────────────
+
+    /// Build a label map from `(k, v)` pairs for matcher assertions.
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_label_selector_empty_matches_everything() {
+        for input in ["", "   ", "\t\n"] {
+            let sel = parse_label_selector(input).expect("empty selector is valid");
+            assert!(
+                sel.selects_all(),
+                "empty/whitespace selector {input:?} must match everything"
+            );
+            assert!(sel.matches(&labels(&[("any", "thing")])));
+            assert!(sel.matches(&BTreeMap::new()));
+        }
+    }
+
+    #[test]
+    fn parse_label_selector_equality_operators() {
+        // `=` and `==` are both equality.
+        for input in ["tier=critical", "tier == critical", "  tier  =  critical  "] {
+            let sel = parse_label_selector(input).expect("valid equality selector");
+            assert!(sel.matches(&labels(&[("tier", "critical")])), "{input:?}");
+            assert!(!sel.matches(&labels(&[("tier", "normal")])), "{input:?}");
+            assert!(!sel.matches(&BTreeMap::new()), "{input:?} on unlabeled");
+        }
+    }
+
+    #[test]
+    fn parse_label_selector_inequality_operator() {
+        let sel = parse_label_selector("tier != normal").expect("valid != selector");
+        // NotEqual matches when the key is absent OR holds a different value.
+        assert!(sel.matches(&labels(&[("tier", "critical")])));
+        assert!(sel.matches(&BTreeMap::new()));
+        assert!(!sel.matches(&labels(&[("tier", "normal")])));
+    }
+
+    #[test]
+    fn parse_label_selector_exists_and_does_not_exist() {
+        let exists = parse_label_selector("tier").expect("bare key = Exists");
+        assert!(exists.matches(&labels(&[("tier", "anything")])));
+        assert!(!exists.matches(&BTreeMap::new()));
+
+        let absent = parse_label_selector("!tier").expect("!key = DoesNotExist");
+        assert!(absent.matches(&BTreeMap::new()));
+        assert!(absent.matches(&labels(&[("other", "x")])));
+        assert!(!absent.matches(&labels(&[("tier", "x")])));
+    }
+
+    #[test]
+    fn parse_label_selector_set_based_in_and_notin() {
+        let in_sel = parse_label_selector("env in (prod, staging)").expect("valid `in` selector");
+        assert!(in_sel.matches(&labels(&[("env", "prod")])));
+        assert!(in_sel.matches(&labels(&[("env", "staging")])));
+        assert!(!in_sel.matches(&labels(&[("env", "dev")])));
+        assert!(!in_sel.matches(&BTreeMap::new()), "absent key fails `in`");
+
+        let notin_sel =
+            parse_label_selector("env notin (dev, test)").expect("valid `notin` selector");
+        assert!(notin_sel.matches(&labels(&[("env", "prod")])));
+        assert!(
+            notin_sel.matches(&BTreeMap::new()),
+            "absent key passes `notin`"
+        );
+        assert!(!notin_sel.matches(&labels(&[("env", "dev")])));
+    }
+
+    #[test]
+    fn parse_label_selector_multi_requirement_anded() {
+        // Comma at top level = AND; comma inside parens = value-list separator.
+        let sel = parse_label_selector("tier=critical, env in (prod,staging)")
+            .expect("valid multi-requirement selector");
+        assert!(sel.matches(&labels(&[("tier", "critical"), ("env", "prod")])));
+        // Fails when one of the two ANDed requirements is unmet.
+        assert!(!sel.matches(&labels(&[("tier", "critical"), ("env", "dev")])));
+        assert!(!sel.matches(&labels(&[("tier", "normal"), ("env", "prod")])));
+    }
+
+    #[test]
+    fn parse_label_selector_malformed_returns_invalid_argument() {
+        let cases = [
+            "tier in (prod",  // unbalanced paren
+            "=value",         // empty key
+            "tier=",          // missing value
+            "tier in ()",     // empty value set
+            "tier in (a,,b)", // empty value in set
+            ",tier=critical", // empty requirement
+            "tier foo (a)",   // unknown set operator
+        ];
+        for input in cases {
+            let err =
+                parse_label_selector(input).expect_err(&format!("{input:?} must be rejected"));
+            assert_eq!(
+                err.code(),
+                tonic::Code::InvalidArgument,
+                "{input:?} must map to INVALID_ARGUMENT (got {err:?})"
+            );
+        }
+    }
+
+    // ── SubscribeFilter::allow: names × selector matrix ──────────────────────
+
+    #[test]
+    fn subscribe_filter_empty_allows_all() {
+        let f = SubscribeFilter::new(&[], "").expect("empty filter is valid");
+        assert!(f.allow("anything", &BTreeMap::new()));
+        assert!(f.allow("cfg-a", &labels(&[("tier", "x")])));
+    }
+
+    #[test]
+    fn subscribe_filter_names_only() {
+        let names = vec!["cfg-a".to_string(), "cfg-b".to_string()];
+        let f = SubscribeFilter::new(&names, "").expect("valid names filter");
+        assert!(f.allow("cfg-a", &BTreeMap::new()));
+        assert!(f.allow("cfg-b", &labels(&[("any", "label")])));
+        assert!(!f.allow("cfg-c", &BTreeMap::new()), "name not in set");
+    }
+
+    #[test]
+    fn subscribe_filter_selector_only() {
+        let f = SubscribeFilter::new(&[], "tier=critical").expect("valid selector filter");
+        // Any name passes; only the label constraint applies.
+        assert!(f.allow("cfg-a", &labels(&[("tier", "critical")])));
+        assert!(f.allow("cfg-z", &labels(&[("tier", "critical"), ("x", "y")])));
+        assert!(!f.allow("cfg-a", &labels(&[("tier", "normal")])));
+    }
+
+    #[test]
+    fn subscribe_filter_names_and_selector_anded() {
+        let names = vec!["cfg-a".to_string()];
+        let f = SubscribeFilter::new(&names, "tier=critical").expect("valid AND filter");
+        // Passes both.
+        assert!(f.allow("cfg-a", &labels(&[("tier", "critical")])));
+        // Right name, wrong labels.
+        assert!(!f.allow("cfg-a", &labels(&[("tier", "normal")])));
+        // Right labels, wrong name.
+        assert!(!f.allow("cfg-b", &labels(&[("tier", "critical")])));
+    }
+
+    #[test]
+    fn subscribe_filter_invalid_selector_propagates() {
+        let err = SubscribeFilter::new(&[], "tier in (oops")
+            .expect_err("malformed selector must propagate");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ── Ticket acceptance: tier=critical selects only the critical config ────
+
+    #[test]
+    fn filter_tier_critical_selects_only_labeled_config() {
+        let f = SubscribeFilter::new(&[], "tier=critical").expect("valid selector");
+        // The critical config is delivered.
+        assert!(f.allow("cfg-critical", &labels(&[("tier", "critical")])));
+        // A normal-tier config is rejected.
+        assert!(!f.allow("cfg-normal", &labels(&[("tier", "normal")])));
+        // An unlabeled config is rejected.
+        assert!(!f.allow("cfg-bare", &BTreeMap::new()));
+    }
+
+    // ── config_event_name / filter_allows_event ──────────────────────────────
+
+    #[test]
+    fn config_event_name_extracts_inner_config_name() {
+        let ev = make_event("1", 1); // make_event sets config.name = "cfg"
+        assert_eq!(config_event_name(&ev), Some("cfg"));
+
+        let nameless = ConfigEvent {
+            event_type: EventType::Modified as i32,
+            config: None,
+        };
+        assert_eq!(config_event_name(&nameless), None);
+    }
+
+    #[test]
+    fn filter_allows_event_treats_missing_config_as_non_matching() {
+        let f = allow_all_filter();
+        let nameless = ConfigEvent {
+            event_type: EventType::Modified as i32,
+            config: None,
+        };
+        // Even an allow-all filter rejects an event with no inner Config —
+        // we never leak an unidentifiable event.
+        assert!(!filter_allows_event(&f, &nameless, &BTreeMap::new()));
+    }
+
+    // ── End-to-end (resume path): label_selector filters the live snapshot ───
+
+    /// A labeled `DynamicObject` parses into a `ConfigSnapshot` whose `labels`
+    /// flow into the cache; `resume_from_buffer` with a `tier=critical` filter
+    /// must emit ONLY the critical config's snapshot. Mirrors the ticket's
+    /// integration acceptance using the resume/snapshot path (the live kind
+    /// e2e gate is CI/linux-only).
+    #[tokio::test]
+    async fn resume_snapshot_path_applies_label_selector() {
+        // Build a cache directly from labeled snapshots.
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let mut critical = ConfigSnapshot {
+            name: "cfg-critical".into(),
+            namespace: "default".into(),
+            schema_version: 1,
+            resource_version: "10".into(),
+            ..Default::default()
+        };
+        critical.labels = Arc::new(labels(&[("tier", "critical")]));
+        cache.update(critical);
+        let mut normal = ConfigSnapshot {
+            name: "cfg-normal".into(),
+            namespace: "default".into(),
+            schema_version: 2,
+            resource_version: "11".into(),
+            ..Default::default()
+        };
+        normal.labels = Arc::new(labels(&[("tier", "normal")]));
+        cache.update(normal);
+
+        let replay_buf: ReplayBuffer = Arc::new(Mutex::new(VecDeque::new()));
+        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
+        let (tx, mut rx) = mpsc::channel(64);
+        drop(bcast_tx); // let bridge exit cleanly after the snapshot phase
+
+        let filter = Arc::new(SubscribeFilter::new(&[], "tier=critical").unwrap());
+
+        tokio::spawn(resume_from_buffer(
+            String::new(), // empty resume_rv → buffer miss → full snapshot
+            replay_buf,
+            cache,
+            "default".into(),
+            bcast_rx,
+            tx,
+            Arc::new(Notify::new()),
+            filter,
+        ));
+
+        let mut received_names: Vec<String> = Vec::new();
+        while let Some(Ok(ev)) = rx.recv().await {
+            received_names.push(ev.config.unwrap().name);
+        }
+        assert_eq!(
+            received_names,
+            vec!["cfg-critical".to_string()],
+            "snapshot path must emit only the tier=critical config"
+        );
     }
 }

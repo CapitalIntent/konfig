@@ -96,6 +96,10 @@ message SubscribeRequest {
   repeated string names = 2;
   // Resume from this resourceVersion (empty = start from current).
   string resume_resource_version = 3;
+  // K8s label-selector predicate (equality + set-based syntax, e.g.
+  // "tier=critical,env in (prod,staging)"). Empty = no label filter. ANDed
+  // with `names`. Server-side filters the per-namespace broadcast.
+  string label_selector = 4;
 }
 
 message ConfigEvent {
