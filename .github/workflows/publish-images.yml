@@ -100,14 +100,18 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # amd64 binaries pin -Ctarget-cpu=x86-64-v2 (--config=x86-baseline) so the
+      # shipped image cannot SIGILL on a prod node lacking the builder's
+      # instructions (CU-86aj4guza). x86_64-only — NOT applied to the arm64 leg
+      # (the cpu name is invalid for aarch64).
       - name: Push konfig (${{ matrix.arch }})
-        run: bazel run --stamp //docker/konfig:push_${{ matrix.arch }}
+        run: bazel run --stamp ${{ matrix.arch == 'amd64' && '--config=x86-baseline ' || '' }}//docker/konfig:push_${{ matrix.arch }}
 
       - name: Push konfig-cli (${{ matrix.arch }})
-        run: bazel run --stamp //docker/konfig-cli:push_${{ matrix.arch }}
+        run: bazel run --stamp ${{ matrix.arch == 'amd64' && '--config=x86-baseline ' || '' }}//docker/konfig-cli:push_${{ matrix.arch }}
 
       - name: Push konfig-loadtest (${{ matrix.arch }})
-        run: bazel run --stamp //docker/konfig-loadtest:push_${{ matrix.arch }}
+        run: bazel run --stamp ${{ matrix.arch == 'amd64' && '--config=x86-baseline ' || '' }}//docker/konfig-loadtest:push_${{ matrix.arch }}
 
       # ----------------------------------------------------------------------
       # Supply-chain: sign + attest each per-arch digest (CU-86aj08v23).

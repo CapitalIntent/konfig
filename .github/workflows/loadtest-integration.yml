@@ -63,8 +63,8 @@ jobs:
         # No multi-arch `:load`/`:image` target is built — each arch is its
         # own native build (no Bazel sysroot wiring after 2026-06-16).
         run: |
-          bazel run //docker/konfig:load_amd64
-          bazel run //docker/konfig-loadtest:load_amd64
+          bazel run --config=x86-baseline //docker/konfig:load_amd64
+          bazel run --config=x86-baseline //docker/konfig-loadtest:load_amd64
 
       - name: Create kind cluster (1 node)
         uses: helm/kind-action@v1

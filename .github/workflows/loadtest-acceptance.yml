@@ -96,9 +96,12 @@ jobs:
           echo "flags: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(cx16|lm|avx|avx2|avx512f|sse4_2|popcnt)$' | tr '\n' ' ')"
 
       - name: Build konfig + konfig-loadtest OCI images (linux/amd64)
+        # --config=x86-baseline pins -Ctarget-cpu=x86-64-v2 so the konfig binary
+        # cannot use instructions absent on a leaner runtime CPU (CU-86aj4guza
+        # SIGILL fix). amd64-only config; never applied to arm64 builds.
         run: |
-          bazel run //docker/konfig:load_amd64
-          bazel run //docker/konfig-loadtest:load_amd64
+          bazel run --config=x86-baseline //docker/konfig:load_amd64
+          bazel run --config=x86-baseline //docker/konfig-loadtest:load_amd64
 
       - name: Create kind cluster (1 node)
         uses: helm/kind-action@v1
@@ -237,6 +240,7 @@ jobs:
             | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).resources.limits.cpu = "4"
             | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).resources.limits.memory = "1Gi"
             | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).volumeMounts = [{"name": "results", "mountPath": "/results"}]
+            | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).securityContext.runAsUser = 0
             | .spec.template.spec.volumes = [{"name": "results", "hostPath": {"path": "/tmp/konfig-acceptance-results", "type": "DirectoryOrCreate"}}]
           ' infra/konfig-loadtest/job.yaml \
           | kubectl apply -f -
