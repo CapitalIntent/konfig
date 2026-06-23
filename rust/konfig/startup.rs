@@ -37,6 +37,7 @@ use crate::grpc::tls::{TlsPaths, build_server_tls_config, warn_tls_disabled};
 use crate::grpc::{ServerConfig, serve};
 use crate::metrics::{LastEventAtMap, last_event_at_for, spawn_tokio_runtime_sampler};
 use crate::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
+use crate::schema::{SchemaSynced, SchemaTable, SchemaWatcher};
 use crate::secret_cache::SecretCache;
 use crate::secret_watcher::SecretWatcher;
 use crate::types::ConfigSnapshot;
@@ -277,6 +278,34 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Spawn the ConfigSchema watcher (CU-86ahrwd5g). `ConfigSchema` is
+    // namespaced, but we watch ALL namespaces (Api::all_with) so a schema in
+    // any tenant namespace is enforced; the registry is keyed by the object's
+    // namespace + `spec.configName`. It populates the table read on the Apply
+    // RPC path. Always run it (no mode gate) — an empty registry just means
+    // "no schema" → accept anything, so the watcher is cheap when unused.
+    let schema_table = Arc::new(SchemaTable::new());
+    let schema_synced = Arc::new(SchemaSynced::new());
+    {
+        let schema_client = kube_client.clone();
+        let schema_table = Arc::clone(&schema_table);
+        let schema_synced = Arc::clone(&schema_synced);
+        tokio::spawn(async move {
+            run_with_reconnect(
+                "configschema",
+                // Watched cluster-wide across all namespaces — no single
+                // namespace; pass empty (matches the ACL watcher convention).
+                String::new(),
+                || {},
+                |_attempt| {
+                    SchemaWatcher::new(schema_client.clone())
+                        .run(Arc::clone(&schema_table), Arc::clone(&schema_synced))
+                },
+            )
+            .await;
+        });
+    }
+
     // Spawn Secret namespace watchers.
     let secret_namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>> =
         Arc::new(DashMap::with_capacity(NAMESPACE_MAP_INITIAL_CAPACITY));
@@ -354,6 +383,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         authz_mode,
         acl_table,
         acl_synced,
+        schema_table,
     })
     .await?;
 

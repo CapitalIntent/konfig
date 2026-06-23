@@ -58,6 +58,7 @@ use crate::proto::{
     SubscribeSecretsRequest,
     konfig_service_server::{KonfigService, KonfigServiceServer},
 };
+use crate::schema::SchemaTable;
 use crate::secret_cache::SecretCache;
 
 /// Maximum time we wait for in-flight RPCs to complete after SIGTERM before
@@ -140,6 +141,11 @@ pub struct ServerConfig {
     /// `UNAVAILABLE` until this flips `true` so the boot window cannot serve
     /// un-authorized.
     pub acl_synced: Arc<AclSynced>,
+    /// Lock-free `(namespace, configName) → compiled draft-07 schema` registry
+    /// populated by the `ConfigSchema` watcher (CU-86ahrwd5g). Read on the
+    /// `Apply` RPC path to validate `content` before patching. Empty registry
+    /// (no schema for a key) ⇒ accept anything.
+    pub schema_table: Arc<SchemaTable>,
 }
 
 /// Type-erased shutdown future.  Boxed so the field doesn't push a generic
@@ -196,6 +202,10 @@ pub struct KonfigServer {
     /// Initial-sync flag for [`Self::acl_table`]; gates the enforce-mode
     /// fail-safe.
     pub(crate) acl_synced: Arc<AclSynced>,
+    /// Lock-free `(namespace, configName) → compiled draft-07 schema` registry
+    /// (CU-86ahrwd5g). Passed to `apply::handle_apply` so `apply_inner`
+    /// validates `content` before patching. No schema for a key ⇒ accept.
+    pub(crate) schema_table: Arc<SchemaTable>,
 }
 
 impl KonfigServer {
@@ -492,7 +502,12 @@ impl KonfigService for KonfigServer {
         let name = request.get_ref().name.clone();
         let schema_version = parse_config_schema_version(&request.get_ref().yaml_content);
 
-        let result = apply::handle_apply(self.kube_client.clone(), request.into_inner()).await;
+        let result = apply::handle_apply(
+            self.kube_client.clone(),
+            Arc::clone(&self.schema_table),
+            request.into_inner(),
+        )
+        .await;
         let rec = audit::AuditRecord {
             rpc: "Apply".into(),
             namespace: ns,
@@ -904,6 +919,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         authz_mode: cfg.authz_mode,
         acl_table: cfg.acl_table,
         acl_synced: cfg.acl_synced,
+        schema_table: cfg.schema_table,
     };
     let svc = KonfigServiceServer::new(server);
 
@@ -1541,6 +1557,7 @@ mod tests {
             authz_mode: AuthzMode::Disabled,
             acl_table: Arc::new(AclTable::new()),
             acl_synced: Arc::new(AclSynced::new()),
+            schema_table: Arc::new(SchemaTable::new()),
         }
     }
 

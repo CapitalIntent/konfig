@@ -19,6 +19,14 @@ async-trait = "0.1.89"
 base64 = {version = "0.22.1", default-features = false}
 bytes = "1"
 dashmap = {version = "6.2.1", default-features = false}
+# Draft-07 JSON Schema validation for the Apply RPC (CU-86ahrwd5g). Operators
+# register a schema per (namespace, configName) via the ConfigSchema CRD; the
+# Apply handler compiles it once at CRD-load time and validates `content`
+# before patching. `default-features = false` drops the `resolve-http`
+# (reqwest + rustls) and `resolve-file` resolvers + the bundled TLS backend —
+# konfig validates self-contained in-memory schemas with no external `$ref`
+# resolution, so pulling a second HTTP/TLS stack into the service is pure cost.
+jsonschema = {version = "0.46.5", default-features = false}
 prost = "0.14.3"
 prost-types = "0.14.3"
 serde = {version = "1.0.228", default-features = false, features = ["derive"]}

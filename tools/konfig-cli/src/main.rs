@@ -174,9 +174,15 @@ async fn cmd_apply(
     yaml_file: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let yaml_content = std::fs::read_to_string(yaml_file)?;
-    let result = konfig::grpc::apply::apply_inner(namespace, name, &yaml_content, client)
-        .await
-        .map_err(|s| format!("Apply failed: {s}"))?;
+    // The CLI applies directly (no server-side watcher / schema registry), so
+    // it passes an empty `SchemaTable` — no schema for any key ⇒ accept
+    // anything, preserving the CLI's historical behaviour. Server-side schema
+    // validation (CU-86ahrwd5g) is enforced by the konfig server's Apply RPC.
+    let schema_table = std::sync::Arc::new(konfig::schema::SchemaTable::new());
+    let result =
+        konfig::grpc::apply::apply_inner(namespace, name, &yaml_content, client, &schema_table)
+            .await
+            .map_err(|s| format!("Apply failed: {s}"))?;
     let rv = result.into_inner().resource_version;
     println!("Applied {namespace}/{name} (resource_version: {rv})");
     Ok(())

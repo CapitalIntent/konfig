@@ -9,6 +9,7 @@
 //! - [`watcher`] — kube-rs watcher for `Config.konfig.io/v1` CRDs
 //! - [`configmap_watcher`] — watcher for ConfigMaps (konfig.io/managed=true)
 //! - [`secret_watcher`] — watcher for Secrets (konfig.io/managed=true)
+//! - [`schema`] — per-(namespace, configName) draft-07 JSON Schema registry + watcher
 //! - [`grpc`] — gRPC server (Protobuf, standard tonic codec)
 //! - [`import`] — CLI helper: onboard existing ConfigMaps as Config CRDs
 //! - [`telemetry`] — optional OTLP/gRPC trace export (tracing-opentelemetry bridge)
@@ -20,6 +21,7 @@ pub mod configmap_watcher;
 pub mod grpc;
 pub mod import;
 pub mod metrics;
+pub mod schema;
 pub mod secret_cache;
 pub mod secret_watcher;
 pub mod startup;
