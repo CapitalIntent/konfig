@@ -117,6 +117,37 @@ spec:
               watcher may be disconnected from the API server. SLI:
               konfig_stale_seconds. See docs/runbook.md (Partition recovery).
 
+    - name: konfig.consumer.freshness
+      rules:
+        # Consumer-side freshness (CU-86ahzwhxj, Phase 5 Deliverable 3).
+        # konfig-consumer pods export `konfig_consumer_stale_seconds` from the
+        # embedded watcher — seconds since the stream last received an event
+        # (0 = fresh). This is a DISTINCT metric from the server-side
+        # `konfig_stale_seconds{namespace}` above (renamed so the two never
+        # collide in PromQL: the server gauge is per-watched-namespace; this
+        # one is per-consumer-pod). Page when a consumer's stream has been
+        # stale > 300 s — its config reads are serving the last-known snapshot
+        # while disconnected from the konfig server / API.
+        #
+        # This rule targets the metric name only; consumer pods scrape in their
+        # own namespaces (e.g. trading), so apply it wherever the consumer
+        # ServiceMonitor lives, not necessarily konfig-system. `for: 1m` mirrors
+        # KonfigWatcherStale's debounce.
+        - alert: KonfigConsumerStreamStale
+          expr: konfig_consumer_stale_seconds > 300
+          for: 1m
+          labels:
+            severity: page
+            slo: consumer_freshness
+          annotations:
+            summary: konfig consumer stream stale on {{ $labels.pod }}
+            description: >
+              The konfig-consumer embedded stream on pod {{ $labels.pod }}
+              ({{ $labels.namespace }}) has not received an event for
+              {{ $value | humanizeDuration }} (> 300 s threshold). The embedded
+              watcher is likely disconnected — config reads are serving the
+              last-known snapshot. SLI: konfig_consumer_stale_seconds.
+
     # SLI 5 (cache hit ratio) is intentionally absent: no konfig_cache_hits_total
     # / konfig_cache_lookups_total metric exists yet (only the `hit` attribute on
     # the konfig.cache_get OTEL span). See docs/slo.md — pending metric. Do NOT
