@@ -70,6 +70,9 @@ bytes = {workspace = true}
 clap = {version = "4", features = ["derive", "env"]}
 dashmap = {workspace = true}
 futures-util = "0.3"
+# Draft-07 JSON Schema validation on the Apply RPC path (CU-86ahrwd5g).
+# default-features off in the workspace dep — no reqwest/rustls/file resolvers.
+jsonschema = {workspace = true}
 kube = {version = "0.98", features = ["runtime", "client"]}
 k8s-openapi = {version = "0.24", features = ["v1_31"]}
 lazy_static = "1"

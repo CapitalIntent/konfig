@@ -15,6 +15,7 @@ resources:
   - namespace.yaml
   - crd.yaml
   - configacl-crd.yaml
+  - configschema-crd.yaml
   - serviceaccount.yaml
   - clusterrole.yaml
   - clusterrolebinding.yaml

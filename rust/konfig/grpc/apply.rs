@@ -2,11 +2,23 @@
 //!
 //! Flow:
 //! 1. Parse `yaml_content` as `ConfigSpec`.
-//! 2. Fetch current CRD to check `schema_version` monotonicity.
-//! 3. Reject with `FAILED_PRECONDITION` if incoming version ≤ current.
-//! 4. Patch the CRD with server-side apply; retry 409 up to 3 times.
-//! 5. Return `ApplyResponse { resource_version }`.
+//! 2. Validate `content` against the registered JSON Schema for
+//!    `(namespace, name)`, if any (CU-86ahrwd5g). No schema ⇒ accept anything.
+//! 3. Fetch current CRD to check `schema_version` monotonicity.
+//! 4. Reject with `FAILED_PRECONDITION` if incoming version ≤ current.
+//! 5. Patch the CRD with server-side apply; retry 409 up to 3 times.
+//! 6. Return `ApplyResponse { resource_version }`.
+//!
+//! ## Why validation lives HERE, not in `apply_spec`
+//!
+//! Schema validation is wired into the `Apply` RPC path ONLY (`apply_inner`,
+//! after the `ConfigSpec` parse, before `apply_spec`). It is deliberately NOT
+//! inside the shared `apply_spec`: `revert.rs` calls `apply_spec` to replay
+//! HISTORICAL `content`, and a schema registered AFTER that content was first
+//! applied must not block a legitimate rollback to it (CU-86ahrwd5g). So
+//! `apply_spec`'s signature is unchanged and revert bypasses validation.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kube::Client;
@@ -19,6 +31,7 @@ use tracing::{Instrument, debug, info, warn};
 use crate::grpc::jittered_retry_ms;
 use crate::metrics::{APPLY_DURATION, APPLY_TOTAL};
 use crate::proto::{ApplyRequest, ApplyResponse, DryRunApplyRequest, DryRunApplyResponse};
+use crate::schema::SchemaTable;
 use crate::types::ConfigSpec;
 use crate::watcher::{GROUP, VERSION, config_api_resource};
 
@@ -26,11 +39,19 @@ const RETRY_DELAYS_MS: [u64; 2] = [100, 200];
 
 pub async fn handle_apply(
     kube_client: Client,
+    schema_table: Arc<SchemaTable>,
     req: ApplyRequest,
 ) -> Result<Response<ApplyResponse>, Status> {
     debug!(namespace = %req.namespace, name = %req.name, "Apply RPC");
 
-    apply_inner(&req.namespace, &req.name, &req.yaml_content, kube_client).await
+    apply_inner(
+        &req.namespace,
+        &req.name,
+        &req.yaml_content,
+        kube_client,
+        &schema_table,
+    )
+    .await
 }
 
 pub async fn apply_inner(
@@ -38,11 +59,47 @@ pub async fn apply_inner(
     name: &str,
     yaml_content: &str,
     kube_client: Client,
+    schema_table: &SchemaTable,
 ) -> Result<Response<ApplyResponse>, Status> {
     let spec: ConfigSpec = serde_yaml::from_str(yaml_content)
         .map_err(|e| Status::invalid_argument(format!("invalid YAML: {e}")))?;
 
+    // JSON Schema gate (CU-86ahrwd5g) — runs on the Apply RPC path ONLY (see the
+    // module docs above for why it is NOT in `apply_spec`, which revert reuses).
+    // No schema registered for `(namespace, name)` ⇒ `Ok(())`, accept anything.
+    validate_against_schema(schema_table, namespace, name, &spec)?;
+
     apply_spec(namespace, name, spec, kube_client).await
+}
+
+/// Validate a proposed `ConfigSpec`'s `content` against the schema registered
+/// for `(namespace, config_name)`, if any. On violation, returns
+/// `Status::failed_precondition` carrying a clean, concatenated list of the
+/// validation errors. No registered schema ⇒ `Ok(())`.
+///
+/// Pure decision over the borrowed table — no kube I/O — so the
+/// reject-on-violation contract is unit-testable with a fake `SchemaTable`.
+pub(crate) fn validate_against_schema(
+    schema_table: &SchemaTable,
+    namespace: &str,
+    config_name: &str,
+    spec: &ConfigSpec,
+) -> Result<(), Status> {
+    match schema_table.validate(namespace, config_name, &spec.content) {
+        Ok(()) => Ok(()),
+        Err(errors) => {
+            warn!(
+                namespace,
+                name = config_name,
+                error_count = errors.len(),
+                "Apply rejected: content violates registered JSON Schema"
+            );
+            Err(Status::failed_precondition(format!(
+                "content does not satisfy registered JSON Schema for {namespace}/{config_name}: {}",
+                errors.join("; ")
+            )))
+        }
+    }
 }
 
 /// `DryRunApply` handler — preview what an `Apply` would change WITHOUT ever
@@ -326,6 +383,82 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── validate_against_schema: JSON Schema gate (CU-86ahrwd5g) ────────────
+    //
+    // The schema gate runs on the Apply RPC path only (apply_inner, before
+    // apply_spec; NOT in apply_spec, which revert reuses). These tests drive
+    // the extracted pure helper `validate_against_schema` directly with a fake
+    // `SchemaTable` (no kube) and assert: (a) no schema registered → Ok
+    // (accept anything), (b) registered schema + valid content → Ok, (c)
+    // registered schema + violating content → FAILED_PRECONDITION carrying the
+    // concatenated error list.
+
+    fn schema_spec(content: serde_json::Value) -> ConfigSpec {
+        ConfigSpec {
+            schema_version: 1,
+            content,
+        }
+    }
+
+    fn object_schema() -> serde_json::Value {
+        serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "required": ["port"],
+            "properties": { "port": { "type": "integer" } }
+        })
+    }
+
+    #[test]
+    fn validate_against_schema_no_schema_registered_is_ok() {
+        let table = crate::schema::SchemaTable::new();
+        let spec = schema_spec(serde_json::json!({ "anything": true }));
+        assert!(
+            validate_against_schema(&table, "trading", "limits", &spec).is_ok(),
+            "no registered schema must accept any content"
+        );
+    }
+
+    #[test]
+    fn validate_against_schema_valid_content_is_ok() {
+        let table = crate::schema::SchemaTable::new();
+        table
+            .insert_for_test("trading", "limits", &object_schema())
+            .expect("schema compiles");
+        let spec = schema_spec(serde_json::json!({ "port": 8080 }));
+        assert!(validate_against_schema(&table, "trading", "limits", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_against_schema_violation_is_failed_precondition() {
+        let table = crate::schema::SchemaTable::new();
+        table
+            .insert_for_test("trading", "limits", &object_schema())
+            .expect("schema compiles");
+        // `port` is a string, not an integer → violates the schema.
+        let spec = schema_spec(serde_json::json!({ "port": "nope" }));
+        let err = validate_against_schema(&table, "trading", "limits", &spec)
+            .expect_err("violating content must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("JSON Schema") && err.message().contains("trading/limits"),
+            "message must name the schema + target; got {:?}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_against_schema_other_key_unaffected() {
+        let table = crate::schema::SchemaTable::new();
+        table
+            .insert_for_test("trading", "limits", &object_schema())
+            .expect("schema compiles");
+        // Different namespace / name → no schema there → accept even bad content.
+        let spec = schema_spec(serde_json::json!({ "port": "nope" }));
+        assert!(validate_against_schema(&table, "risk", "limits", &spec).is_ok());
+        assert!(validate_against_schema(&table, "trading", "other", &spec).is_ok());
+    }
 
     // ── schema_version_decision: monotonicity gate + gRPC code mapping ──────
     //

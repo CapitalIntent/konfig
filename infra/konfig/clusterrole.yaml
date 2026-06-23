@@ -12,6 +12,12 @@ rules:
   - apiGroups: ["konfig.io"]
     resources: ["configacls"]
     verbs: ["get", "list", "watch"]
+  # JSON Schema validation (CU-86ahrwd5g): the ConfigSchema watcher lists/watches
+  # ConfigSchemas across all namespaces (Api::all_with). Read-only — konfig never
+  # mutates schemas; operators register them out-of-band.
+  - apiGroups: ["konfig.io"]
+    resources: ["configschemas"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch"]
