@@ -6,6 +6,7 @@
 //! # Commands
 //!
 //! - `apply <namespace> <name> <yaml-file>` — create/update a Config CRD
+//! - `dry-run <namespace> <name> <yaml-file>` — preview an apply (no write)
 //! - `get <namespace> <name>` — print a Config CRD spec as YAML
 //! - `revert <namespace> <name> <resource-version>` — roll back to a historical RV
 //! - `import configmap <namespace> <name> [--target <name>]` — import an existing ConfigMap
@@ -33,6 +34,15 @@ struct Cli {
 enum Commands {
     /// Create or update a Config CRD from a YAML file.
     Apply {
+        namespace: String,
+        name: String,
+        yaml_file: PathBuf,
+    },
+    /// Preview what an apply would change WITHOUT writing to K8s.
+    ///
+    /// Runs the same schema_version monotonicity gate as `apply` and prints the
+    /// current vs proposed content/version. Never patches the cluster.
+    DryRun {
         namespace: String,
         name: String,
         yaml_file: PathBuf,
@@ -108,6 +118,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             cmd_apply(client, &namespace, &name, &yaml_file).await?;
         }
+        Commands::DryRun {
+            namespace,
+            name,
+            yaml_file,
+        } => {
+            cmd_dry_run(client, &namespace, &name, &yaml_file).await?;
+        }
         Commands::Get { namespace, name } => {
             cmd_get(client, &namespace, &name).await?;
         }
@@ -162,6 +179,44 @@ async fn cmd_apply(
         .map_err(|s| format!("Apply failed: {s}"))?;
     let rv = result.into_inner().resource_version;
     println!("Applied {namespace}/{name} (resource_version: {rv})");
+    Ok(())
+}
+
+async fn cmd_dry_run(
+    client: Client,
+    namespace: &str,
+    name: &str,
+    yaml_file: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use konfig::proto::DryRunApplyRequest;
+
+    let yaml_content = std::fs::read_to_string(yaml_file)?;
+    let req = DryRunApplyRequest {
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        yaml_content,
+    };
+    let result = konfig::grpc::apply::handle_dry_run_apply(client, req)
+        .await
+        .map_err(|s| format!("DryRunApply failed: {s}"))?;
+    let resp = result.into_inner();
+
+    println!("# Dry-run diff for {namespace}/{name} (NO changes written)");
+    println!(
+        "schema_version: {} -> {}",
+        resp.current_schema_version, resp.proposed_schema_version
+    );
+    println!("--- current content");
+    println!(
+        "{}",
+        if resp.current_content_json.is_empty() {
+            "<absent>"
+        } else {
+            &resp.current_content_json
+        }
+    );
+    println!("+++ proposed content");
+    println!("{}", resp.proposed_content_json);
     Ok(())
 }
 

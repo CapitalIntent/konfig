@@ -53,8 +53,9 @@ use crate::grpc::subscribe::{
 use crate::metrics::{LastEventAtMap, REPLAY_BUFFER_DEPTH, STALE_SECONDS};
 use crate::proto::{
     ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, Config, ConfigEvent,
-    GetAllRequest, GetAllSecretsRequest, GetRequest, GetSecretRequest, RevertRequest,
-    RevertResponse, SecretEvent, SecretResponse, SubscribeRequest, SubscribeSecretsRequest,
+    DryRunApplyRequest, DryRunApplyResponse, GetAllRequest, GetAllSecretsRequest, GetRequest,
+    GetSecretRequest, RevertRequest, RevertResponse, SecretEvent, SecretResponse, SubscribeRequest,
+    SubscribeSecretsRequest,
     konfig_service_server::{KonfigService, KonfigServiceServer},
 };
 use crate::secret_cache::SecretCache;
@@ -507,6 +508,38 @@ impl KonfigService for KonfigServer {
         audit::emit(&rec);
         audit::maybe_emit_k8s_event(&self.kube_client, &rec).await;
         record_status(result)
+    }
+
+    #[tracing::instrument(
+        name = "konfig.DryRunApply",
+        skip_all,
+        fields(namespace = %request.get_ref().namespace, name = %request.get_ref().name, client_addr = tracing::field::Empty, request_id = tracing::field::Empty, status_code = tracing::field::Empty),
+    )]
+    async fn dry_run_apply(
+        &self,
+        request: Request<DryRunApplyRequest>,
+    ) -> Result<Response<DryRunApplyResponse>, Status> {
+        log_rpc_entry(
+            "konfig.DryRunApply",
+            &request,
+            Some(&request.get_ref().namespace),
+            Some(&request.get_ref().name),
+        );
+        check_drain(&self.draining)?;
+        // Apply-shaped: previews a write AND reveals the target's current
+        // content, so it gates on `Write` like Apply (CU-86ahrg731). NO audit
+        // record is emitted — DryRunApply is non-mutating, and the audit log is
+        // for mutating RPCs only (the ticket requires it never appears as a
+        // write).
+        self.authorize(
+            &request,
+            Verb::Write,
+            &request.get_ref().namespace,
+            &request.get_ref().name,
+        )?;
+        record_status(
+            apply::handle_dry_run_apply(self.kube_client.clone(), request.into_inner()).await,
+        )
     }
 
     #[tracing::instrument(
