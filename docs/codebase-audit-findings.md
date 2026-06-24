@@ -156,7 +156,7 @@ There is one current local working-tree change in `MODULE.bazel`: the `snmalloc`
 
 ## Bazel And Benchmark Verification Update
 
-Date: 2026-06-23, follow-up run.
+Date: 2026-06-24, follow-up run.
 
 ### snmalloc Pin
 
@@ -166,19 +166,19 @@ Date: 2026-06-23, follow-up run.
 
 This follow-up pin uses Bazel-native `cc_library` targets. The previous local runtime patch is no longer needed because the pinned `jayakasadev/snmalloc` commit carries the runtime fix upstream.
 
-### Bazel Configuration Findings
+### Bazel Configuration Cleanup
 
-Bazel 9.1.1 can load and query the repo, but the query produced configuration warnings that should be cleaned up:
+The Bazel 9 module warnings found during the audit have been addressed in `MODULE.bazel`:
 
-- `compatibility_level` in `module()` is a no-op in Bazel 9 and should be removed.
-- Several root `bazel_dep` versions are lower than the resolved dependency graph versions:
-  - `platforms`: root asks `0.0.11`, resolved `1.0.0`.
-  - `bazel_skylib`: root asks `1.8.1`, resolved `1.8.2`.
-  - `aspect_bazel_lib`: root asks `2.14.0`, resolved `2.21.1`.
-  - `protobuf`: root asks `29.3`, resolved `33.4`.
-  - `rules_shell`: root asks `0.3.0`, resolved `0.6.1`.
+- Removed the no-op `compatibility_level` from `module()`.
+- Updated root `bazel_dep` versions to match the resolved dependency graph:
+  - `platforms`: `1.0.0`
+  - `bazel_skylib`: `1.8.2`
+  - `aspect_bazel_lib`: `2.21.1`
+  - `protobuf`: `33.4`
+  - `rules_shell`: `0.6.1`
 
-Those warnings do not block native tests, but they are a cache/reproducibility smell because the root module no longer states the versions Bazel actually selected.
+This removes avoidable module-version drift and makes the root module state the versions Bazel actually selects.
 
 ### Linux OCI Image Build Fix
 
@@ -258,23 +258,23 @@ A fresh profiled local benchmark was completed against the requested `snmalloc` 
 - One `konfig-heapprof` server replica for per-pod profiling accuracy and heap-profile endpoint availability.
 - Alloy/Pyroscope deployed in the `profiling` namespace for CPU profiling.
 - `konfig-loadtest --scenario all` with Scenario 1 set to 100 subscribers, 100 applies, and 6000ms apply interval.
-- Artifacts: `/tmp/konfig-benchmark-e64cd355-20260624-005314`.
+- Artifacts: `/tmp/konfig-benchmark-e64cd355-20260624-114942`.
 
 Results:
 
 | Scenario | Result | Key Metrics |
 | --- | --- | --- |
-| `subscribe_flood` | PASS | 10,000/10,000 events, p50 1ms, p95 2ms, p99 3ms, max 5ms |
-| `get_flood` | PASS | 5,000 samples, 0 errors, p50 1ms, p95 1ms, p99 2ms, max 4ms |
+| `subscribe_flood` | PASS | 10,000/10,000 events, p50 0ms, p95 5ms, p99 9ms, max 16ms |
+| `get_flood` | PASS | 5,000 samples, 0 errors, p50 1ms, p95 1ms, p99 2ms, max 5ms |
 | `reconnect_storm` | PASS | 500/500 post-reconnect events, 0 missed |
-| `secrets_flood` | PASS | 1,000/1,000 events, p50 0ms, p95 0ms, p99 1ms, max 1ms |
+| `secrets_flood` | PASS | 1,000/1,000 events, p50 0ms, p95 0ms, p99 0ms, max 0ms |
 
 Collected evidence:
 
 - `acceptance.json`: valid JSON, `all_passed: true`.
-- `metrics.prom`: Prometheus snapshot after the run, 196 lines / 12,549 bytes.
-- `cpu-profile.flamebearer.json`: scoped Pyroscope flamebearer profile for `service_name="konfig"`, 52,508 bytes, 502 names, 93 levels. This is usable Pyroscope profile data, but it is not a pprof payload and `go tool pprof` cannot parse it.
-- `heap-profile.pprof`: valid snmalloc heap profile, 1,584 bytes. `go tool pprof -top` succeeded and attributed 1,030.02kB total `alloc_space`, split between a subscription polling frame and `konfig::grpc::subscribe::SubscribeFilter::new`.
+- `metrics.prom`: Prometheus snapshot after the run, 196 lines / 12,550 bytes.
+- `cpu-profile.flamebearer.json`: scoped Pyroscope flamebearer profile for `service_name="konfig"`, 50,769 bytes, 448 names, 87 levels. This is usable Pyroscope profile data, but it is not a pprof payload and `go tool pprof` cannot parse it.
+- `heap-profile.pprof`: valid snmalloc heap profile, 2,358 bytes. `go tool pprof -top` succeeded and attributed 1,322.01kB total `alloc_space`, led by `konfig::startup::run` and `rustls::client::tls13::ExpectTraffic::handle_new_ticket_impl`.
 - `top-pod.txt`: unavailable because the Docker Desktop cluster does not have Metrics API installed.
 
 ### Fixes Applied During Verification
@@ -290,10 +290,27 @@ Collected evidence:
 
 ### Remaining Bazel Notes
 
-The local arm64 image path now works, but two cleanup items remain:
+The local arm64 image path now works. Remaining Bazel cleanup items are:
 
 - The Docker-generated sysroot is Bazel-managed, but still local-development oriented because it depends on Docker and apt during repository fetch. For CI-grade hermeticity, replace it with a pinned `http_archive`/prebuilt sysroot artifact or `@toolchains_llvm//toolchain:sysroot.bzl` flow.
-- Bazel 9 still reports module-version drift warnings for `platforms`, `bazel_skylib`, `aspect_bazel_lib`, `protobuf`, and `rules_shell`, plus the no-op `compatibility_level` warning.
+- `rules_rust` now reports that only the workspace `Cargo.toml` is required in `crate.from_cargo(manifests = ...)`; the extra manifests can be removed in a follow-up cleanup if that does not disturb crate annotation generation.
+
+### Optimization Strategies
+
+Recommended next optimizations, in priority order:
+
+1. Turn the current profiled `konfig-loadtest --scenario all` run into a regression gate. The latest local results are strong, so the main value is preserving p95/p99 latency, missed-event, error-rate, and memory-growth thresholds across future allocator, cache, and fanout changes.
+2. Add a longer steady-state soak benchmark. The current benchmark validates burst behavior; a 10-30 minute run with long-lived subscribers, periodic config/secret updates, reconnects, and repeated heap snapshots would better expose allocator growth, watcher drift, and backpressure issues.
+3. Replace the Docker/apt-created sysroot with a pinned sysroot artifact or the `toolchains_llvm` sysroot flow. This improves Bazel reproducibility, CI cacheability, and review confidence for cross-host image builds.
+4. Run amd64 OCI image build and smoke verification before relying on the branch outside the current arm64 Docker Desktop path.
+5. Keep runtime cache/fanout changes profile-led. The measured service latencies are already low (`subscribe_flood` p99 9ms and `get_flood` p99 2ms), so runtime rewrites should wait for production-like CPU or heap profiles that identify a concrete bottleneck.
+6. Preserve allocation-conscious cache access patterns. Future hot-path work should keep borrowed-key lookups, avoid unnecessary namespace/name allocation, reduce avoidable `Arc` churn, and reserve collection capacity when fanout/update sizes are known.
+7. Separate startup allocation from steady-state allocation in heap profiling. The current `heap-profile.pprof` is valid, but top attribution includes startup/TLS paths; warmup plus repeated snapshots would make service steady-state memory easier to judge.
+8. Improve CPU-profile artifact usability. Pyroscope flamebearer JSON is useful but not `pprof`; either add a pprof-compatible profile path or automate flamebearer summary extraction so CPU regressions can be reviewed quickly.
+9. Remove remaining Bazel module noise, especially the extra `rules_rust` `manifests` entries, if crate annotation generation remains stable.
+10. Script or document Docker Desktop image import into each node's `k8s.io` containerd namespace. This avoids stale local images invalidating benchmark results.
+11. Refactor the `cargo-crap` hotspots (`classify_secret_patch_error`, `classify_patch_error`, and `map_list_error`) as maintainability work before deeper runtime changes.
+12. Convert the prose-only local ticket cache into structured, machine-checkable data with fields such as `ticket_id`, `source`, `status`, `linked_prs`, `last_checked_at`, and `verified_merged`.
 
 ### Verification Run
 
