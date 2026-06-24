@@ -170,6 +170,14 @@ llvm.toolchain(
             "-iwithsysroot",
             "/usr/include/aarch64-linux-gnu/c++/13",
         ],
+        # snmalloc's aba.h hard-errors without 16-byte CAS (CMPXCHG16B). The
+        # Bazel-native snmalloc-rs cc_library (new pin) no longer sets -mcx16
+        # the way the old foreign_cc cmake build did, so the C++ archive must
+        # carry the same x86-64-v2 floor the Rust side already pins
+        # (.bazelrc:26, CU-86aj4guza). v2 == cx16 + sse4.2 + popcnt.
+        "linux-x86_64": [
+            "-march=x86-64-v2",
+        ],
     },
     llvm_versions = {
         "": "21.1.8",
