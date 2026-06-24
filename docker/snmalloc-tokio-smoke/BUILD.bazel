@@ -1,0 +1,8 @@
+load("//bazel/oci:defs.bzl", "konfig_oci_image")
+
+konfig_oci_image(
+    name = "snmalloc_tokio_smoke",
+    binary = "//rust/konfig:snmalloc_tokio_smoke",
+    binary_name = "snmalloc-tokio-smoke",
+    repository = "kasa288/snmalloc-tokio-smoke",
+)

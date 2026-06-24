@@ -41,26 +41,6 @@ snmalloc = ["dep:snmalloc-rs"]
 # `profiling`). Cargo builds never enable this feature.
 snmalloc_profiling = ["snmalloc"]
 
-[[test]]
-name = "integration_watcher"
-path = "tests/integration_watcher.rs"
-required-features = ["integration"]
-
-[[test]]
-name = "integration_watch_timing"
-path = "tests/integration_watch_timing.rs"
-required-features = ["integration"]
-
-[[test]]
-name = "integration_grpc"
-path = "tests/integration_grpc.rs"
-required-features = ["integration"]
-
-[[test]]
-name = "cp_integration"
-path = "tests/cp_integration.rs"
-required-features = ["integration"]
-
 [dependencies]
 arc-swap = {workspace = true}
 async-trait = {workspace = true}

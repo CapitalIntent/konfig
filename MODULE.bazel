@@ -20,16 +20,15 @@ Public targets:
 module(
     name = "konfig",
     version = "0.1.0",
-    compatibility_level = 1,
 )
 
 ##################################
 # Core rules — always required
 ##################################
 bazel_dep(name = "rules_rust", version = "")
-bazel_dep(name = "platforms", version = "0.0.11")
-bazel_dep(name = "bazel_skylib", version = "1.8.1")
-bazel_dep(name = "aspect_bazel_lib", version = "2.14.0")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "aspect_bazel_lib", version = "2.21.1")
 
 # archive_override applies when konfig is the root module (standalone CI/dev).
 # When konfig is used as a dep, the root workspace's override takes precedence
@@ -71,12 +70,12 @@ register_toolchains(
 # Protobuf
 ##################################
 bazel_dep(name = "rules_proto", version = "7.1.0")
-bazel_dep(name = "protobuf", version = "29.3")
+bazel_dep(name = "protobuf", version = "33.4")
 
 ##################################
 # Shell rules (sh_binary — removed from Bazel 9 built-ins)
 ##################################
-bazel_dep(name = "rules_shell", version = "0.3.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
 
 ##################################
 # OCI images (dev only — used for building/pushing the server image)
@@ -126,6 +125,19 @@ use_repo(
     "distroless_cc_debug_linux_arm64_v8",
 )
 
+docker_linux_sysroot = use_repo_rule(
+    "//bazel/sysroot:docker_linux_sysroot.bzl",
+    "docker_linux_sysroot",
+)
+
+# Local Docker Desktop / Apple Silicon image builds need a Linux sysroot for
+# snmalloc's C++ archive. This repository rule intentionally shells out to
+# Docker + apt during repository fetch, so it is a local-development bridge,
+# not a fully pinned CI sysroot. CI still builds each image on a native runner;
+# if CI needs cross-host Linux image builds, replace this with a pinned sysroot
+# archive or the @toolchains_llvm sysroot repository rule.
+docker_linux_sysroot(name = "linux_aarch64_sysroot")
+
 ##################################
 # LLVM cross-compilation toolchain (dev only)
 ##################################
@@ -136,25 +148,42 @@ llvm = use_extension(
     "llvm",
     dev_dependency = True,
 )
-# Enable cross-compilation to Linux targets from macOS via LLVM's bundled
-# libc++ — no glibc sysroot wired. The previous setup extracted Ubuntu 22.04
-# `libstdc++-12-dev` via Docker into per-arch sysroots, but the libstdc++
-# header include path was never propagated to clang during foreign_cc cmake
-# builds, so cross-compile from darwin failed with `'atomic' file not found`
-# inside `external/snmalloc+/src/snmalloc/stl/cxx/atomic.h`. Dropping the
-# sysroot and letting LLVM provide its own C++ runtime headers matches the
-# capitalintent monorepo setup and makes cross-compile work out of the box.
+
+# Linux OCI builds compile C++ through snmalloc. `toolchains_llvm` only emits
+# Linux cross-target toolchains when an explicit sysroot is configured; without
+# one it emits host and freestanding toolchains only. Use the dynamic libstdc++
+# runtime to match the distroless cc base image and avoid static libstdc++
+# operator overrides.
 llvm.toolchain(
     name = "konfig_llvm_toolchain",
+    cxx_builtin_include_directories = {
+        "linux-aarch64": [
+            "%sysroot%/usr/include/c++/13",
+            "%sysroot%/usr/include/aarch64-linux-gnu/c++/13",
+        ],
+    },
     cxx_standard = {"": "c++23"},
+    extra_cxx_flags = {
+        "linux-aarch64": [
+            "-iwithsysroot",
+            "/usr/include/c++/13",
+            "-iwithsysroot",
+            "/usr/include/aarch64-linux-gnu/c++/13",
+        ],
+    },
     llvm_versions = {
         "": "21.1.8",
         "darwin-aarch64": "20.1.8",
     },
     stdlib = {
-        "aarch64-unknown-linux-gnu": "libc++",
-        "x86_64-unknown-linux-gnu": "libc++",
+        "linux-aarch64": "dynamic-stdc++",
+        "linux-x86_64": "dynamic-stdc++",
     },
+)
+llvm.sysroot(
+    name = "konfig_llvm_toolchain",
+    label = "@linux_aarch64_sysroot//sysroot:sysroot",
+    targets = ["linux-aarch64"],
 )
 use_repo(llvm, "konfig_llvm_toolchain", "konfig_llvm_toolchain_llvm")
 
@@ -240,7 +269,6 @@ crate.annotation(
     crate = "console-subscriber",
     rustc_flags = ["--cfg=tokio_unstable"],
 )
-
 use_repo(crate, "konfig_crates")
 
 ##################################
@@ -251,6 +279,6 @@ use_repo(crate, "konfig_crates")
 bazel_dep(name = "snmalloc", version = "0")
 git_override(
     module_name = "snmalloc",
+    commit = "e64cd355ff4f0291101d495f7e8e7d9d0821bfe9",
     remote = "https://github.com/jayakasadev/snmalloc.git",
-    commit = "185c7a119b050fe7aae7fe2edd046b43cea25d90",
 )

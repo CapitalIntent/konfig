@@ -175,6 +175,20 @@ rust_binary(
     ],
 )
 
+# Minimal allocator/runtime smoke binary. Keep this separate from `konfig_bin`
+# so Linux image smoke tests can distinguish snmalloc/Tokio startup failures
+# from application, Kubernetes, and CLI initialization failures.
+rust_binary(
+    name = "snmalloc_tokio_smoke",
+    srcs = ["snmalloc_tokio_smoke.rs"],
+    tags = ["konfig", "rust", "smoke"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@konfig_crates//:tokio",
+        "@snmalloc//snmalloc-rs:snmalloc_rs",
+    ],
+)
+
 # Opt-in tokio-console binary — same sources as `:konfig_bin` but built
 # with `--cfg feature="tokio_console"`, which compiles in the
 # `console_subscriber::ConsoleLayer` activation in `main.rs::init_tracing`.
