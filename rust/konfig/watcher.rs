@@ -13,7 +13,7 @@ use kube::{Api, Client};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use crate::cache::ConfigCache;
+use crate::cache::{ConfigCache, ConfigMutation};
 use crate::metrics::LastEventAt;
 use crate::types::{ConfigSnapshot, ConfigSpec};
 
@@ -155,7 +155,7 @@ impl Watcher {
                 "Config watcher started"
             );
 
-            match pump_config_events(stream, &cache, &last_event_at).await {
+            match pump_config_events(stream, &cache, &last_event_at, attempt > 0).await {
                 PumpOutcome::StreamEnded => {
                     info!("Config watcher stream ended cleanly");
                     return Ok(());
@@ -193,16 +193,43 @@ pub(crate) async fn pump_config_events<S>(
     mut stream: S,
     cache: &Arc<ConfigCache>,
     last_event_at: &Arc<LastEventAt>,
+    batch_relist: bool,
 ) -> PumpOutcome
 where
     S: futures_util::stream::TryStream<Ok = Event<DynamicObject>, Error = kube_watcher::Error>
         + Unpin,
 {
+    // On a watch RESTART (reconnect) kube-rs replays the full watched set as an
+    // Init -> InitApply* -> InitDone relist. Buffer those upserts and commit
+    // them with ONE `apply_batch` clone+swap instead of one clone per object
+    // (CU-86aj7k61x). Cold start (`batch_relist == false`) keeps the historical
+    // incremental apply so the `is_populated()` readiness gate still flips on
+    // the first object rather than waiting for the whole list. A relist cut
+    // short by a stream error simply drops the buffer — the reconnect re-lists.
+    let mut relist: Option<Vec<ConfigMutation>> = None;
     loop {
         match stream.try_next().await {
             Ok(Some(event)) => {
                 last_event_at.touch();
-                handle_event(event, cache);
+                match event {
+                    Event::Init if batch_relist => relist = Some(Vec::new()),
+                    Event::InitApply(obj) => match relist.as_mut() {
+                        Some(buf) => {
+                            if let Some(snap) = parse_config_object(&obj) {
+                                buf.push(ConfigMutation::Upsert(snap));
+                            }
+                        }
+                        None => handle_event(Event::InitApply(obj), cache),
+                    },
+                    Event::InitDone => match relist.take() {
+                        Some(buf) => {
+                            let n = cache.apply_batch(buf);
+                            debug!(events = n, "Config watch relist committed as one batch");
+                        }
+                        None => handle_event(Event::InitDone, cache),
+                    },
+                    other => handle_event(other, cache),
+                }
             }
             Ok(None) => return PumpOutcome::StreamEnded,
             Err(e) => return PumpOutcome::StreamErrored(e),
@@ -472,7 +499,7 @@ mod tests {
         ];
         let stream = stream::iter(events);
 
-        let outcome = pump_config_events(stream, &cache, &lea).await;
+        let outcome = pump_config_events(stream, &cache, &lea, false).await;
         assert!(matches!(outcome, PumpOutcome::StreamEnded));
         assert_eq!(cache.get("default", "cfg-a").unwrap().schema_version, 2);
         assert_eq!(cache.get("default", "cfg-b").unwrap().schema_version, 3);
@@ -491,7 +518,7 @@ mod tests {
         ];
         let stream = stream::iter(events);
 
-        let outcome = pump_config_events(stream, &cache, &lea).await;
+        let outcome = pump_config_events(stream, &cache, &lea, false).await;
         assert!(matches!(outcome, PumpOutcome::StreamErrored(_)));
         // Pre-error event landed; post-error event did not.
         assert_eq!(cache.get("default", "cfg-a").unwrap().schema_version, 1);
@@ -506,7 +533,7 @@ mod tests {
         assert!(lea.elapsed_secs().is_none(), "cold start: None");
 
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> = vec![Ok(Event::Init)];
-        let _ = pump_config_events(stream::iter(events), &cache, &lea).await;
+        let _ = pump_config_events(stream::iter(events), &cache, &lea, false).await;
 
         assert!(
             lea.elapsed_secs().is_some(),
@@ -522,7 +549,7 @@ mod tests {
         let obj = make_obj("cfg-a", 7, json!({"k": 1}));
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> =
             vec![Ok(Event::Apply(obj.clone())), Ok(Event::Delete(obj))];
-        let _ = pump_config_events(stream::iter(events), &cache, &lea).await;
+        let _ = pump_config_events(stream::iter(events), &cache, &lea, false).await;
         // Delete intentionally retains the last-known-good entry — this
         // documents the audit's accepted design (CU-86aj0jfu5 deferred items).
         assert_eq!(cache.get("default", "cfg-a").unwrap().schema_version, 7);
@@ -535,9 +562,29 @@ mod tests {
         let lea = Arc::new(LastEventAt::new());
         let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> = vec![];
 
-        let outcome = pump_config_events(stream::iter(events), &cache, &lea).await;
+        let outcome = pump_config_events(stream::iter(events), &cache, &lea, false).await;
         assert!(matches!(outcome, PumpOutcome::StreamEnded));
         assert!(lea.elapsed_secs().is_none());
         assert!(!cache.is_populated());
+    }
+
+    #[tokio::test]
+    async fn reconnect_relist_commits_as_single_batch() {
+        use futures_util::stream;
+        let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
+        let lea = Arc::new(LastEventAt::new());
+        let events: Vec<Result<Event<DynamicObject>, kube_watcher::Error>> = vec![
+            Ok(Event::Init),
+            Ok(Event::InitApply(make_obj("cfg-a", 1, json!({"a": 1})))),
+            Ok(Event::InitApply(make_obj("cfg-b", 2, json!({"b": 2})))),
+            Ok(Event::InitDone),
+        ];
+        // batch_relist = true: the Init..InitDone relist commits atomically.
+        let outcome = pump_config_events(stream::iter(events), &cache, &lea, true).await;
+        assert!(matches!(outcome, PumpOutcome::StreamEnded));
+        assert_eq!(cache.get("default", "cfg-a").unwrap().schema_version, 1);
+        assert_eq!(cache.get("default", "cfg-b").unwrap().schema_version, 2);
+        // Two objects, exactly ONE clone+swap — the batch path.
+        assert_eq!(cache.write_count(), 1);
     }
 }

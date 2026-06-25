@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use crate::grpc::secret_get::secret_snapshot_to_proto;
 use crate::metrics::{LastEventAt, LastEventAtMap, last_event_at_for};
 use crate::proto::{SecretEvent, secret_event::EventType};
-use crate::secret_cache::SecretCache;
+use crate::secret_cache::{SecretCache, SecretMutation};
 use crate::types::SecretSnapshot;
 use crate::watcher::run_with_reconnect;
 
@@ -75,13 +75,14 @@ impl SecretWatcher {
                     "secret",
                     namespace.clone(),
                     move || cache_stale.mark_all_stale(),
-                    |_attempt| {
+                    |attempt| {
                         run_namespace_watcher(
                             client.clone(),
                             Arc::clone(&cache),
                             namespace.clone(),
                             tx.clone(),
                             Arc::clone(&last_event_at),
+                            attempt > 0,
                         )
                     },
                 )
@@ -97,6 +98,7 @@ async fn run_namespace_watcher(
     namespace: String,
     broadcast_tx: broadcast::Sender<SecretEvent>,
     last_event_at: Arc<LastEventAt>,
+    batch_relist: bool,
 ) -> Result<(), kube_watcher::Error> {
     let api: Api<Secret> = Api::namespaced(client, &namespace);
     let wc = kube_watcher::Config::default().labels(&format!("{MANAGED_LABEL}=true"));
@@ -104,7 +106,15 @@ async fn run_namespace_watcher(
 
     info!(namespace = %namespace, "Secret watcher started");
 
-    pump_secret_events(stream, &cache, &namespace, &broadcast_tx, &last_event_at).await
+    pump_secret_events(
+        stream,
+        &cache,
+        &namespace,
+        &broadcast_tx,
+        &last_event_at,
+        batch_relist,
+    )
+    .await
 }
 
 /// Apply one Secret watcher event to the cache + broadcast channel.
@@ -194,13 +204,48 @@ pub(crate) async fn pump_secret_events<S>(
     namespace: &str,
     broadcast_tx: &broadcast::Sender<SecretEvent>,
     last_event_at: &Arc<LastEventAt>,
+    batch_relist: bool,
 ) -> Result<(), kube_watcher::Error>
 where
     S: futures_util::stream::TryStream<Ok = Event<Secret>, Error = kube_watcher::Error> + Unpin,
 {
+    // On a watch RESTART (reconnect) the relist (Init -> InitApply* -> InitDone)
+    // is committed to the cache with ONE `apply_batch` clone+swap instead of one
+    // clone per secret (CU-86aj7k61x). Each secret is STILL broadcast
+    // individually so subscribers observe per-secret Modified events exactly as
+    // before — only the cache write is coalesced. Cold start keeps the per-event
+    // path so the readiness gate is unchanged; a relist cut short by a stream
+    // error drops the buffer and the reconnect re-lists.
+    let mut relist: Option<Vec<SecretMutation>> = None;
     while let Some(event) = stream.try_next().await? {
         last_event_at.touch();
-        handle_secret_event(event, cache, namespace, broadcast_tx);
+        match event {
+            Event::Init if batch_relist => relist = Some(Vec::new()),
+            Event::InitApply(secret) => match relist.as_mut() {
+                Some(buf) => {
+                    if let Some(snap) = parse_secret(&secret, namespace) {
+                        let secret_event = SecretEvent {
+                            event_type: EventType::Modified as i32,
+                            secret: Some(secret_snapshot_to_proto(&snap)),
+                        };
+                        buf.push(SecretMutation::Upsert(snap));
+                        // Ignore Err — means zero receivers at the moment.
+                        let _ = broadcast_tx.send(secret_event);
+                    }
+                }
+                None => {
+                    handle_secret_event(Event::InitApply(secret), cache, namespace, broadcast_tx)
+                }
+            },
+            Event::InitDone => match relist.take() {
+                Some(buf) => {
+                    let n = cache.apply_batch(buf);
+                    debug!(events = n, "Secret watch relist committed as one batch");
+                }
+                None => handle_secret_event(Event::InitDone, cache, namespace, broadcast_tx),
+            },
+            other => handle_secret_event(other, cache, namespace, broadcast_tx),
+        }
     }
     Ok(())
 }
@@ -335,7 +380,7 @@ mod tests {
         // that wraps the success in a different variant (or returns Ok(())
         // prematurely without consuming the stream) is still possible after
         // future refactors.
-        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea, false).await;
         match res {
             Ok(()) => {}
             Err(e) => panic!("clean-stream end must be Ok(()), got Err({e:?})"),
@@ -392,7 +437,7 @@ mod tests {
         let events: Vec<Result<Event<Secret>, kube_watcher::Error>> =
             vec![Ok(Event::Apply(s.clone())), Ok(Event::Delete(s))];
 
-        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea, false).await;
         assert!(res.is_ok());
         // Cache retains last-known-good (documented CP behaviour).
         assert_eq!(cache.get("ns", "s-a").unwrap().schema_version, 7);
@@ -415,7 +460,7 @@ mod tests {
             Ok(Event::Apply(secret_with_data("s-c", "k", b"v", 99))),
         ];
 
-        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea, false).await;
         // Strengthen `is_err()` to a precise variant match — the kube
         // runtime watcher distinguishes WatchFailed (this case), InitFailed,
         // TooManyObjects etc. The reconnect loop in `run_with_reconnect`
@@ -448,7 +493,7 @@ mod tests {
         assert!(lea.elapsed_secs().is_none());
 
         let events: Vec<Result<Event<Secret>, kube_watcher::Error>> = vec![Ok(Event::Init)];
-        let _ = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        let _ = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea, false).await;
         assert!(
             lea.elapsed_secs().is_some(),
             "Init must touch freshness — gauge reflects connectivity",
@@ -466,7 +511,7 @@ mod tests {
         let events: Vec<Result<Event<Secret>, kube_watcher::Error>> =
             vec![Ok(Event::Apply(secret_with_data("s-a", "k", b"v", 4)))];
 
-        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea, false).await;
         assert!(res.is_ok());
         // Cache still updates even when no subscribers — broadcast errs only get logged.
         assert_eq!(cache.get("ns", "s-a").unwrap().schema_version, 4);
@@ -480,8 +525,32 @@ mod tests {
         let lea = Arc::new(LastEventAt::new());
         let events: Vec<Result<Event<Secret>, kube_watcher::Error>> = vec![];
 
-        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea).await;
+        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea, false).await;
         assert!(res.is_ok());
         assert!(lea.elapsed_secs().is_none());
+    }
+
+    #[tokio::test]
+    async fn reconnect_relist_commits_as_single_batch_and_broadcasts_each() {
+        use futures_util::stream;
+        let cache = Arc::new(SecretCache::new());
+        let (tx, mut rx) = broadcast::channel(8);
+        let lea = Arc::new(LastEventAt::new());
+        let events: Vec<Result<Event<Secret>, kube_watcher::Error>> = vec![
+            Ok(Event::Init),
+            Ok(Event::InitApply(secret_with_data("s-a", "k", b"v", 1))),
+            Ok(Event::InitApply(secret_with_data("s-b", "k", b"v", 2))),
+            Ok(Event::InitDone),
+        ];
+        // batch_relist = true: the relist commits to the cache atomically.
+        let res = pump_secret_events(stream::iter(events), &cache, "ns", &tx, &lea, true).await;
+        assert!(res.is_ok());
+        assert_eq!(cache.get("ns", "s-a").unwrap().schema_version, 1);
+        assert_eq!(cache.get("ns", "s-b").unwrap().schema_version, 2);
+        // Two secrets, exactly ONE cache clone+swap...
+        assert_eq!(cache.write_count(), 1);
+        // ...but each secret is still broadcast individually to subscribers.
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
     }
 }

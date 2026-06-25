@@ -79,6 +79,27 @@ lazy_static::lazy_static! {
     )
     .expect("failed to register konfig_subscribe_snapshot_emitted_total");
 
+    /// Current number of entries in each cache (`cache` = "config" | "secret").
+    /// Refreshed to the post-mutation map length after every write so a scrape
+    /// reflects steady-state cache size without walking the map.
+    pub static ref CACHE_ENTRIES: GaugeVec = register_gauge_vec!(
+        "konfig_cache_entries",
+        "Current number of entries in each cache",
+        &["cache"]
+    )
+    .expect("failed to register konfig_cache_entries");
+
+    /// Total cache write mutations (whole-map clone+swap operations) per cache.
+    /// One increment per `update`/`remove`/`mark_all_stale`/`apply_batch` call —
+    /// a batch of N events counts as ONE mutation, so `rate()` of this metric is
+    /// the copy-on-write clone churn the cache pays under watch load.
+    pub static ref CACHE_WRITE_MUTATIONS_TOTAL: CounterVec = register_counter_vec!(
+        "konfig_cache_write_mutations_total",
+        "Total cache write mutations (whole-map clone+swap) per cache",
+        &["cache"]
+    )
+    .expect("failed to register konfig_cache_write_mutations_total");
+
     /// Depth of the per-namespace replay buffer (sampled every 5 s).
     pub static ref REPLAY_BUFFER_DEPTH: GaugeVec = register_gauge_vec!(
         "konfig_replay_buffer_depth",
