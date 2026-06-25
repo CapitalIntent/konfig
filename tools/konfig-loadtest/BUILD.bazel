@@ -2,7 +2,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy", "rustfmt_test")
 
 rust_binary(
     name = "konfig_loadtest",
-    srcs = ["src/main.rs"],
+    srcs = glob(["src/**/*.rs"]),
     tags = ["konfig", "loadtest", "rust"],
     visibility = ["//visibility:public"],
     deps = [
