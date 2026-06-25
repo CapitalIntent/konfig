@@ -219,35 +219,57 @@ where
     let mut relist: Option<Vec<SecretMutation>> = None;
     while let Some(event) = stream.try_next().await? {
         last_event_at.touch();
-        match event {
-            Event::Init if batch_relist => relist = Some(Vec::new()),
-            Event::InitApply(secret) => match relist.as_mut() {
-                Some(buf) => {
-                    if let Some(snap) = parse_secret(&secret, namespace) {
-                        let secret_event = SecretEvent {
-                            event_type: EventType::Modified as i32,
-                            secret: Some(secret_snapshot_to_proto(&snap)),
-                        };
-                        buf.push(SecretMutation::Upsert(snap));
-                        // Ignore Err — means zero receivers at the moment.
-                        let _ = broadcast_tx.send(secret_event);
-                    }
-                }
-                None => {
-                    handle_secret_event(Event::InitApply(secret), cache, namespace, broadcast_tx)
-                }
-            },
-            Event::InitDone => match relist.take() {
-                Some(buf) => {
-                    let n = cache.apply_batch(buf);
-                    debug!(events = n, "Secret watch relist committed as one batch");
-                }
-                None => handle_secret_event(Event::InitDone, cache, namespace, broadcast_tx),
-            },
-            other => handle_secret_event(other, cache, namespace, broadcast_tx),
-        }
+        route_secret_event(
+            event,
+            cache,
+            namespace,
+            broadcast_tx,
+            &mut relist,
+            batch_relist,
+        );
     }
     Ok(())
+}
+
+/// Route one Secret watch event, batching the reconnect relist.
+///
+/// `relist` is `Some` only between `Init` and `InitDone` on a reconnect
+/// (`batch_relist`): `InitApply` secrets are buffered (and STILL broadcast
+/// individually so subscribers see per-secret Modified events) and `InitDone`
+/// commits the buffer with one `apply_batch`. Every other case falls through to
+/// the per-event [`handle_secret_event`], preserving the historical path.
+fn route_secret_event(
+    event: Event<Secret>,
+    cache: &Arc<SecretCache>,
+    namespace: &str,
+    broadcast_tx: &broadcast::Sender<SecretEvent>,
+    relist: &mut Option<Vec<SecretMutation>>,
+    batch_relist: bool,
+) {
+    if let Some(buf) = relist.as_mut() {
+        match event {
+            Event::InitApply(secret) => {
+                if let Some(snap) = parse_secret(&secret, namespace) {
+                    let secret_event = SecretEvent {
+                        event_type: EventType::Modified as i32,
+                        secret: Some(secret_snapshot_to_proto(&snap)),
+                    };
+                    buf.push(SecretMutation::Upsert(snap));
+                    // Ignore Err — means zero receivers at the moment.
+                    let _ = broadcast_tx.send(secret_event);
+                }
+            }
+            Event::InitDone => {
+                let n = cache.apply_batch(relist.take().expect("relist buffer set"));
+                debug!(events = n, "Secret watch relist committed as one batch");
+            }
+            other => handle_secret_event(other, cache, namespace, broadcast_tx),
+        }
+    } else if batch_relist && matches!(event, Event::Init) {
+        *relist = Some(Vec::new());
+    } else {
+        handle_secret_event(event, cache, namespace, broadcast_tx);
+    }
 }
 
 fn parse_secret(secret: &Secret, namespace: &str) -> Option<SecretSnapshot> {

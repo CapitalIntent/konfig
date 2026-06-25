@@ -200,40 +200,54 @@ where
         + Unpin,
 {
     // On a watch RESTART (reconnect) kube-rs replays the full watched set as an
-    // Init -> InitApply* -> InitDone relist. Buffer those upserts and commit
-    // them with ONE `apply_batch` clone+swap instead of one clone per object
-    // (CU-86aj7k61x). Cold start (`batch_relist == false`) keeps the historical
-    // incremental apply so the `is_populated()` readiness gate still flips on
-    // the first object rather than waiting for the whole list. A relist cut
-    // short by a stream error simply drops the buffer — the reconnect re-lists.
+    // Init -> InitApply* -> InitDone relist; `route_config_event` buffers it and
+    // commits it with ONE `apply_batch` clone+swap (CU-86aj7k61x). Cold start
+    // keeps the per-event apply so the `is_populated()` readiness gate is
+    // unchanged. A relist cut short by a stream error drops the buffer — the
+    // reconnect re-lists.
     let mut relist: Option<Vec<ConfigMutation>> = None;
     loop {
         match stream.try_next().await {
             Ok(Some(event)) => {
                 last_event_at.touch();
-                match event {
-                    Event::Init if batch_relist => relist = Some(Vec::new()),
-                    Event::InitApply(obj) => match relist.as_mut() {
-                        Some(buf) => {
-                            if let Some(snap) = parse_config_object(&obj) {
-                                buf.push(ConfigMutation::Upsert(snap));
-                            }
-                        }
-                        None => handle_event(Event::InitApply(obj), cache),
-                    },
-                    Event::InitDone => match relist.take() {
-                        Some(buf) => {
-                            let n = cache.apply_batch(buf);
-                            debug!(events = n, "Config watch relist committed as one batch");
-                        }
-                        None => handle_event(Event::InitDone, cache),
-                    },
-                    other => handle_event(other, cache),
-                }
+                route_config_event(event, cache, &mut relist, batch_relist);
             }
             Ok(None) => return PumpOutcome::StreamEnded,
             Err(e) => return PumpOutcome::StreamErrored(e),
         }
+    }
+}
+
+/// Route one Config watch event, batching the reconnect relist.
+///
+/// `relist` is `Some` only between `Init` and `InitDone` on a reconnect
+/// (`batch_relist`): `InitApply` objects are buffered there and `InitDone`
+/// commits them with a single `apply_batch`. Every other case — cold start, a
+/// bare `InitApply` with no framing, live `Apply`/`Delete` — falls through to
+/// the per-event [`handle_event`], preserving the historical path.
+fn route_config_event(
+    event: Event<DynamicObject>,
+    cache: &Arc<ConfigCache>,
+    relist: &mut Option<Vec<ConfigMutation>>,
+    batch_relist: bool,
+) {
+    if let Some(buf) = relist.as_mut() {
+        match event {
+            Event::InitApply(obj) => {
+                if let Some(snap) = parse_config_object(&obj) {
+                    buf.push(ConfigMutation::Upsert(snap));
+                }
+            }
+            Event::InitDone => {
+                let n = cache.apply_batch(relist.take().expect("relist buffer set"));
+                debug!(events = n, "Config watch relist committed as one batch");
+            }
+            other => handle_event(other, cache),
+        }
+    } else if batch_relist && matches!(event, Event::Init) {
+        *relist = Some(Vec::new());
+    } else {
+        handle_event(event, cache);
     }
 }
 
