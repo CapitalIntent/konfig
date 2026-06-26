@@ -125,21 +125,8 @@ use_repo(
     "distroless_cc_debug_linux_arm64_v8",
 )
 
-docker_linux_sysroot = use_repo_rule(
-    "//bazel/sysroot:docker_linux_sysroot.bzl",
-    "docker_linux_sysroot",
-)
-
-# Local Docker Desktop / Apple Silicon image builds need a Linux sysroot for
-# snmalloc's C++ archive. This repository rule intentionally shells out to
-# Docker + apt during repository fetch, so it is a local-development bridge,
-# not a fully pinned CI sysroot. CI still builds each image on a native runner;
-# if CI needs cross-host Linux image builds, replace this with a pinned sysroot
-# archive or the @toolchains_llvm sysroot repository rule.
-docker_linux_sysroot(name = "linux_aarch64_sysroot")
-
 ##################################
-# LLVM cross-compilation toolchain (dev only)
+# LLVM toolchains (dev only — root workspace provides when used as a dep)
 ##################################
 bazel_dep(name = "toolchains_llvm", version = "1.7.0")
 
@@ -149,36 +136,84 @@ llvm = use_extension(
     dev_dependency = True,
 )
 
-# Linux OCI builds compile C++ through snmalloc. `toolchains_llvm` only emits
-# Linux cross-target toolchains when an explicit sysroot is configured; without
-# one it emits host and freestanding toolchains only. Use the dynamic libstdc++
-# runtime to match the distroless cc base image and avoid static libstdc++
-# operator overrides.
+# Two LLVM toolchains, split by exec host (mirrors CapitalIntent/capitalintent,
+# CU-86aj7k844):
+#
+#   * konfig_llvm_toolchain (NATIVE) — host == target. No sysroot, so a Linux CI
+#     build (exec == target == linux) compiles natively and macOS host builds /
+#     `bazel test` use the macOS SDK. toolchains_llvm only emits Linux cross
+#     toolchains when a sysroot is configured, so the native one never emits
+#     (and never fetches) anything linux.
+#   * konfig_llvm_toolchain_cross (CROSS) — macOS exec -> linux target only,
+#     carrying the pinned Debian-trixie sysroot + libstdc++ flags. Registered
+#     ONLY on a macOS host (.bazelrc `build:macos --extra_toolchains`), so a
+#     Linux CI host never registers it and never resolves/fetches @sysroot_linux_*
+#     (replaces the old Docker+apt sysroot, which needed Docker at fetch time).
 llvm.toolchain(
     name = "konfig_llvm_toolchain",
-    cxx_builtin_include_directories = {
-        "linux-aarch64": [
-            "%sysroot%/usr/include/c++/13",
-            "%sysroot%/usr/include/aarch64-linux-gnu/c++/13",
+    cxx_standard = {"": "c++23"},
+    # snmalloc's aba.h hard-errors without 16-byte CAS (CMPXCHG16B), so the x86_64
+    # C++ archive needs the x86-64-v2 floor (cx16 + sse4.2 + popcnt) the Rust side
+    # already pins (.bazelrc, CU-86aj4guza). This applies on a NATIVE Linux x86_64
+    # build (CI builds each image on its native runner) where target == host ==
+    # linux-x86_64; the cross toolchain below carries the same flag for the
+    # macOS -> linux-x86_64 path. aarch64 needs no march (LSE atomics).
+    extra_cxx_flags = {
+        "linux-x86_64": [
+            "-march=x86-64-v2",
         ],
     },
-    cxx_standard = {"": "c++23"},
-    extra_cxx_flags = {
+    llvm_versions = {
+        "": "21.1.8",
+        "darwin-aarch64": "20.1.8",
+    },
+)
+
+# The macOS LLVM distribution ships only Mach-O libc++, so linux cross targets
+# link libstdc++ from the Debian-trixie sysroot below. dynamic-stdc++ (NOT
+# static) is deliberate: snmalloc overrides the global operator new/delete, and a
+# statically linked libstdc++ would drag in its own operator definitions and
+# clash; the distroless/cc-debian13 runtime ships libstdc++.so to satisfy the
+# dynamic link. The ruleset's auto builtin-include dirs cover libc++ + the C
+# headers only, so the GCC-14 libstdc++ header dirs are declared explicitly per
+# target (Debian trixie == glibc 2.41 / GCC 14 — matches the runtime base image).
+llvm.toolchain(
+    name = "konfig_llvm_toolchain_cross",
+    cxx_builtin_include_directories = {
         "linux-aarch64": [
-            "-iwithsysroot",
-            "/usr/include/c++/13",
-            "-iwithsysroot",
-            "/usr/include/aarch64-linux-gnu/c++/13",
+            "%sysroot%/usr/include/c++/14",
+            "%sysroot%/usr/include/aarch64-linux-gnu/c++/14",
+            "%sysroot%/usr/include/c++/14/backward",
+            "%sysroot%/usr/lib/gcc/aarch64-linux-gnu/14/include",
+        ],
+        "linux-x86_64": [
+            "%sysroot%/usr/include/c++/14",
+            "%sysroot%/usr/include/x86_64-linux-gnu/c++/14",
+            "%sysroot%/usr/include/c++/14/backward",
+            "%sysroot%/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        ],
+    },
+    cxx_flags = {
+        "linux-aarch64": [
+            "-stdlib=libstdc++",
+            "-isystem=/usr/include/c++/14",
+            "-isystem=/usr/include/aarch64-linux-gnu/c++/14",
+            "-isystem=/usr/include/c++/14/backward",
         ],
         # snmalloc's aba.h hard-errors without 16-byte CAS (CMPXCHG16B). The
         # Bazel-native snmalloc-rs cc_library (new pin) no longer sets -mcx16
         # the way the old foreign_cc cmake build did, so the C++ archive must
         # carry the same x86-64-v2 floor the Rust side already pins
-        # (.bazelrc:26, CU-86aj4guza). v2 == cx16 + sse4.2 + popcnt.
+        # (.bazelrc, CU-86aj4guza). v2 == cx16 + sse4.2 + popcnt.
         "linux-x86_64": [
+            "-stdlib=libstdc++",
+            "-isystem=/usr/include/c++/14",
+            "-isystem=/usr/include/x86_64-linux-gnu/c++/14",
+            "-isystem=/usr/include/c++/14/backward",
             "-march=x86-64-v2",
         ],
     },
+    cxx_standard = {"": "c++23"},
     llvm_versions = {
         "": "21.1.8",
         "darwin-aarch64": "20.1.8",
@@ -189,15 +224,73 @@ llvm.toolchain(
     },
 )
 llvm.sysroot(
-    name = "konfig_llvm_toolchain",
-    label = "@linux_aarch64_sysroot//sysroot:sysroot",
+    name = "konfig_llvm_toolchain_cross",
+    label = "@sysroot_linux_arm64//:sysroot",
     targets = ["linux-aarch64"],
 )
-use_repo(llvm, "konfig_llvm_toolchain", "konfig_llvm_toolchain_llvm")
+llvm.sysroot(
+    name = "konfig_llvm_toolchain_cross",
+    label = "@sysroot_linux_x86_64//:sysroot",
+    targets = ["linux-x86_64"],
+)
+use_repo(
+    llvm,
+    "konfig_llvm_toolchain",
+    "konfig_llvm_toolchain_cross",
+    "konfig_llvm_toolchain_cross_llvm",
+    "konfig_llvm_toolchain_llvm",
+)
 
+# Register ONLY the native toolchain unconditionally. The cross toolchain is
+# registered host-conditionally in .bazelrc:
+#   build:macos --extra_toolchains=@konfig_llvm_toolchain_cross//:all
+# so a Linux CI host never registers it and never fetches @sysroot_linux_*.
 register_toolchains(
     "@konfig_llvm_toolchain//:all",
     dev_dependency = True,
+)
+
+# Pinned Debian-trixie linux sysroots for the mac->linux C++ cross-compile,
+# fetched lazily and ONLY by the cross toolchain (macOS exec). A Linux CI host
+# never selects that toolchain, so it never fetches these (CU-86aj7k844).
+#
+# These reuse CapitalIntent/capitalintent's already-generated, sha256-pinned
+# tarballs (Debian-trixie, glibc 2.41, GCC 14 — produced by that repo's
+# //docker/coinbase:gen_sysroot and matching distroless/cc-debian13, konfig's
+# runtime base). The repo is PRIVATE, so the URLs point at the GitHub *API asset*
+# endpoint and rely on the credential helper (.bazelrc --credential_helper),
+# satisfied by $GH_TOKEN/$GITHUB_TOKEN (CI) or `gh auth token` (dev). Re-pin only
+# when that release's assets change.
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+_SYSROOT_BUILD = """\
+filegroup(
+    name = "sysroot",
+    # Exclude paths with spaces — glob() rejects them and the sysroot has none.
+    srcs = glob(["**"], exclude = ["**/* *"]),
+    visibility = ["//visibility:public"],
+)
+"""
+
+_ASSET = "https://api.github.com/repos/CapitalIntent/capitalintent/releases/assets"
+
+http_archive(
+    name = "sysroot_linux_arm64",
+    build_file_content = _SYSROOT_BUILD,
+    integrity = "sha256-NkLaUHN8pJDmefd4IVOqlx8gt6Pu8TZr2OvJrjPP608=",
+    strip_prefix = "sysroot",
+    # API asset URLs have no archive suffix, so declare the format explicitly.
+    type = "tar.zst",
+    urls = [_ASSET + "/456011942"],  # sysroot_linux_arm64.tar.zst
+)
+
+http_archive(
+    name = "sysroot_linux_x86_64",
+    build_file_content = _SYSROOT_BUILD,
+    integrity = "sha256-dt1V1qLrnqTcwSI/MsqwQThYTxU3E7szvmo+9cloSsQ=",
+    strip_prefix = "sysroot",
+    type = "tar.zst",
+    urls = [_ASSET + "/456011943"],  # sysroot_linux_x86_64.tar.zst
 )
 
 ##################################
@@ -208,13 +301,10 @@ crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "konfig_crates",
     cargo_lockfile = "//:Cargo.lock",
-    manifests = [
-        "//:Cargo.toml",
-        "//rust/konfig:Cargo.toml",
-        "//rust/konfig-consumer:Cargo.toml",
-        "//tools/konfig-cli:Cargo.toml",
-        "//tools/konfig-loadtest:Cargo.toml",
-    ],
+    # rules_rust discovers the workspace members from the root [workspace]
+    # manifest + Cargo.lock; the per-crate manifests are redundant (the ruleset
+    # emits an INFO saying only //:Cargo.toml is required). CU-86aj7k844.
+    manifests = ["//:Cargo.toml"],
     supported_platform_triples = [
         "aarch64-apple-darwin",
         "aarch64-unknown-linux-gnu",

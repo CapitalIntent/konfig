@@ -31,6 +31,30 @@ build:release --@rules_rust//:extra_rustc_flags=-Cpanic=abort
 build:release --@rules_rust//:extra_rustc_flags=-Cstrip=symbols
 build:release --@rules_rust//:extra_rustc_flags=-Ctarget-cpu=native
 
+# ── Hermetic mac→linux cross-compile (CU-86aj7k844) ────────────────────────
+# --enable_platform_specific_config auto-applies `build:macos` by host OS, so a
+# Linux CI host never registers the cross toolchain, never selects its
+# linux-target toolchains, and never resolves/fetches the pinned linux sysroot
+# (the prior Docker+apt fetch was local-dev-only and not CI-hermetic). The NATIVE
+# toolchain (@konfig_llvm_toolchain) is registered unconditionally in MODULE.bazel.
+# Mirrors CapitalIntent/capitalintent's two-toolchain split.
+common --enable_platform_specific_config
+
+# Register the macOS→linux CROSS LLVM toolchain ONLY on a macOS host — the only
+# host that cross-compiles the //docker/konfig images. A Linux host builds each
+# image natively (publish-images.yml), so it never needs the sysroot.
+build:macos --extra_toolchains=@konfig_llvm_toolchain_cross//:all
+
+# Fetch the pinned linux sysroot tarballs. The http_archive entries in
+# MODULE.bazel point at the GitHub *API asset* endpoint of the PRIVATE
+# CapitalIntent/capitalintent release (same Debian-trixie sysroot, sha256-pinned,
+# matches distroless/cc-debian13). The helper attaches `Authorization: Bearer
+# <gh-token>` + `Accept: application/octet-stream`; token from
+# $GH_TOKEN/$GITHUB_TOKEN (CI) or `gh auth token` (local dev). Scoped to
+# api.github.com, so all other downloads use Bazel's default resolution. Lazy:
+# only invoked when a macOS cross build actually fetches the sysroot.
+common --credential_helper=api.github.com=%workspace%/tools/bazel/github_credential_helper.py
+
 # Linux arm64 target — used when building container images on Apple Silicon.
 build:linux-arm64 --platforms=//platforms:linux_arm64
 
