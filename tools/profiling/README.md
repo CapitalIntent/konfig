@@ -117,15 +117,71 @@ on macOS):
 
 1. **Capture the baseline from `main`.** Run the loadtest against a
    `konfig-profiling` Deployment + pyroscope/alloy (see `infra/profiling/`),
-   then query pyroscope's render API for the top-5 self-% frames and commit the
-   result as `.profiling-baseline.json`.
-2. **Add a post-loadtest step** to `loadtest-integration.yml` that runs the same
-   pyroscope query → `current.json`, then `python3 tools/profiling/flamediff.py
-   current.json .profiling-baseline.json --output=$GITHUB_STEP_SUMMARY`. Gate
-   the job on its exit code.
+   then capture the flamebearer (pyroscope render API, `format=json`) and reduce
+   it locally with `flamebearer_to_pprof.py --top-frames 5` (see below), and
+   commit the result as `.profiling-baseline.json`.
+2. **Add a post-loadtest step** to `loadtest-integration.yml` that captures the
+   flamebearer, reduces it with `flamebearer_to_pprof.py --top-frames 5` →
+   `current.json`, then `python3 tools/profiling/flamediff.py current.json
+   .profiling-baseline.json --output=$GITHUB_STEP_SUMMARY`. Gate the job on its
+   exit code. (Also emit `cpu-profile.pprof` via the same converter for
+   interactive drill-down on regressions.)
 3. **Verify the gate fires:** open a throwaway PR with an intentional hot-path
    regression (e.g. a `sleep` in the apply path) and confirm CI fails; revert.
 
 Until the baseline is captured the gate is intentionally NOT wired into the
 required smoke gate — an unverified pyroscope query must not be allowed to break
 every PR.
+
+# flamebearer_to_pprof.py — pprof + summary export (CU-86aj7kawc)
+
+The bench captures CPU profiles as Pyroscope **flamebearer JSON**
+(`cpu-profile.flamebearer.json`), which `go tool pprof` cannot parse — so ad-hoc
+CPU drill-down (`-top`, `-list`, `-http` flamegraph) was not possible.
+`flamebearer_to_pprof.py` reconstructs the call tree from the flamebearer and
+emits either a **pprof** profile or the **flamediff top-frames** summary. Pure
+stdlib (no protobuf dependency); pyroscope frames are already symbolized so no
+konfig binary is needed.
+
+## Capture a flamebearer
+
+Query Pyroscope's render API for the konfig CPU profile as flamebearer JSON
+(during/after a loadtest with `infra/profiling/` deployed). `format=json` yields
+flamebearer; adjust the query selector to your pyroscope app/profile type:
+
+```sh
+kubectl -n profiling port-forward svc/pyroscope 4040:4040 &
+curl -fsS 'http://localhost:4040/pyroscope/render?query=process_cpu:cpu:nanoseconds:cpu:nanoseconds{service_name="konfig"}&from=now-10m&format=json' \
+  -o cpu-profile.flamebearer.json
+```
+
+## pprof export (interactive drill-down)
+
+```sh
+python3 tools/profiling/flamebearer_to_pprof.py cpu-profile.flamebearer.json \
+    --out cpu-profile.pprof
+go tool pprof -top cpu-profile.pprof            # flat/cum self per frame
+go tool pprof -list 'konfig::.*' cpu-profile.pprof
+go tool pprof -http=:8080 cpu-profile.pprof     # interactive flamegraph
+```
+
+Sample values use `cpu/nanoseconds` when the flamebearer carries a `sampleRate`
+(ticks x 1e9/rate); otherwise `samples/count`.
+
+## Top-frames summary (feeds flamediff)
+
+```sh
+python3 tools/profiling/flamebearer_to_pprof.py cpu-profile.flamebearer.json \
+    --top-frames 5 --out current.json
+python3 tools/profiling/flamediff.py current.json .profiling-baseline.json
+```
+
+This automates the previously-manual "extract top-N self-% frames" step, so one
+captured flamebearer drives both interactive pprof analysis and the flamediff
+regression gate.
+
+## Logic test
+
+```sh
+python3 tools/profiling/flamebearer_to_pprof.py --self-test
+```
