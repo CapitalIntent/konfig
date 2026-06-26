@@ -1,0 +1,158 @@
+name: Profiling Pipeline — Linux coalesce/shards flip gate (CU-86aj4z43b)
+on:
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: "Per-variant subscribe soak duration (seconds)"
+        required: false
+        default: "180"
+      noop_park_max:
+        description: "Max acceptable steady-state noop-park rate for optimized"
+        required: false
+        default: "0.20"
+      p99_budget_ms:
+        description: "Max acceptable subscribe p99 (ms) for optimized"
+        required: false
+        default: "50"
+
+# Authoritative, reproducible Linux profiling path (CU-86aj4z43b). The
+# 2026-06-19 coalesce+shards run had to be done natively on darwin because
+# darwin->linux cross-compile is broken; macOS numbers are indicative only.
+# This workflow builds the konfig-heapprof image NATIVELY on a Linux amd64
+# runner (no cross-compile), runs the konfig-loadtest subscribe scenario under
+# two variants in one kind cluster:
+#
+#   baseline   = --coalesce-window-ms 0  --broadcast-shards 1   (historical)
+#   optimized  = --coalesce-window-ms 5  --broadcast-shards 4   (candidate)
+#
+# and captures snmalloc heap pprof + tokio park/noop runtime gauges +
+# konfig_broadcast_lag drop count + subscribe p99. tools/profiling/profiling_gate.py
+# then asserts the CU-86aj3vpgr / CU-86aj3vpnh acceptances (noop-park < max AND
+# below baseline; drops not worse; p99 within budget) and emits the FLIP
+# APPROVED / BLOCKED verdict that gates flipping the defaults 0->5 / 1->4.
+#
+# Scope: manual dispatch only (never push/PR). Wall-clock ~= 2*soak + build.
+# CPU/pyroscope flamegraph capture is provided out-of-band by the PROF-2
+# `bazel run //rust/konfig:flamegraph` target (CU-86ahtj0m5) + infra/profiling/.
+#
+# Tracker: CU-86aj4z43b (parent CU-86aj4chjk Phase 7P).
+jobs:
+  profile:
+    name: coalesce/shards flip gate (native Linux amd64)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+      SOAK: ${{ inputs.soak_seconds || '180' }}
+      NOOP_PARK_MAX: ${{ inputs.noop_park_max || '0.20' }}
+      P99_BUDGET_MS: ${{ inputs.p99_budget_ms || '50' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler
+
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
+
+      - name: CPU capability probe (cx16 — snmalloc SIGILL guard, CU-86aj4guza)
+        run: |
+          grep -m1 'model name' /proc/cpuinfo || true
+          if grep -qm1 cx16 /proc/cpuinfo; then echo "host: cx16 PRESENT"; else echo "host: cx16 MISSING"; fi
+
+      - name: Build konfig-heapprof + konfig-loadtest OCI images (linux/amd64)
+        # Native amd64 build — the authoritative path this ticket exists to
+        # establish (no darwin->linux cross-compile / sysroot wiring).
+        run: |
+          bazel run --config=x86-baseline //docker/konfig-heapprof:load_amd64
+          bazel run --config=x86-baseline //docker/konfig-loadtest:load_amd64
+
+      - name: Create kind cluster (1 node)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: konfig-profiling
+          wait: 120s
+
+      - name: Load images into kind (poll containerd image store)
+        run: |
+          kind load docker-image kasa288/konfig-heapprof:latest --name konfig-profiling
+          kind load docker-image kasa288/konfig-loadtest:latest --name konfig-profiling
+          for img in kasa288/konfig-heapprof:latest kasa288/konfig-loadtest:latest; do
+            repo="${img%:*}"; tag="${img##*:}"
+            ok=0
+            for i in $(seq 1 60); do
+              if docker exec konfig-profiling-control-plane crictl images 2>/dev/null \
+                   | awk -v r="docker.io/$repo" -v t="$tag" '$1==r && $2==t {f=1} END{exit !f}'; then
+                echo "  -> $img visible after ${i}s"; ok=1; break
+              fi
+              sleep 1
+            done
+            [ "$ok" -eq 1 ] || { echo "::error::timeout for $img"; exit 1; }
+          done
+
+      - name: Apply CRDs (Config) + wait
+        run: |
+          kubectl apply -f infra/konfig/crd.yaml
+          kubectl wait --for=condition=Established crd/configs.konfig.io --timeout=60s
+
+      - name: Apply namespace, RBAC, ServiceAccount, Service
+        run: |
+          kubectl apply -f infra/konfig/namespace.yaml
+          kubectl apply -f infra/konfig/serviceaccount.yaml
+          kubectl apply -f infra/konfig/clusterrole.yaml
+          kubectl apply -f infra/konfig/clusterrole-configmap.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding-configmap.yaml
+          kubectl apply -f infra/konfig/role-secret.yaml
+          kubectl apply -f infra/konfig/service.yaml
+
+      - name: Apply konfig ConfigMap (loadtest config name) + seed Config CR
+        run: |
+          kubectl create configmap konfig-config \
+            --namespace=konfig-system \
+            --from-literal=namespace=konfig-system \
+            --from-literal=name=konfig-loadtest \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f infra/konfig-loadtest/seed-config.yaml
+
+      - name: Wait for node Ready (CNI up)
+        run: kubectl wait --for=condition=Ready node --all --timeout=120s
+
+      - name: Capture variant — baseline (coalesce=0 / shards=1)
+        run: bash tools/profiling/ci_capture_variant.sh baseline 0 1 "$SOAK" "$PWD/captures"
+
+      - name: Capture variant — optimized (coalesce=5ms / shards=4)
+        run: bash tools/profiling/ci_capture_variant.sh optimized 5 4 "$SOAK" "$PWD/captures"
+
+      - name: Flip-gate verdict (compare baseline vs optimized)
+        run: python3 tools/profiling/profiling_gate.py "$PWD/captures"
+
+      - name: Upload profiling captures + verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiling-captures
+          path: captures/
+          retention-days: 14
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A || true
+          kubectl describe -n konfig-system deploy/konfig || true
+          kubectl logs -n konfig-system -l app=konfig --tail=200 || true
+          kubectl get events -n konfig-system --sort-by=.lastTimestamp || true
