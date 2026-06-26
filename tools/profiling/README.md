@@ -225,3 +225,37 @@ workflow run's Artifacts panel for the corresponding tag.
 gh run download --name release-profiles-v1.2.3        # by tag
 go tool pprof -http=:0 cpu.pprof                       # inspect locally
 ```
+
+# Linux coalesce/shards flip gate (CU-86aj4z43b)
+
+Authoritative, reproducible **Linux** profiling path that decides whether the
+Subscribe broadcast defaults `--coalesce-window-ms` (0→5) and
+`--broadcast-shards` (1→4) are safe to flip on. macOS numbers from the
+2026-06-19 run are indicative only (darwin→linux cross-compile is broken); this
+builds the `konfig-heapprof` image natively on a Linux amd64 runner.
+
+Driven by `.github/workflows/profiling.yml` (manual dispatch). Per run it
+captures two variants in one kind cluster:
+
+| variant | `--coalesce-window-ms` | `--broadcast-shards` |
+|---|---|---|
+| baseline | 0 | 1 |
+| optimized | 5 | 4 |
+
+- `ci_capture_variant.sh <name> <coalesce_ms> <shards> <soak_s> <outdir>` —
+  deploys `konfig-heapprof` with the variant config, runs the loadtest
+  `subscribe` scenario as traffic, and captures (from the pod's own
+  `/metrics` + `/debug/heap-profile.pprof`) tokio park/noop runtime gauges,
+  `konfig_broadcast_lag_total` drops, snmalloc heap pprof, and the loadtest
+  results JSON (subscribe p99) via a busybox sidecar.
+- `profiling_gate.py <captures-root>` — compares baseline vs optimized and
+  asserts the CU-86aj3vpgr / CU-86aj3vpnh acceptances (noop-park rate
+  `< NOOP_PARK_MAX` **and** below baseline; drop-count not worse; subscribe p99
+  `<= P99_BUDGET_MS`), emitting a **FLIP APPROVED / BLOCKED** verdict to the
+  job summary. Exits non-zero when the optimized variant fails the gate.
+
+```sh
+# Logic self-test (synthetic captures) is covered by the workflow; run the gate
+# locally against a captures/ dir produced by ci_capture_variant.sh:
+NOOP_PARK_MAX=0.20 P99_BUDGET_MS=50 python3 tools/profiling/profiling_gate.py captures
+```

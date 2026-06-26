@@ -1,0 +1,84 @@
+name: amd64 OCI smoke (CU-86aj7k7pc)
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# CU-86aj7k7pc — closes the audit's amd64 verification gap. Only the arm64 OCI
+# path (Darwin->Linux arm64) had been smoked; amd64 image build + the snmalloc/
+# Tokio startup smoke + the amd64 `//rust/konfig:test` path were unverified.
+# This native-amd64 gate builds the snmalloc-tokio-smoke + konfig images on
+# linux/amd64, asserts their arch, runs the smoke (must exit 0 with no
+# sn_rust_dealloc segfault), and runs the konfig test suite on the amd64 path.
+#
+# Self-contained on `--config=x86-baseline` (x86-64-v2 target-cpu, matching the
+# shipped amd64 images) so it does not thrash ci.yml's default-config analysis
+# cache. Verified locally too: Darwin->Linux amd64 cross-build of both images
+# succeeds and the smoke runs clean under amd64 emulation.
+jobs:
+  amd64-smoke:
+    name: amd64 image build + snmalloc/Tokio smoke + amd64 test
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
+
+      - name: CPU capability probe (cx16 — snmalloc SIGILL guard, CU-86aj4guza)
+        run: |
+          if grep -qm1 cx16 /proc/cpuinfo; then echo "host: cx16 PRESENT"; else echo "host: cx16 MISSING"; fi
+
+      - name: Build + load amd64 OCI images (snmalloc-tokio-smoke + konfig)
+        run: |
+          bazel run --config=x86-baseline //docker/snmalloc-tokio-smoke:load_amd64
+          bazel run --config=x86-baseline //docker/konfig:load_amd64
+
+      - name: Assert images are linux/amd64
+        run: |
+          for img in kasa288/snmalloc-tokio-smoke:latest kasa288/konfig:latest; do
+            os=$(docker inspect --format '{{.Os}}' "$img")
+            arch=$(docker inspect --format '{{.Architecture}}' "$img")
+            echo "$img -> $os/$arch"
+            if [ "$os" != "linux" ] || [ "$arch" != "amd64" ]; then
+              echo "::error::Expected linux/amd64 for $img, got $os/$arch"; exit 1
+            fi
+          done
+
+      - name: Run snmalloc/Tokio smoke (must exit 0, no sn_rust_dealloc segfault)
+        run: |
+          set -o pipefail
+          out=$(docker run --rm kasa288/snmalloc-tokio-smoke:latest 2>&1); rc=$?
+          echo "$out"
+          echo "smoke exit code = $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::snmalloc-tokio smoke exited $rc on amd64 (allocator/Tokio startup failure — possible sn_rust_dealloc segfault)"; exit 1
+          fi
+          if ! grep -q "tokio blocking task completed" <<<"$out"; then
+            echo "::error::smoke did not reach the final stage (truncated/crashed before completion)"; exit 1
+          fi
+
+      - name: Run konfig test suite on the amd64 path
+        run: bazel test --config=x86-baseline //rust/konfig:test --test_output=errors
