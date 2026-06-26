@@ -266,15 +266,7 @@ mod tests {
         make_cm(name, data)
     }
 
-    fn watcher_err() -> kube_watcher::Error {
-        // The runtime watcher wraps stream errors in `Error::WatchFailed`.
-        kube_watcher::Error::WatchFailed(kube::Error::Api(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "synthetic".to_string(),
-            reason: "synthetic".to_string(),
-            code: 500,
-        }))
-    }
+    use crate::watcher::synthetic_watcher_error as watcher_err;
 
     #[tokio::test]
     async fn pump_applies_events_to_cache_and_completes_on_stream_close() {

@@ -225,30 +225,65 @@ where
 /// commits them with a single `apply_batch`. Every other case — cold start, a
 /// bare `InitApply` with no framing, live `Apply`/`Delete` — falls through to
 /// the per-event [`handle_event`], preserving the historical path.
+/// Shared reconnect-relist state machine for the config + secret watchers.
+///
+/// On a watch RESTART (reconnect, `batch_relist == true`) kube-rs replays the
+/// full watched set as an `Init -> InitApply* -> InitDone` burst. This routes
+/// that burst into a single buffered `apply_batch` instead of one clone+swap
+/// per event (CU-86aj7k61x). Every other case — cold start, a bare `InitApply`
+/// with no framing, live `Apply`/`Delete` — falls through to the caller's
+/// per-event `handle` path, preserving the historical behaviour.
+///
+/// Mechanics only (CU-86aj7k6mr): the caller supplies how to turn an
+/// `InitApply` payload into a buffered mutation (`buffer`, which may also have
+/// side effects such as broadcasting each secret), how to commit the buffer
+/// (`commit`), and how to handle non-relist events (`handle`).
+pub(crate) fn route_relist_event<E, M>(
+    event: Event<E>,
+    relist: &mut Option<Vec<M>>,
+    batch_relist: bool,
+    label: &'static str,
+    mut buffer: impl FnMut(E, &mut Vec<M>),
+    commit: impl FnOnce(Vec<M>) -> usize,
+    handle: impl FnOnce(Event<E>),
+) {
+    if let Some(buf) = relist.as_mut() {
+        match event {
+            Event::InitApply(payload) => buffer(payload, buf),
+            Event::InitDone => {
+                let n = commit(relist.take().expect("relist buffer set"));
+                debug!(label, events = n, "watch relist committed as one batch");
+            }
+            other => handle(other),
+        }
+    } else if batch_relist && matches!(event, Event::Init) {
+        *relist = Some(Vec::new());
+    } else {
+        handle(event);
+    }
+}
+
+/// Route one Config watch event, batching the reconnect relist via the shared
+/// [`route_relist_event`] state machine.
 fn route_config_event(
     event: Event<DynamicObject>,
     cache: &Arc<ConfigCache>,
     relist: &mut Option<Vec<ConfigMutation>>,
     batch_relist: bool,
 ) {
-    if let Some(buf) = relist.as_mut() {
-        match event {
-            Event::InitApply(obj) => {
-                if let Some(snap) = parse_config_object(&obj) {
-                    buf.push(ConfigMutation::Upsert(snap));
-                }
+    route_relist_event(
+        event,
+        relist,
+        batch_relist,
+        "Config",
+        |obj, buf| {
+            if let Some(snap) = parse_config_object(&obj) {
+                buf.push(ConfigMutation::Upsert(snap));
             }
-            Event::InitDone => {
-                let n = cache.apply_batch(relist.take().expect("relist buffer set"));
-                debug!(events = n, "Config watch relist committed as one batch");
-            }
-            other => handle_event(other, cache),
-        }
-    } else if batch_relist && matches!(event, Event::Init) {
-        *relist = Some(Vec::new());
-    } else {
-        handle_event(event, cache);
-    }
+        },
+        |muts| cache.apply_batch(muts),
+        |other| handle_event(other, cache),
+    );
 }
 
 /// OTEL child span (Phase 7, CU-86ahzwj3k) per Config watch event, nested
@@ -323,6 +358,21 @@ pub fn parse_config_object(obj: &DynamicObject) -> Option<ConfigSnapshot> {
         snap.labels = Arc::new(labels);
     }
     Some(snap)
+}
+
+/// Build a synthetic `kube_watcher::Error` for watcher pump/relist tests.
+///
+/// The runtime watcher wraps stream errors in `Error::WatchFailed`; tests use
+/// this to drive the error path without a live kube API. Shared by the config,
+/// secret, and configmap watcher test modules (CU-86aj7k6mr).
+#[cfg(test)]
+pub(crate) fn synthetic_watcher_error() -> kube_watcher::Error {
+    kube_watcher::Error::WatchFailed(kube::Error::Api(kube::core::ErrorResponse {
+        status: "Failure".to_string(),
+        message: "synthetic".to_string(),
+        reason: "synthetic".to_string(),
+        code: 500,
+    }))
 }
 
 #[cfg(test)]
@@ -492,14 +542,7 @@ mod tests {
 
     // ── pump_config_events ───────────────────────────────────────────────────
 
-    fn watcher_err() -> kube_watcher::Error {
-        kube_watcher::Error::WatchFailed(kube::Error::Api(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "synthetic".to_string(),
-            reason: "synthetic".to_string(),
-            code: 500,
-        }))
-    }
+    use crate::watcher::synthetic_watcher_error as watcher_err;
 
     #[tokio::test]
     async fn pump_applies_events_to_cache_and_returns_ended_on_stream_close() {

@@ -1,109 +1,67 @@
-//! Lock-free multi-key Secret cache backed by [`ArcSwap`]`<HashMap>`.
+//! Lock-free multi-key Secret cache.
 //!
-//! Same pattern as [`ConfigCache`] but typed for [`SecretSnapshot`].
-//! Reads are fully lock-free (atomic pointer load via `arc_swap`).
-//! The 1-2 writers serialise on a `Mutex<()>` that is never held during reads.
-//!
-//! [`ConfigCache`]: crate::cache::ConfigCache
-//! [`ArcSwap`]: arc_swap::ArcSwap
+//! Thin domain wrapper over the generic [`CowCache`](crate::cow_cache::CowCache)
+//! primitive — same pattern as [`ConfigCache`](crate::cache::ConfigCache) but
+//! typed for [`SecretSnapshot`].  Reads are fully lock-free; the 1-2 writers
+//! serialise on an internal `Mutex<()>` never held during reads.  The
+//! copy-on-write mechanics live in [`crate::cow_cache`].
 
-use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Instant;
 
-use arc_swap::ArcSwap;
-
-use crate::cache_key::{BorrowedKey, KeyRef, OwnedKey};
-use crate::metrics::{CACHE_ENTRIES, CACHE_WRITE_MUTATIONS_TOTAL};
+use crate::cow_cache::{CacheEntry, CowCache, INITIAL_CAPACITY, Mutation};
 use crate::types::SecretSnapshot;
-
-type Inner = HashMap<OwnedKey, Arc<SecretSnapshot>>;
 
 /// Label value for this cache's Prometheus metrics.
 const CACHE_KIND: &str = "secret";
 
-/// A single staged mutation for [`SecretCache::apply_batch`].
-///
-/// Mirrors [`ConfigMutation`](crate::cache::ConfigMutation) so the
-/// secret watch-restart relist applies many events under one map clone
-/// (CU-86aj7k61x).
-pub enum SecretMutation {
-    /// Insert or replace the entry for `snap.namespace`/`snap.name`.
-    Upsert(SecretSnapshot),
-    /// Remove the `(namespace, name)` entry if present.
-    Remove { namespace: String, name: String },
+/// A single staged mutation for [`SecretCache::apply_batch`].  Mirrors
+/// [`ConfigMutation`](crate::cache::ConfigMutation).
+pub type SecretMutation = Mutation<SecretSnapshot>;
+
+impl CacheEntry for SecretSnapshot {
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn set_stale(&mut self, now: Instant) {
+        self.stale_since = Some(now);
+    }
 }
 
-/// Initial capacity for the inner [`HashMap`].  Typical 10–100 secrets per
-/// namespace × ~10–50 namespaces ⇒ 128 is the next power of two that
-/// covers the common single-namespace pod and amortises rehashes on
-/// multi-namespace pods.  Capacity propagates across the per-write
-/// `.clone()` so this single pre-size avoids `RawTable::reserve_rehash`
-/// on early Apply events (CU-86aj37pwx).
-pub const INITIAL_CAPACITY: usize = 128;
+// ── SecretCache ─────────────────────────────────────────────────────────────
 
+/// Shared, lock-free multi-key cache for [`SecretSnapshot`].
 pub struct SecretCache {
-    inner: ArcSwap<Inner>,
-    /// Serialises the 1-2 concurrent writers — never held during reads.
-    write_lock: Mutex<()>,
-    /// Count of write mutations (clone+swap operations). A batch counts once.
-    #[cfg(test)]
-    writes: AtomicU64,
+    inner: CowCache<SecretSnapshot>,
 }
 
 impl SecretCache {
     pub fn new() -> Self {
-        CACHE_ENTRIES.with_label_values(&[CACHE_KIND]).set(0.0);
         Self {
-            inner: ArcSwap::from_pointee(Inner::with_capacity(INITIAL_CAPACITY)),
-            write_lock: Mutex::new(()),
-            #[cfg(test)]
-            writes: AtomicU64::new(0),
+            inner: CowCache::with_capacity(CACHE_KIND, INITIAL_CAPACITY),
         }
     }
 
     /// Zero locking — atomic pointer load only.  Lookup is allocation-free
     /// via the `BorrowedKey` / `Borrow<dyn KeyRef>` trick.
     pub fn get(&self, namespace: &str, name: &str) -> Option<Arc<SecretSnapshot>> {
-        let q = BorrowedKey::new(namespace, name);
-        self.inner.load().get(&q as &dyn KeyRef).map(Arc::clone)
+        self.inner.get(namespace, name)
     }
 
     pub fn update(&self, snap: SecretSnapshot) {
-        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
-        let current = self.inner.load();
-        let mut next = (**current).clone();
-        next.insert(
-            OwnedKey::new(snap.namespace.clone(), snap.name.clone()),
-            Arc::new(snap),
-        );
-        let len = next.len();
-        self.inner.store(Arc::new(next));
-        self.record_write(len);
+        self.inner.update(snap);
     }
 
     pub fn remove(&self, namespace: &str, name: &str) {
-        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
-        let current = self.inner.load();
-        let mut next = (**current).clone();
-        let q = BorrowedKey::new(namespace, name);
-        next.remove(&q as &dyn KeyRef);
-        let len = next.len();
-        self.inner.store(Arc::new(next));
-        self.record_write(len);
+        self.inner.remove(namespace, name);
     }
 
     /// Zero locking — atomic pointer load only.
     pub fn all_in_namespace(&self, namespace: &str) -> Vec<Arc<SecretSnapshot>> {
-        let guard = self.inner.load();
-        let mut out = Vec::with_capacity(guard.len());
-        for (k, v) in guard.iter() {
-            if k.namespace == namespace {
-                out.push(Arc::clone(v));
-            }
-        }
-        out
+        self.inner.all_in_namespace(namespace)
     }
 
     /// Mark all cached snapshots as stale (secret watcher lost K8s connection).
@@ -113,71 +71,21 @@ impl SecretCache {
     /// inserts a snapshot with `stale_since = None`.  Mirrors
     /// [`ConfigCache::mark_all_stale`](crate::cache::ConfigCache::mark_all_stale).
     pub fn mark_all_stale(&self) {
-        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
-        let current = self.inner.load();
-        let mut next = (**current).clone();
-        let now = std::time::Instant::now();
-        for v in next.values_mut() {
-            let mut snap = (**v).clone();
-            snap.stale_since = Some(now);
-            *v = Arc::new(snap);
-        }
-        let len = next.len();
-        self.inner.store(Arc::new(next));
-        self.record_write(len);
+        self.inner.mark_all_stale();
     }
 
     /// Apply many mutations under a SINGLE map clone + swap. See
-    /// [`ConfigCache::apply_batch`](crate::cache::ConfigCache::apply_batch).
+    /// [`CowCache::apply_batch`](crate::cow_cache::CowCache::apply_batch).
     /// Empty input is a no-op. Returns the number of mutations applied.
     pub fn apply_batch(&self, mutations: impl IntoIterator<Item = SecretMutation>) -> usize {
-        let mutations: Vec<SecretMutation> = mutations.into_iter().collect();
-        if mutations.is_empty() {
-            return 0;
-        }
-        let n = mutations.len();
-        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
-        let current = self.inner.load();
-        let mut next = (**current).clone();
-        for m in mutations {
-            match m {
-                SecretMutation::Upsert(snap) => {
-                    next.insert(
-                        OwnedKey::new(snap.namespace.clone(), snap.name.clone()),
-                        Arc::new(snap),
-                    );
-                }
-                SecretMutation::Remove { namespace, name } => {
-                    let q = BorrowedKey::new(&namespace, &name);
-                    next.remove(&q as &dyn KeyRef);
-                }
-            }
-        }
-        let len = next.len();
-        self.inner.store(Arc::new(next));
-        self.record_write(len);
-        n
+        self.inner.apply_batch(mutations)
     }
 
     /// Number of write mutations (clone+swap operations) performed. A batch
-    /// counts once. Deterministic per-instance counter used by tests.
-    #[cfg(test)]
+    /// counts once. Used by tests.
     #[cfg(test)]
     pub(crate) fn write_count(&self) -> u64 {
-        self.writes.load(Ordering::Relaxed)
-    }
-
-    /// Record one write mutation: per-instance counter + clone-churn counter +
-    /// entry-count gauge refresh.
-    fn record_write(&self, new_len: usize) {
-        #[cfg(test)]
-        self.writes.fetch_add(1, Ordering::Relaxed);
-        CACHE_WRITE_MUTATIONS_TOTAL
-            .with_label_values(&[CACHE_KIND])
-            .inc();
-        CACHE_ENTRIES
-            .with_label_values(&[CACHE_KIND])
-            .set(new_len as f64);
+        self.inner.write_count()
     }
 }
 

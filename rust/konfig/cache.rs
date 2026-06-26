@@ -1,60 +1,46 @@
-//! Lock-free multi-key config cache backed by [`ArcSwap`]`<HashMap>`.
+//! Lock-free multi-key config cache.
 //!
-//! Keyed by `(namespace, name)`.  Reads are fully lock-free (atomic pointer
-//! load via `arc_swap`).  The 1-2 writers serialise on a `Mutex<()>` that is
-//! never held during reads.
-//!
-//! [`ArcSwap`]: arc_swap::ArcSwap
+//! Thin domain wrapper over the generic [`CowCache`](crate::cow_cache::CowCache)
+//! primitive, keyed by `(namespace, name)`.  Reads are fully lock-free; the
+//! 1-2 writers serialise on an internal `Mutex<()>` that is never held during
+//! reads.  Config-specific bits (the seed-snapshot constructor, the
+//! `is_populated` readiness gate, and the `load` default) live here; the
+//! copy-on-write mechanics live in [`crate::cow_cache`].
 
 use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Instant;
 
-use arc_swap::ArcSwap;
-
-use crate::cache_key::{BorrowedKey, KeyRef, OwnedKey};
-use crate::metrics::{CACHE_ENTRIES, CACHE_WRITE_MUTATIONS_TOTAL};
+use crate::cache_key::OwnedKey;
+use crate::cow_cache::{CacheEntry, CowCache, INITIAL_CAPACITY, Mutation};
 use crate::types::ConfigSnapshot;
-
-// ── ConfigCache ───────────────────────────────────────────────────────────────
-
-type Inner = HashMap<OwnedKey, Arc<ConfigSnapshot>>;
 
 /// Label value for this cache's Prometheus metrics.
 const CACHE_KIND: &str = "config";
 
 /// A single staged mutation for [`ConfigCache::apply_batch`].
-///
-/// Lets the watch-restart relist apply many events under one map clone
-/// instead of one clone per event (CU-86aj7k61x).
-pub enum ConfigMutation {
-    /// Insert or replace the entry for `snap.namespace`/`snap.name`.
-    Upsert(ConfigSnapshot),
-    /// Remove the `(namespace, name)` entry if present.
-    Remove { namespace: String, name: String },
+pub type ConfigMutation = Mutation<ConfigSnapshot>;
+
+impl CacheEntry for ConfigSnapshot {
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn set_stale(&mut self, now: Instant) {
+        self.stale_since = Some(now);
+    }
 }
 
-/// Initial capacity for the inner [`HashMap`].  Typical 10–100 configs per
-/// namespace × ~10–50 namespaces ⇒ 128 is the next power of two that
-/// covers the common single-namespace pod and amortises rehashes on
-/// multi-namespace pods.  Capacity propagates across the per-write
-/// `.clone()` so this single pre-size avoids `RawTable::reserve_rehash`
-/// on early Apply events (CU-86aj37pwx).
-pub const INITIAL_CAPACITY: usize = 128;
+// ── ConfigCache ───────────────────────────────────────────────────────────────
 
 /// Shared, lock-free multi-key cache for [`ConfigSnapshot`].
 ///
 /// Keyed by `(namespace, name)`.  Reads pay only an atomic pointer load;
 /// writes clone the current map, mutate the clone, then swap the pointer.
 pub struct ConfigCache {
-    inner: ArcSwap<Inner>,
-    /// Serialises the 1-2 concurrent writers — never held during reads.
-    write_lock: Mutex<()>,
-    /// Count of write mutations (clone+swap operations). A batch counts once.
-    /// Deterministic per-instance mirror of `CACHE_WRITE_MUTATIONS_TOTAL`.
-    #[cfg(test)]
-    writes: AtomicU64,
+    inner: CowCache<ConfigSnapshot>,
 }
 
 impl ConfigCache {
@@ -65,37 +51,27 @@ impl ConfigCache {
     /// non-empty `namespace` + `name`, it is pre-inserted; otherwise it is
     /// discarded (default snapshots have no key to insert under).
     pub fn new(initial: ConfigSnapshot) -> Self {
-        let mut map = Inner::with_capacity(INITIAL_CAPACITY);
+        let mut map = HashMap::with_capacity(INITIAL_CAPACITY);
         if !initial.namespace.is_empty() && !initial.name.is_empty() {
             let key = OwnedKey::new(initial.namespace.clone(), initial.name.clone());
             map.insert(key, Arc::new(initial));
         }
-        CACHE_ENTRIES
-            .with_label_values(&[CACHE_KIND])
-            .set(map.len() as f64);
         Self {
-            inner: ArcSwap::from_pointee(map),
-            write_lock: Mutex::new(()),
-            #[cfg(test)]
-            writes: AtomicU64::new(0),
+            inner: CowCache::from_map(CACHE_KIND, map),
         }
     }
 
     /// Look up a snapshot by `(namespace, name)`.
     ///
     /// Returns `None` when no entry has been inserted for this key yet.
-    /// Zero locking — atomic pointer load only.  Lookup is allocation-free:
-    /// the `BorrowedKey` view passes `(&str, &str)` straight to the
-    /// `HashMap` via the `Borrow<dyn KeyRef>` impl on [`OwnedKey`].
+    /// Zero locking — atomic pointer load only.
     ///
     /// OTEL child span (Phase 7, CU-86ahzwj3k): `level = "debug"` + `skip_all`
-    /// so the lock-free read path pays nothing at the production INFO level
-    /// (the span is never constructed unless a debug-level subscriber is
-    /// active). Records `hit` (bool) only — no per-op heap alloc.
+    /// so the lock-free read path pays nothing at the production INFO level.
+    /// Records `hit` (bool) only — no per-op heap alloc.
     #[tracing::instrument(level = "debug", name = "konfig.cache_get", skip_all, fields(hit))]
     pub fn get(&self, namespace: &str, name: &str) -> Option<Arc<ConfigSnapshot>> {
-        let q = BorrowedKey::new(namespace, name);
-        let found = self.inner.load().get(&q as &dyn KeyRef).map(Arc::clone);
+        let found = self.inner.get(namespace, name);
         tracing::Span::current().record("hit", found.is_some());
         found
     }
@@ -106,47 +82,24 @@ impl ConfigCache {
     /// keeps the snapshot out of the span and off the INFO production path.
     #[tracing::instrument(level = "debug", name = "konfig.cache_update", skip_all)]
     pub fn update(&self, snap: ConfigSnapshot) {
-        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
-        let current = self.inner.load();
-        let mut next = (**current).clone();
-        next.insert(
-            OwnedKey::new(snap.namespace.clone(), snap.name.clone()),
-            Arc::new(snap),
-        );
-        let len = next.len();
-        self.inner.store(Arc::new(next));
-        self.record_write(len);
+        self.inner.update(snap);
     }
 
     /// Remove the entry for `(namespace, name)` if present.
     pub fn remove(&self, namespace: &str, name: &str) {
-        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
-        let current = self.inner.load();
-        let mut next = (**current).clone();
-        let q = BorrowedKey::new(namespace, name);
-        next.remove(&q as &dyn KeyRef);
-        let len = next.len();
-        self.inner.store(Arc::new(next));
-        self.record_write(len);
+        self.inner.remove(namespace, name);
     }
 
     /// Return all snapshots whose namespace matches `namespace`.
     /// Zero locking — atomic pointer load only.
     pub fn all_in_namespace(&self, namespace: &str) -> Vec<Arc<ConfigSnapshot>> {
-        let guard = self.inner.load();
-        let mut out = Vec::with_capacity(guard.len());
-        for (k, v) in guard.iter() {
-            if k.namespace == namespace {
-                out.push(Arc::clone(v));
-            }
-        }
-        out
+        self.inner.all_in_namespace(namespace)
     }
 
     /// Return `true` when the cache contains at least one entry.
     /// Zero locking — atomic pointer load only.
     pub fn is_populated(&self) -> bool {
-        !self.inner.load().is_empty()
+        self.inner.is_populated()
     }
 
     /// Mark all cached snapshots as stale (watcher lost K8s connection).
@@ -155,24 +108,13 @@ impl ConfigCache {
     /// `stale_since = Some(now)`.  Next `cache.update(snap)` for a fresh
     /// Apply event will insert a snapshot with `stale_since = None`.
     pub fn mark_all_stale(&self) {
-        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
-        let current = self.inner.load();
-        let mut next = (**current).clone();
-        let now = std::time::Instant::now();
-        for v in next.values_mut() {
-            let mut snap = (**v).clone();
-            snap.stale_since = Some(now);
-            *v = Arc::new(snap);
-        }
-        let len = next.len();
-        self.inner.store(Arc::new(next));
-        self.record_write(len);
+        self.inner.mark_all_stale();
     }
 
     /// Return any one snapshot — useful for health-gate checks.
     /// Zero locking — atomic pointer load only.
     pub fn load_any(&self) -> Option<Arc<ConfigSnapshot>> {
-        self.inner.load().values().next().cloned()
+        self.inner.load_any()
     }
 
     /// Backward-compat helper: returns any cached snapshot.
@@ -187,63 +129,18 @@ impl ConfigCache {
 
     /// Apply many mutations under a SINGLE map clone + swap.
     ///
-    /// The per-write path (`update`/`remove`) clones the whole map once each;
-    /// applying N watch events that way is N clones. `apply_batch` clones once,
-    /// applies every mutation to that clone, then swaps the pointer a single
-    /// time — O(map) work once instead of N times. Used on watch restart, where
-    /// the relist replays the full watched set as one burst.
-    ///
-    /// Empty input is a no-op: no clone, no swap, not counted. Returns the
-    /// number of mutations applied.
+    /// See [`CowCache::apply_batch`](crate::cow_cache::CowCache::apply_batch).
+    /// Empty input is a no-op. Returns the number of mutations applied.
     pub fn apply_batch(&self, mutations: impl IntoIterator<Item = ConfigMutation>) -> usize {
-        let mutations: Vec<ConfigMutation> = mutations.into_iter().collect();
-        if mutations.is_empty() {
-            return 0;
-        }
-        let n = mutations.len();
-        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
-        let current = self.inner.load();
-        let mut next = (**current).clone();
-        for m in mutations {
-            match m {
-                ConfigMutation::Upsert(snap) => {
-                    next.insert(
-                        OwnedKey::new(snap.namespace.clone(), snap.name.clone()),
-                        Arc::new(snap),
-                    );
-                }
-                ConfigMutation::Remove { namespace, name } => {
-                    let q = BorrowedKey::new(&namespace, &name);
-                    next.remove(&q as &dyn KeyRef);
-                }
-            }
-        }
-        let len = next.len();
-        self.inner.store(Arc::new(next));
-        self.record_write(len);
-        n
+        self.inner.apply_batch(mutations)
     }
 
     /// Number of write mutations (clone+swap operations) this cache has
-    /// performed. A batch counts once. Deterministic per-instance counter used
-    /// by the watcher relist tests and the burst benchmark.
-    #[cfg(test)]
+    /// performed. A batch counts once. Used by the watcher relist tests and
+    /// the burst benchmark.
     #[cfg(test)]
     pub(crate) fn write_count(&self) -> u64 {
-        self.writes.load(Ordering::Relaxed)
-    }
-
-    /// Record one write mutation: bump the per-instance counter, the
-    /// process-wide clone-churn counter, and refresh the entry-count gauge.
-    fn record_write(&self, new_len: usize) {
-        #[cfg(test)]
-        self.writes.fetch_add(1, Ordering::Relaxed);
-        CACHE_WRITE_MUTATIONS_TOTAL
-            .with_label_values(&[CACHE_KIND])
-            .inc();
-        CACHE_ENTRIES
-            .with_label_values(&[CACHE_KIND])
-            .set(new_len as f64);
+        self.inner.write_count()
     }
 }
 
