@@ -155,17 +155,17 @@ observed before they bite:
 
 Created under milestone CU-86aj4chpd (see ADR-0002 for the decision link):
 
-1. **TenantQuota CRD + lock-free watcher** — mirror `acl.rs` (`ArcSwap`,
-   `Synced` gate); identity-keyed quota table + `mode` flag.
-2. **Subscriber quota enforcement** — per-identity stream gauge + RAII guard on
-   Subscribe / SubscribeSecrets; `RESOURCE_EXHAUSTED` over budget.
-3. **Apply rate-limit (per-tenant token bucket)** — replace/augment the Phase 4
-   per-IP limiter on authenticated paths.
-4. **Per-tenant cache budget + eviction** — per-identity byte accounting +
-   serve-time eviction + `konfig_tenant_cache_*` metrics.
-5. **Per-tenant NetworkPolicy overlay** — `infra/konfig/overlays/tenants/`
+1. **TenantQuota CRD + lock-free watcher** (CU-86aj8pvcu) — mirror `acl.rs`
+   (`ArcSwap`, `Synced` gate); identity-keyed quota table + `mode` flag.
+2. **Subscriber quota enforcement** (CU-86aj8pvdb) — per-identity stream gauge +
+   RAII guard on Subscribe / SubscribeSecrets; `RESOURCE_EXHAUSTED` over budget.
+3. **Apply rate-limit (per-tenant token bucket)** (CU-86aj8pvf1) — replace/augment
+   the Phase 4 per-IP limiter on authenticated paths.
+4. **Per-tenant cache budget + eviction** (CU-86aj8pvg3) — per-identity byte
+   accounting + serve-time eviction + `konfig_tenant_cache_*` metrics.
+5. **Per-tenant NetworkPolicy overlay** (CU-86aj8pvgx) — `infra/konfig/overlays/tenants/`
    generator + docs.
-6. **Tenant metrics + dashboard** — `konfig_tenant_subscribers`,
+6. **Tenant metrics + dashboard** (CU-86aj8pvj7) — `konfig_tenant_subscribers`,
    `_applies_total`, `_cache_bytes`, `_evictions_total`, `_quota_denied_total`.
 
 KMS envelope encryption for managed Secrets (CU-86ahrwd6m) is tracked
