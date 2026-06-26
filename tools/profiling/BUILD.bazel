@@ -14,3 +14,12 @@ sh_binary(
     srcs = ["heap_delta.sh"],
     visibility = ["//visibility:public"],
 )
+
+# import-images — push freshly built bench images from the dockerd store into
+# Docker Desktop's k8s.io containerd namespace so pods (IfNotPresent :latest)
+# don't silently run a stale image. CU-86aj7kawk. Needs docker on PATH.
+sh_binary(
+    name = "import_images",
+    srcs = ["import-images.sh"],
+    visibility = ["//visibility:public"],
+)
