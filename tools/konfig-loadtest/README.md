@@ -256,6 +256,40 @@ usually lands on a `cx16`-capable host. If it recurs deterministically, the
 runner pool genuinely lacks `cx16` — escalate the runner image, do not patch the
 allocator. Refs CU-86aj4guza, CU-86aj3872a.
 
+## Docker Desktop: import images into the k8s.io containerd ns (CU-86aj7kawk)
+
+When the local bench runs on **Docker Desktop Kubernetes** (`--context
+docker-desktop`), pods are served from containerd's `k8s.io` namespace, which is
+**separate** from the dockerd image store that `docker build` / the Bazel
+`:load_<arch>` targets populate. A freshly built `:latest` stays invisible to
+k8s, so a pod with `imagePullPolicy: IfNotPresent` silently keeps running the
+**old** image and quietly invalidates the bench. (kind has the same split but
+solves it with `kind load docker-image`, used by the CI gates above — this is
+the Docker Desktop equivalent.)
+
+Import the current bench images into the Docker Desktop VM's k8s.io containerd
+namespace with one command:
+
+```sh
+# build+load (arm64) and import the default bench set:
+bazel run //tools/profiling:import_images -- --build
+# or import already-built images only:
+bazel run //tools/profiling:import_images
+# preview the docker/ctr commands without running them:
+bazel run //tools/profiling:import_images -- --dry-run
+```
+
+Defaults to `kasa288/konfig{,-loadtest,-heapprof}:latest`; pass image refs to
+override, `--arch amd64` for Intel, `NSENTER_IMAGE=...` to swap the nsenter
+helper. It `docker save`s each image and pipes it through `nsenter` (PID 1 of the
+Docker Desktop LinuxKit VM) into `ctr -n k8s.io images import -`, then verifies
+with `ctr -n k8s.io images ls`. After importing, roll the pods to pick up the
+fresh image:
+
+```sh
+kubectl -n konfig-system rollout restart deploy/konfig
+```
+
 ## Heap profiling: startup vs steady-state (CU-86aj7kavv)
 
 The `konfig-heapprof` image variant compiles snmalloc-rs with the `profiling`

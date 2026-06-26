@@ -185,3 +185,23 @@ regression gate.
 ```sh
 python3 tools/profiling/flamebearer_to_pprof.py --self-test
 ```
+
+# import-images.sh — Docker Desktop k8s.io image import (CU-86aj7kawk)
+
+Pushes freshly built bench images from the dockerd store into Docker Desktop's
+`k8s.io` containerd namespace, so pods (`imagePullPolicy: IfNotPresent`, `:latest`)
+don't silently run a stale image. dockerd and the k8s containerd are separate
+stores on Docker Desktop; `bazel run //docker/...:load_<arch>` only populates the
+former. `docker save | nsenter (VM PID 1) | ctr -n k8s.io images import -`.
+
+```sh
+bazel run //tools/profiling:import_images -- --build      # build+load+import default set
+bazel run //tools/profiling:import_images                 # import already-built images
+bazel run //tools/profiling:import_images -- --dry-run    # print commands only
+bazel run //tools/profiling:import_images -- --help
+```
+
+Defaults: `kasa288/konfig{,-loadtest,-heapprof}:latest`. Flags: `--arch
+arm64|amd64` (default arm64), positional image refs to override the set; env
+`NSENTER_IMAGE` to swap the nsenter helper (default `justincormack/nsenter1`).
+See the konfig-loadtest bench runbook for the full local-bench flow.
