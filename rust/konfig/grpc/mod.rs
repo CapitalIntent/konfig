@@ -280,6 +280,17 @@ impl KonfigServer {
 
 // ── Shared helper ─────────────────────────────────────────────────────────────
 
+/// HTTP status code of a kube API error, or `None` when `err` is not an
+/// `Error::Api`.  Lets the retry / list error classifiers be a flat
+/// `match code { .. }` instead of repeated `Error::Api(ae) if ae.code == N`
+/// guard arms — drops their cyclomatic complexity (CU-86aj7k7fd).
+pub(crate) fn api_status_code(err: &kube::Error) -> Option<u16> {
+    match err {
+        kube::Error::Api(ae) => Some(ae.code),
+        _ => None,
+    }
+}
+
 /// Apply ±25% jitter to a base retry delay (ms) to break lockstep retries
 /// across N clients racing on the same Config / Secret resourceVersion.
 ///

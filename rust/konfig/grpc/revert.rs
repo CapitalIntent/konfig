@@ -133,8 +133,8 @@ pub(crate) fn parse_historical_obj(obj: &DynamicObject) -> Result<ConfigSpec, St
 /// Pure classifier for a kube `list()` failure on the historical-RV fetch.
 /// Emits the operator-facing `warn!` for 410 (etcd compaction) inline.
 pub(crate) fn map_list_error(err: &kube::Error, name: &str, resource_version: &str) -> Status {
-    match err {
-        kube::Error::Api(ae) if ae.code == 410 => {
+    match super::api_status_code(err) {
+        Some(410) => {
             warn!(
                 resource_version,
                 "Revert: requested RV has been compacted by etcd",
@@ -144,7 +144,7 @@ pub(crate) fn map_list_error(err: &kube::Error, name: &str, resource_version: &s
                  K8s only retains history within the compaction window"
             ))
         }
-        kube::Error::Api(ae) if ae.code == 404 => Status::not_found(format!(
+        Some(404) => Status::not_found(format!(
             "Config {name} not found at resource_version={resource_version}"
         )),
         _ => Status::unavailable(format!("kube list error: {err}")),

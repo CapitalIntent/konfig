@@ -202,14 +202,15 @@ pub(crate) fn classify_secret_patch_error(
     err: &kube::Error,
     attempt: usize,
 ) -> SecretPatchRetryDecision {
-    match err {
-        kube::Error::Api(ae) if ae.code == 409 && attempt < RETRY_DELAYS_MS.len() => {
-            SecretPatchRetryDecision::RetryAfter {
-                delay_ms: RETRY_DELAYS_MS[attempt],
-            }
+    if super::api_status_code(err) != Some(409) {
+        return SecretPatchRetryDecision::Unavailable;
+    }
+    if attempt < RETRY_DELAYS_MS.len() {
+        SecretPatchRetryDecision::RetryAfter {
+            delay_ms: RETRY_DELAYS_MS[attempt],
         }
-        kube::Error::Api(ae) if ae.code == 409 => SecretPatchRetryDecision::AbortRetriesExhausted,
-        _ => SecretPatchRetryDecision::Unavailable,
+    } else {
+        SecretPatchRetryDecision::AbortRetriesExhausted
     }
 }
 
