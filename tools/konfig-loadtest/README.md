@@ -256,6 +256,77 @@ usually lands on a `cx16`-capable host. If it recurs deterministically, the
 runner pool genuinely lacks `cx16` — escalate the runner image, do not patch the
 allocator. Refs CU-86aj4guza, CU-86aj3872a.
 
+## Heap profiling: startup vs steady-state (CU-86aj7kavv)
+
+The `konfig-heapprof` image variant compiles snmalloc-rs with the `profiling`
+feature and serves a gzipped pprof heap snapshot at
+`GET :9090/debug/heap-profile.pprof` (the default `konfig` image returns 404 —
+rebuild `//rust/konfig:konfig_bin_heapprof`). A *single* snapshot mixes one-time
+startup / TLS / first-touch-arena allocations (`konfig::startup::run`, rustls
+`handle_new_ticket_impl`) with real per-request growth, so absolute `-top`
+attribution cannot isolate steady-state behavior.
+
+The heap eval captures **three phases** and reports a **delta** so startup is
+excluded:
+
+| Phase | Snapshot | When |
+| --- | --- | --- |
+| startup | `startup.pb.gz` | pre-traffic, right after pod-ready (reference) |
+| warmup | `warmup.pb.gz` | after a warmup soak under load (one-time init settled) |
+| steady-state | `t<N>s.pb.gz`, `final.pb.gz` | repeated, during sustained load |
+
+**Steady-state delta** = `final − warmup`, per call site. This is the "done
+when" artifact: per-request growth with startup/warmup excluded.
+
+### CI (recommended)
+
+Dispatch the manual workflow — it builds the images, brings up kind, runs the
+loadtest, captures all three phases, computes the delta, and uploads the
+`heap-profiles` artifact (the `.pb.gz` snapshots **plus** `steady-state-delta.txt`):
+
+```sh
+gh workflow run heap-profile-eval.yml                       # default 90s warmup
+gh workflow run heap-profile-eval.yml -f warmup_seconds=120 # longer warmup soak
+```
+
+Download + read the precomputed delta:
+
+```sh
+gh run download <run-id> -n heap-profiles -D /tmp/heap
+cat /tmp/heap/steady-state-delta.txt
+```
+
+### Local
+
+Run a `konfig-heapprof` pod under load (mirror steps 0–2 above but swap the
+container image to `kasa288/konfig-heapprof:latest` and scale to **1 replica**
+for per-pod accuracy — see `feedback_loadtest_replicas.md`). Then, against a
+port-forward of `:9090`, drive the loadtest (sections 3a/3b/4) in another shell
+and snapshot the three phases:
+
+```sh
+kubectl -n konfig-system port-forward deploy/konfig 9090:9090 &
+
+# 1. pre-traffic reference (optional)
+curl -fsS -o startup.pb.gz http://localhost:9090/debug/heap-profile.pprof
+
+# 2. start the loadtest, soak ~90s so one-time init settles, then warmup baseline
+sleep 90
+curl -fsS -o warmup.pb.gz http://localhost:9090/debug/heap-profile.pprof
+
+# 3. keep load running; final steady-state snapshot
+curl -fsS -o final.pb.gz http://localhost:9090/debug/heap-profile.pprof
+
+# 4. steady-state delta (startup excluded)
+bash tools/profiling/heap_delta.sh --base warmup.pb.gz --profile final.pb.gz
+```
+
+`heap_delta.sh` wraps `go tool pprof -top -diff_base` (needs `go`, or a
+standalone `pprof`, on PATH). snmalloc emits *pre-symbolized* pprof, so no
+konfig binary is needed. Positive rows grew after warmup (the steady-state
+signal); negative rows were transient warmup allocations since freed. For an
+interactive view: `go tool pprof -http=:8080 -diff_base=warmup.pb.gz final.pb.gz`.
+
 ## Teardown / cleanup
 
 Profiling-session cleanup (keeps pyroscope datastore by default):
