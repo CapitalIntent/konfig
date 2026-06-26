@@ -246,30 +246,27 @@ fn route_secret_event(
     relist: &mut Option<Vec<SecretMutation>>,
     batch_relist: bool,
 ) {
-    if let Some(buf) = relist.as_mut() {
-        match event {
-            Event::InitApply(secret) => {
-                if let Some(snap) = parse_secret(&secret, namespace) {
-                    let secret_event = SecretEvent {
-                        event_type: EventType::Modified as i32,
-                        secret: Some(secret_snapshot_to_proto(&snap)),
-                    };
-                    buf.push(SecretMutation::Upsert(snap));
-                    // Ignore Err — means zero receivers at the moment.
-                    let _ = broadcast_tx.send(secret_event);
-                }
+    crate::watcher::route_relist_event(
+        event,
+        relist,
+        batch_relist,
+        "Secret",
+        |secret, buf| {
+            if let Some(snap) = parse_secret(&secret, namespace) {
+                let secret_event = SecretEvent {
+                    event_type: EventType::Modified as i32,
+                    secret: Some(secret_snapshot_to_proto(&snap)),
+                };
+                buf.push(SecretMutation::Upsert(snap));
+                // Ignore Err — means zero receivers at the moment. The relist
+                // still broadcasts each secret individually so subscribers see
+                // per-secret Modified events; only the cache write is coalesced.
+                let _ = broadcast_tx.send(secret_event);
             }
-            Event::InitDone => {
-                let n = cache.apply_batch(relist.take().expect("relist buffer set"));
-                debug!(events = n, "Secret watch relist committed as one batch");
-            }
-            other => handle_secret_event(other, cache, namespace, broadcast_tx),
-        }
-    } else if batch_relist && matches!(event, Event::Init) {
-        *relist = Some(Vec::new());
-    } else {
-        handle_secret_event(event, cache, namespace, broadcast_tx);
-    }
+        },
+        |muts| cache.apply_batch(muts),
+        |other| handle_secret_event(other, cache, namespace, broadcast_tx),
+    );
 }
 
 fn parse_secret(secret: &Secret, namespace: &str) -> Option<SecretSnapshot> {
@@ -375,14 +372,7 @@ mod tests {
         make_secret_obj(name, data, schema_version)
     }
 
-    fn watcher_err() -> kube_watcher::Error {
-        kube_watcher::Error::WatchFailed(kube::Error::Api(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "synthetic".to_string(),
-            reason: "synthetic".to_string(),
-            code: 500,
-        }))
-    }
+    use crate::watcher::synthetic_watcher_error as watcher_err;
 
     #[tokio::test]
     async fn pump_apply_event_updates_cache_and_broadcasts_modified() {

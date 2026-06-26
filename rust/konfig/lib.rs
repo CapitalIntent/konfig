@@ -18,6 +18,7 @@ pub mod acl;
 pub mod cache;
 pub mod cache_key;
 pub mod configmap_watcher;
+pub mod cow_cache;
 pub mod grpc;
 pub mod import;
 pub mod metrics;
