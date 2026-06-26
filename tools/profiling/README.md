@@ -226,6 +226,23 @@ gh run download --name release-profiles-v1.2.3        # by tag
 go tool pprof -http=:0 cpu.pprof                       # inspect locally
 ```
 
+# Local flamegraph (CU-86ahtj0m5)
+
+`bazel run //rust/konfig:flamegraph -- --duration 60` produces `flamegraph.svg`
+from the `konfig` binary (`profiling` feature) via cargo-flamegraph — zero
+cluster pyroscope. The wrapper (`rust/konfig/flamegraph.sh`) parses `--duration`
+/ `-o`, forwards args after `--` to konfig, and arms a SIGINT timer so the
+long-running server flushes the SVG after the window.
+
+Runtime prereqs (cargo-flamegraph's sampler):
+
+- **Linux**: `perf` (linux-tools) + a low enough `perf_event_paranoid`.
+- **macOS**: `dtrace`, which requires root — re-run under
+  `sudo -E env "PATH=$PATH" bazel run //rust/konfig:flamegraph -- --duration 60`.
+
+For cluster-representative captures, prefer the Linux CI profiling pipeline
+(CU-86aj4z43b, `.github/workflows/profiling.yml`).
+
 # Linux coalesce/shards flip gate (CU-86aj4z43b)
 
 Authoritative, reproducible **Linux** profiling path that decides whether the
