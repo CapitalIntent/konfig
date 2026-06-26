@@ -1,5 +1,6 @@
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy", "rust_doc", "rust_doc_test", "rust_library", "rust_test", "rustfmt_test")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
 # Run build.rs to generate protobuf/tonic bindings into OUT_DIR.
 # The proto file is available in the sandbox at
@@ -357,4 +358,20 @@ rust_clippy(
     testonly = True,
     tags = ["konfig", "rust", "unit"],
     deps = [":konfig"],
+)
+
+# CU-86ahtj0m5 — local SVG flamegraph dev convenience (zero K8s). Wraps
+# cargo-flamegraph against the `konfig` bin + `profiling` feature and emits
+# flamegraph.svg. Needs perf (Linux) / sudo dtrace (macOS) at runtime.
+# `bazel run //rust/konfig:flamegraph -- --duration 60`. `manual` keeps it out
+# of `:all` / `//...` wildcards (dev tool, not a build/test artifact).
+sh_binary(
+    name = "flamegraph",
+    srcs = ["flamegraph.sh"],
+    tags = [
+        "konfig",
+        "manual",
+        "profiling",
+    ],
+    visibility = ["//visibility:public"],
 )
