@@ -1,0 +1,181 @@
+name: Profile Release Artifacts (CU-86ahtj1v9)
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      capture_window:
+        description: "Pyroscope render window (e.g. 10m) for the release profile"
+        required: false
+        default: "10m"
+
+# INFRA-4: capture one canonical CPU profile artifact per tagged release so a
+# quarterly comparison needs no loadtest re-run. Stands up kind + the
+# konfig-profiling image (in-process pyroscope agent) + an in-cluster pyroscope
+# server (infra/profiling/), drives the `saturate` loadtest profile (CU-LOAD-1),
+# then pulls the CPU profile via pyroscope's flamebearer render API, converts it
+# to pprof (CU-86aj7kawc converter), reduces a samples.csv, and uploads the
+# bundle as a GitHub Actions artifact (NOT AWS, per memory rule).
+#
+# Deviations from the original sketch (documented, intentional):
+#   * alloy (eBPF DaemonSet) is NOT deployed — the konfig-profiling in-process
+#     pyroscope agent already ships CPU samples; eBPF in kind is privileged +
+#     flaky and adds nothing for this app-level profile.
+#   * "samples.csv from sidecar" -> derived from the pprof via `go tool pprof`
+#     (no such sidecar exists; same data, no extra moving part).
+#   * heap-per-release stays with heap-profile-eval.yml (heap needs the
+#     konfig-heapprof image; this CPU artifact uses konfig-profiling).
+#
+# Tracker: CU-86ahtj1v9 (Phase 7P). Blocked-by CU-PROF-1 / CU-LOAD-1 / CU-INFRA-1 (done).
+jobs:
+  release-profile:
+    name: capture release CPU profile (kind + pyroscope)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+      WINDOW: ${{ inputs.capture_window || '10m' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazelbuild/setup-bazelisk@v3
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler
+
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
+
+      - name: CPU capability probe (cx16 — snmalloc SIGILL guard)
+        run: |
+          if grep -qm1 cx16 /proc/cpuinfo; then echo "host: cx16 PRESENT"; else echo "host: cx16 MISSING"; fi
+
+      - name: Build konfig-profiling + konfig-loadtest OCI images (linux/amd64)
+        run: |
+          bazel run --config=x86-baseline //docker/konfig-profiling:load_amd64
+          bazel run --config=x86-baseline //docker/konfig-loadtest:load_amd64
+
+      - name: Create kind cluster (1 node)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: konfig-release-profile
+          wait: 120s
+
+      - name: Load images into kind (poll containerd image store)
+        run: |
+          kind load docker-image kasa288/konfig-profiling:latest --name konfig-release-profile
+          kind load docker-image kasa288/konfig-loadtest:latest --name konfig-release-profile
+          for img in kasa288/konfig-profiling:latest kasa288/konfig-loadtest:latest; do
+            repo="${img%:*}"; tag="${img##*:}"; ok=0
+            for i in $(seq 1 60); do
+              if docker exec konfig-release-profile-control-plane crictl images 2>/dev/null \
+                   | awk -v r="docker.io/$repo" -v t="$tag" '$1==r && $2==t {f=1} END{exit !f}'; then
+                echo "  -> $img visible after ${i}s"; ok=1; break
+              fi
+              sleep 1
+            done
+            [ "$ok" -eq 1 ] || { echo "::error::timeout for $img"; exit 1; }
+          done
+
+      - name: Apply CRDs + RBAC + Service + ConfigMap + seed Config
+        run: |
+          kubectl apply -f infra/konfig/crd.yaml
+          kubectl wait --for=condition=Established crd/configs.konfig.io --timeout=60s
+          kubectl apply -f infra/konfig/namespace.yaml
+          kubectl apply -f infra/konfig/serviceaccount.yaml
+          kubectl apply -f infra/konfig/clusterrole.yaml
+          kubectl apply -f infra/konfig/clusterrole-configmap.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding-configmap.yaml
+          kubectl apply -f infra/konfig/role-secret.yaml
+          kubectl apply -f infra/konfig/service.yaml
+          kubectl create configmap konfig-config \
+            --namespace=konfig-system \
+            --from-literal=namespace=konfig-system \
+            --from-literal=name=konfig-loadtest \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f infra/konfig-loadtest/seed-config.yaml
+
+      - name: Deploy pyroscope (infra/profiling)
+        run: |
+          kubectl apply -f infra/profiling/namespace.yaml
+          kubectl apply -f infra/profiling/pyroscope-configmap.yaml
+          kubectl apply -f infra/profiling/pyroscope-deployment.yaml
+          kubectl apply -f infra/profiling/pyroscope-service.yaml
+          kubectl rollout status -n profiling deploy/pyroscope --timeout=180s
+
+      - name: Deploy konfig-profiling (pyroscope agent on, 1 replica, --tls=false)
+        run: |
+          yq '
+            .spec.replicas = 1
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).image = "kasa288/konfig-profiling:latest"
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).imagePullPolicy = "IfNotPresent"
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).args |=
+                ([.[] | select(test("^--tls") | not)] + ["--tls=false"])
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).env +=
+                [{"name":"PYROSCOPE_SERVER_ADDRESS","value":"http://pyroscope.profiling.svc.cluster.local:4040"},
+                 {"name":"PYROSCOPE_APPLICATION_NAME","value":"konfig"}]
+            | del(.spec.template.spec.containers[] | select(.name == "konfig").volumeMounts[] | select(.name == "konfig-tls"))
+            | del(.spec.template.spec.volumes[] | select(.name == "konfig-tls"))
+          ' infra/konfig/deployment.yaml | kubectl apply -f -
+          kubectl rollout status -n konfig-system deploy/konfig --timeout=180s
+          kubectl wait --for=condition=Ready -n konfig-system pod -l app=konfig --timeout=180s
+
+      - name: Run saturate loadtest (CU-LOAD-1) and wait
+        run: |
+          sed 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/' \
+            infra/konfig-loadtest/job-saturate.yaml | kubectl apply -f -
+          for _ in $(seq 1 60); do
+            ph=$(kubectl get pods -n konfig-system -l job-name=konfig-loadtest-saturate \
+                   -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+            [ "$ph" = "Running" ] || [ "$ph" = "Succeeded" ] || [ "$ph" = "Failed" ] && break
+            sleep 2
+          done
+          kubectl logs -n konfig-system -f job/konfig-loadtest-saturate --all-containers=true || true
+          # Let pyroscope ingest the tail of the run before we render.
+          sleep 20
+
+      - name: Capture release CPU profile (pyroscope render -> pprof + samples.csv)
+        run: bash tools/profiling/ci_release_capture.sh "$PWD/release-profiles" "$WINDOW" konfig
+
+      - name: Annotate release profile bundle
+        if: always()
+        run: |
+          mkdir -p release-profiles
+          {
+            echo "ref:    ${{ github.ref_name }}"
+            echo "sha:    ${{ github.sha }}"
+            echo "window: ${WINDOW}"
+            echo "date:   $(date -u +%FT%TZ)"
+          } > release-profiles/RELEASE.txt
+          kubectl logs -n konfig-system -l app=konfig --tail=-1 > release-profiles/konfig.log 2>&1 || true
+
+      - name: Upload release profile artifact (GitHub artifact store — NOT AWS)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-profiles-${{ github.ref_name }}
+          path: release-profiles/
+          retention-days: 90
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A || true
+          kubectl logs -n konfig-system -l app=konfig --tail=200 || true
+          kubectl logs -n profiling -l app=pyroscope --tail=100 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
