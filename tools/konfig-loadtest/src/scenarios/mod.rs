@@ -4,10 +4,12 @@ mod backpressure;
 mod get;
 mod reconnect;
 mod secrets;
+mod soak;
 mod subscribe;
 
 pub(crate) use backpressure::scenario_backpressure;
 pub(crate) use get::scenario_get_flood;
 pub(crate) use reconnect::scenario_reconnect_storm;
 pub(crate) use secrets::scenario_secrets_flood;
+pub(crate) use soak::scenario_soak;
 pub(crate) use subscribe::scenario_subscribe_flood;

@@ -1,0 +1,336 @@
+name: Streamprof Eval — snmalloc streaming capture + soak (CU-86aj35zxw)
+on:
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: "Soak duration in seconds (--scenario soak --duration N)"
+        required: false
+        default: "600"
+      warmup_seconds:
+        description: "Seconds to soak under load before the warmup heap snapshot"
+        required: false
+        default: "90"
+
+# Manual-trigger workflow that drives the in-cluster konfig-loadtest Job in
+# the steady-state `soak` scenario (long-lived config+secret subscribers +
+# periodic Apply/ApplySecret + reconnect churn) against a `konfig-heapprof`
+# Deployment. The heapprof binary has BOTH observers wired in:
+#
+#   1. snmalloc streaming sink (CU-86aj35zxw) — activated by setting
+#      KONFIG_SNMALLOC_STREAM_PATH; `konfig::stream_sink` writes one JSONL
+#      event per sampled alloc/resize to a file on a writable emptyDir. After
+#      the soak we `kubectl exec` a busybox sidecar (the konfig container is
+#      distroless + readOnlyRootFilesystem) to copy the JSONL out, then run
+#      the fork's `snmalloc-tools rate-report --top 20` (best-effort) to
+#      surface the highest-rate call sites = transient per-callsite churn.
+#
+#   2. heap snapshots (CU-86aj7kavv) — `/debug/heap-profile.pprof` scraped in
+#      three phases (startup / warmup / steady-state) and reduced to a
+#      steady-state delta via `tools/profiling/heap_delta.sh` = whole-process
+#      growth/drift with startup excluded.
+#
+# The JSONL (+ rate-report), all pprof snapshots, the heap delta, and pod logs
+# are uploaded as the `streamprof` artifact.
+#
+# Scope: NOT a gate. Manual dispatch only. Wall-clock is dominated by the soak
+# (soak_seconds, default 600). The live findings doc + per-callsite ClickUp
+# sub-tickets (acceptance) are filed by a human from the uploaded artifacts.
+#
+# Tracker: CU-86aj35zxw.
+
+jobs:
+  eval:
+    name: Streaming capture + soak under loadtest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+      SOAK_SECONDS: ${{ inputs.soak_seconds || '600' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler
+
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
+
+      - name: Build konfig-heapprof + konfig-loadtest OCI images (linux/amd64)
+        run: |
+          bazel run //docker/konfig-heapprof:load_amd64
+          bazel run //docker/konfig-loadtest:load_amd64
+
+      - name: Create kind cluster (1 node)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: konfig-streamprof
+          wait: 120s
+
+      - name: Load images into kind
+        run: |
+          kind load docker-image kasa288/konfig-heapprof:latest --name konfig-streamprof
+          kind load docker-image kasa288/konfig-loadtest:latest --name konfig-streamprof
+
+      - name: Apply CRDs (Config) and wait for establishment
+        run: |
+          kubectl apply -f infra/konfig/crd.yaml
+          kubectl wait --for=condition=Established crd/configs.konfig.io --timeout=60s
+
+      - name: Apply namespace, RBAC, ServiceAccount, Service
+        run: |
+          kubectl apply -f infra/konfig/namespace.yaml
+          kubectl apply -f infra/konfig/serviceaccount.yaml
+          kubectl apply -f infra/konfig/clusterrole.yaml
+          kubectl apply -f infra/konfig/clusterrole-configmap.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding-configmap.yaml
+          kubectl apply -f infra/konfig/role-secret.yaml
+          kubectl apply -f infra/konfig/service.yaml
+
+      - name: Apply konfig ConfigMap (loadtest config name)
+        run: |
+          kubectl create configmap konfig-config \
+            --namespace=konfig-system \
+            --from-literal=namespace=konfig-system \
+            --from-literal=name=konfig-loadtest \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Pre-seed Config CR
+        run: |
+          kubectl apply -f infra/konfig-loadtest/seed-config.yaml
+
+      - name: Apply konfig Deployment override (heapprof + stream sink + busybox sidecar)
+        # On top of the heap-eval override (heapprof image, 1 replica,
+        # --tls=false, drop konfig-tls), this adds the streaming sink wiring:
+        #   * env KONFIG_SNMALLOC_STREAM_PATH → activates konfig::stream_sink.
+        #   * emptyDir `stream-out` mounted RW at /var/log/konfig-stream on the
+        #     konfig container — required because the container has
+        #     readOnlyRootFilesystem: true; emptyDir mounts stay writable.
+        #   * busybox `streamout` sidecar mounting the same volume RO at
+        #     /stream so we can `kubectl exec -c streamout -- cat` the JSONL out
+        #     (the konfig image is distroless: no shell/cat/tar for kubectl cp).
+        run: |
+          yq '
+            .spec.replicas = 1
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).image = "kasa288/konfig-heapprof:latest"
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).imagePullPolicy = "IfNotPresent"
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).args |=
+                ([.[] | select(test("^--tls") | not)] + ["--tls=false"])
+            | del(.spec.template.spec.containers[] | select(.name == "konfig").volumeMounts[] | select(.name == "konfig-tls"))
+            | del(.spec.template.spec.volumes[] | select(.name == "konfig-tls"))
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).volumeMounts +=
+                [{"name": "stream-out", "mountPath": "/var/log/konfig-stream"}]
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).env +=
+                [{"name": "KONFIG_SNMALLOC_STREAM_PATH", "value": "/var/log/konfig-stream/stream.jsonl"}]
+            | .spec.template.spec.volumes += [{"name": "stream-out", "emptyDir": {}}]
+            | .spec.template.spec.containers +=
+                [{
+                  "name": "streamout",
+                  "image": "busybox:1.36",
+                  "imagePullPolicy": "IfNotPresent",
+                  "command": ["sh", "-c", "sleep 100000"],
+                  "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "readOnlyRootFilesystem": true,
+                    "capabilities": {"drop": ["ALL"]}
+                  },
+                  "volumeMounts": [{"name": "stream-out", "mountPath": "/stream", "readOnly": true}]
+                }]
+          ' infra/konfig/deployment.yaml \
+          | kubectl apply -f -
+
+      - name: Wait for konfig-heapprof Pod Ready
+        run: |
+          kubectl rollout status -n konfig-system deploy/konfig --timeout=180s
+          kubectl wait --for=condition=Ready -n konfig-system pod -l app=konfig --timeout=180s
+
+      - name: Verify heap-profile endpoint shape (startup snapshot)
+        run: |
+          mkdir -p /tmp/streamprof
+          kubectl -n konfig-system port-forward svc/konfig 9090:9090 >/tmp/streamprof/portfwd.log 2>&1 &
+          PF_PID=$!
+          echo "$PF_PID" > /tmp/streamprof/portfwd.pid
+          for i in $(seq 1 20); do
+            if curl -fsS -o /dev/null --max-time 2 http://localhost:9090/metrics; then
+              echo "port-forward live after ${i}x500ms"
+              break
+            fi
+            sleep 0.5
+          done
+          curl -fsS -o /tmp/streamprof/startup.pb.gz http://localhost:9090/debug/heap-profile.pprof
+          BYTES=$(stat -c '%s' /tmp/streamprof/startup.pb.gz)
+          echo "startup body bytes: $BYTES"
+          gunzip -t /tmp/streamprof/startup.pb.gz
+
+      - name: Apply konfig-loadtest Job (--scenario soak)
+        # Override the burst args with the steady-state soak for SOAK_SECONDS.
+        # backoffLimit is 0 + restartPolicy Never so the Job runs exactly once.
+        run: |
+          sed 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/' \
+            infra/konfig-loadtest/job.yaml \
+          | yq '
+              (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).args +=
+                ["--scenario", "soak", "--duration", strenv(SOAK_SECONDS)]
+            ' \
+          | kubectl apply -f -
+
+      - name: Warmup soak + capture warmup baseline
+        env:
+          HEAP_WARMUP_SECONDS: ${{ inputs.warmup_seconds || '90' }}
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 60); do
+            PHASE=$(kubectl get pods -n konfig-system -l job-name=konfig-loadtest \
+                      -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+            if [ "$PHASE" = "Running" ] || [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "Failed" ]; then
+              echo "loadtest pod phase=$PHASE after ${i}x2s"
+              break
+            fi
+            sleep 2
+          done
+          echo "warming up for ${HEAP_WARMUP_SECONDS}s under load before warmup snapshot"
+          sleep "${HEAP_WARMUP_SECONDS}"
+          curl -fsS -o /tmp/streamprof/warmup.pb.gz http://localhost:9090/debug/heap-profile.pprof \
+            && echo "captured warmup ($(stat -c '%s' /tmp/streamprof/warmup.pb.gz) bytes)" \
+            || echo "::warning::warmup pprof scrape failed"
+
+      - name: Capture steady-state pprofs (every 30s) until the soak Job ends
+        run: |
+          set -uo pipefail
+          start=$SECONDS
+          # Ceiling = soak + 3 min slack, in 30s ticks (cap at 40 ticks = 20 min).
+          ticks=$(( (SOAK_SECONDS + 180) / 30 ))
+          if [ "$ticks" -gt 40 ]; then ticks=40; fi
+          for _ in $(seq 1 "$ticks"); do
+            sleep 30
+            t=$((SECONDS - start))
+            JOB_STATE=$(kubectl get job/konfig-loadtest -n konfig-system \
+                          -o jsonpath='{.status.succeeded}{.status.failed}' 2>/dev/null || true)
+            curl -fsS -o "/tmp/streamprof/t${t}s.pb.gz" http://localhost:9090/debug/heap-profile.pprof \
+              && echo "captured t=${t}s ($(stat -c '%s' /tmp/streamprof/t${t}s.pb.gz) bytes)" \
+              || echo "::warning::pprof scrape failed at t=${t}s"
+            if [ -n "$JOB_STATE" ] && [ "$JOB_STATE" != "0" ]; then
+              echo "soak Job terminated (status=$JOB_STATE) — stopping snapshot loop"
+              break
+            fi
+          done
+          curl -fsS -o /tmp/streamprof/final.pb.gz http://localhost:9090/debug/heap-profile.pprof \
+            && echo "captured final ($(stat -c '%s' /tmp/streamprof/final.pb.gz) bytes)" \
+            || echo "::warning::final pprof scrape failed"
+
+      - name: Copy streaming JSONL out of the konfig pod (busybox sidecar)
+        run: |
+          set -uo pipefail
+          POD=$(kubectl get pod -n konfig-system -l app=konfig -o jsonpath='{.items[0].metadata.name}')
+          echo "konfig pod: $POD"
+          # The sidecar shares the stream-out emptyDir; cat the JSONL over exec.
+          if kubectl exec -n konfig-system "$POD" -c streamout -- \
+               cat /stream/stream.jsonl > /tmp/streamprof/stream.jsonl 2>/tmp/streamprof/stream-cat.err; then
+            BYTES=$(stat -c '%s' /tmp/streamprof/stream.jsonl)
+            LINES=$(wc -l < /tmp/streamprof/stream.jsonl)
+            echo "stream.jsonl: $BYTES bytes, $LINES events"
+            if [ "$BYTES" -lt 1048576 ]; then
+              echo "::warning::stream.jsonl < 1 MiB ($BYTES bytes) — acceptance wants >=10 MB for a 600s run; raise the sampling rate or soak longer"
+            fi
+          else
+            echo "::warning::failed to read /stream/stream.jsonl from sidecar"
+            cat /tmp/streamprof/stream-cat.err || true
+          fi
+
+      - name: rate-report --top 20 (best-effort)
+        # Builds the fork's snmalloc-tools at the pinned commit and runs the
+        # rate-report subcommand on the captured JSONL. Best-effort: the
+        # durable deliverable is stream.jsonl (uploaded below); if the fork
+        # can't be fetched/built here, run `snmalloc-tools rate-report
+        # --input stream.jsonl --top 20` locally on the artifact instead.
+        continue-on-error: true
+        env:
+          SNMALLOC_REV: e64cd355ff4f0291101d495f7e8e7d9d0821bfe9
+          GH_TOKEN: ${{ secrets.SNMALLOC_FETCH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ ! -s /tmp/streamprof/stream.jsonl ]; then
+            echo "::warning::no stream.jsonl — skipping rate-report"
+            exit 0
+          fi
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          if git clone --depth 1 --filter=blob:none https://github.com/jayakasadev/snmalloc /tmp/snmalloc-fork 2>/tmp/streamprof/clone.err; then
+            ( cd /tmp/snmalloc-fork && git fetch --depth 1 origin "$SNMALLOC_REV" && git checkout "$SNMALLOC_REV" ) || true
+            if cargo build --manifest-path /tmp/snmalloc-fork/snmalloc-tools/Cargo.toml --bin snmalloc-tools --release 2>/tmp/streamprof/build.err; then
+              /tmp/snmalloc-fork/target/release/snmalloc-tools rate-report \
+                --input /tmp/streamprof/stream.jsonl --top 20 \
+                | tee /tmp/streamprof/rate-report.txt
+            else
+              echo "::warning::snmalloc-tools build failed — see build.err"; tail -20 /tmp/streamprof/build.err || true
+            fi
+          else
+            echo "::warning::snmalloc fork clone failed (no SNMALLOC_FETCH_TOKEN?) — run rate-report locally on the artifact"
+            tail -5 /tmp/streamprof/clone.err || true
+          fi
+
+      - name: Compute steady-state heap delta
+        run: |
+          set -uo pipefail
+          if [ ! -f /tmp/streamprof/warmup.pb.gz ] || [ ! -f /tmp/streamprof/final.pb.gz ]; then
+            echo "::warning::missing warmup.pb.gz or final.pb.gz — skipping delta"
+            exit 0
+          fi
+          echo "=== steady-state delta (final - warmup) ==="
+          bash tools/profiling/heap_delta.sh \
+            --base /tmp/streamprof/warmup.pb.gz \
+            --profile /tmp/streamprof/final.pb.gz \
+            --output /tmp/streamprof/steady-state-delta.txt
+          if [ -f /tmp/streamprof/startup.pb.gz ]; then
+            echo "=== context: warmup cost (warmup - startup) ==="
+            bash tools/profiling/heap_delta.sh \
+              --base /tmp/streamprof/startup.pb.gz \
+              --profile /tmp/streamprof/warmup.pb.gz \
+              --output /tmp/streamprof/startup-to-warmup.txt || true
+          fi
+
+      - name: Collect loadtest + konfig logs
+        if: always()
+        run: |
+          mkdir -p /tmp/streamprof
+          kubectl logs -n konfig-system -l job-name=konfig-loadtest --all-containers=true --tail=-1 \
+            > /tmp/streamprof/loadtest.log 2>&1 || true
+          POD=$(kubectl get pod -n konfig-system -l app=konfig -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$POD" ]; then
+            kubectl logs -n konfig-system "$POD" -c konfig --tail=-1 > /tmp/streamprof/konfig.log 2>&1 || true
+            kubectl top pod -n konfig-system "$POD" > /tmp/streamprof/konfig.top 2>&1 || true
+          fi
+          kubectl get events -n konfig-system --sort-by=.lastTimestamp > /tmp/streamprof/events.log 2>&1 || true
+          kubectl get job/konfig-loadtest -n konfig-system -o yaml > /tmp/streamprof/loadtest-job.yaml 2>&1 || true
+
+      - name: Stop port-forward
+        if: always()
+        run: |
+          if [ -f /tmp/streamprof/portfwd.pid ]; then
+            kill "$(cat /tmp/streamprof/portfwd.pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload streamprof artifacts (JSONL + rate-report + pprofs + logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamprof
+          path: /tmp/streamprof/
+          retention-days: 14

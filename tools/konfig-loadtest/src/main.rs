@@ -16,6 +16,15 @@
 //!      N seconds (no per-event accounting, drain-only check). Designed for
 //!      steady-state RSS / allocator decay runs.
 //!
+//! Soak mode (opt-in, CU-86aj35zxw):
+//!   --scenario soak [--duration N]
+//!                       — sustained mixed workload (long-lived config+secret
+//!      subscribers + periodic Apply/ApplySecret + reconnect churn) for N
+//!      seconds (default 600). The natural host for the snmalloc streaming
+//!      capture (`KONFIG_SNMALLOC_STREAM_PATH` -> `rate-report`) + repeated
+//!      heap snapshots / growth delta. Tunables: SOAK_CONFIG_SUBS /
+//!      SOAK_SECRET_SUBS / SOAK_RECONNECT_SUBS / SOAK_*_INTERVAL_MS.
+//!
 //! Tunables (env, defaults preserve historical shape):
 //!   S1_SUBSCRIBERS / S1_APPLIES / S1_INTERVAL_MS — scenario-1 shape
 //!     (100 / 200 / 100 ms). For CU-86ahzwhat set 100 / 100 / 6000 (10/min × 10 min).
@@ -39,7 +48,7 @@ use crate::args::Args;
 use crate::metrics::{ScenarioResult, write_results_json};
 use crate::scenarios::{
     scenario_backpressure, scenario_get_flood, scenario_reconnect_storm, scenario_secrets_flood,
-    scenario_subscribe_flood,
+    scenario_soak, scenario_subscribe_flood,
 };
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -103,6 +112,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.scenario == "backpressure" {
         info!("=== Scenario 5: Slow-subscriber backpressure ===");
         results.push(scenario_backpressure(&args.addr, &args.namespace, &args.config_name).await);
+    }
+
+    // Soak is opt-in (never part of `all`): a 10 min+ steady-state mixed
+    // workload for streaming snmalloc capture + heap-growth observation
+    // (CU-86aj35zxw). `--duration` overrides the 600 s default.
+    if args.scenario == "soak" {
+        info!("=== Scenario: Steady-state soak (sustained mixed workload) ===");
+        results.push(
+            scenario_soak(
+                &args.addr,
+                &args.namespace,
+                &args.config_name,
+                &args.secret_name,
+                args.duration,
+            )
+            .await,
+        );
     }
 
     // ── Summary table ─────────────────────────────────────────────────────────
