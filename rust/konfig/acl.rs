@@ -519,7 +519,6 @@ mod tests {
 
     #[test]
     fn init_done_marks_synced_and_is_no_rebuild() {
-        let table = Arc::new(AclTable::new());
         let synced = Arc::new(AclSynced::new());
         let mut objects = HashMap::new();
         assert!(!synced.is_synced());

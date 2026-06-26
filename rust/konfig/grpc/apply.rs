@@ -497,14 +497,15 @@ pub(crate) enum PatchRetryDecision {
 /// Pure classifier — no I/O, no logging. Tests cover every branch by
 /// constructing `kube::Error::Api(ErrorResponse { code, ... })` directly.
 pub(crate) fn classify_patch_error(err: &kube::Error, attempt: usize) -> PatchRetryDecision {
-    match err {
-        kube::Error::Api(ae) if ae.code == 409 && attempt < RETRY_DELAYS_MS.len() => {
-            PatchRetryDecision::RetryAfter {
-                delay_ms: RETRY_DELAYS_MS[attempt],
-            }
+    if super::api_status_code(err) != Some(409) {
+        return PatchRetryDecision::Unavailable;
+    }
+    if attempt < RETRY_DELAYS_MS.len() {
+        PatchRetryDecision::RetryAfter {
+            delay_ms: RETRY_DELAYS_MS[attempt],
         }
-        kube::Error::Api(ae) if ae.code == 409 => PatchRetryDecision::AbortRetriesExhausted,
-        _ => PatchRetryDecision::Unavailable,
+    } else {
+        PatchRetryDecision::AbortRetriesExhausted
     }
 }
 
