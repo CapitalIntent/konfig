@@ -5,3 +5,12 @@ sh_binary(
     srcs = ["teardown.sh"],
     visibility = ["//visibility:public"],
 )
+
+# heap_delta — wraps `go tool pprof -diff_base` to emit a steady-state heap
+# delta (warmup snapshot subtracted) from two konfig-heapprof pprof captures.
+# CU-86aj7kavv. Needs `go` (or a standalone `pprof`) on PATH at runtime.
+sh_binary(
+    name = "heap_delta",
+    srcs = ["heap_delta.sh"],
+    visibility = ["//visibility:public"],
+)
