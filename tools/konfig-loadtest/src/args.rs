@@ -15,7 +15,7 @@ pub(crate) struct Args {
     pub(crate) config_name: String,
     #[arg(long, default_value = "my-config-secret")]
     pub(crate) secret_name: String,
-    /// Which scenario to run: all | subscribe | get | reconnect | secrets | backpressure
+    /// Which scenario to run: all | subscribe | get | reconnect | secrets | backpressure | soak
     #[arg(long, default_value = "all")]
     pub(crate) scenario: String,
     /// Sustained run duration in seconds. When set, scenario_subscribe_flood

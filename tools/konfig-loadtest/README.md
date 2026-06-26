@@ -361,6 +361,89 @@ konfig binary is needed. Positive rows grew after warmup (the steady-state
 signal); negative rows were transient warmup allocations since freed. For an
 interactive view: `go tool pprof -http=:8080 -diff_base=warmup.pb.gz final.pb.gz`.
 
+## Soak + streaming snmalloc capture (CU-86aj35zxw)
+
+A steady-state soak (`--scenario soak`) runs a sustained mixed workload — the
+natural host for two complementary observers over one window:
+
+- **per-callsite allocation churn** — snmalloc streaming-mode JSONL +
+  `snmalloc-tools rate-report` (catches *transient* churn the snapshot heap
+  profile is blind to: broadcast emit, `snapshot_to_proto`, cache get/update,
+  per-`Subscribe`-stream bookkeeping).
+- **whole-process growth/drift** — repeated heap snapshots + the steady-state
+  delta (see the heap-profiling section above), which a burst run misses.
+
+### The soak scenario
+
+```sh
+konfig-loadtest --scenario soak --duration 600   # 10 min; default when unset
+```
+
+Workload mix (all concurrent until the deadline):
+
+| Component | Default | Env tunable |
+| --- | --- | --- |
+| long-lived config `Subscribe` streams | 50 | `SOAK_CONFIG_SUBS` |
+| long-lived `SubscribeSecrets` streams | 25 | `SOAK_SECRET_SUBS` |
+| reconnect-churn streams (connect → read → drop → reconnect) | 10 | `SOAK_RECONNECT_SUBS` |
+| periodic `Apply` cadence | 250 ms | `SOAK_CONFIG_INTERVAL_MS` |
+| periodic `ApplySecret` cadence | 1000 ms | `SOAK_SECRET_INTERVAL_MS` |
+| reconnect window | 5000 ms | `SOAK_RECONNECT_INTERVAL_MS` |
+
+It is **opt-in** (never part of `--scenario all`) and the pass/fail gate is
+lenient ("the system kept serving the whole mix") — growth and per-callsite
+rates are judged out-of-band, not asserted, since 10–30 min of per-event
+bookkeeping would leak the loadtest process itself.
+
+### Streaming capture
+
+The `konfig-heapprof` image compiles the snmalloc `profiling` feature, which
+includes `konfig::stream_sink`. Set `KONFIG_SNMALLOC_STREAM_PATH` to a writable
+path and the process opens a `ProfilingSession` and streams one JSONL line per
+sampled alloc/resize (default sampling ~1-per-512 KiB) to that file:
+
+```text
+{"ts_ns":<u128>,"kind":"alloc|resize","site":"0x<leaf-frame-hex>","size":<bytes>}
+```
+
+The schema matches the fork's `snmalloc-tools rate-report` consumer. Post-process
+the captured log to surface the highest-rate call sites:
+
+```sh
+snmalloc-tools rate-report --input stream.jsonl --top 20
+```
+
+> `site` is the raw innermost return-address (hex); resolve hot sites to symbols
+> against the binary (`addr2line`/`atos`) when filing per-callsite findings.
+
+### CI (recommended)
+
+`streamprof-eval.yml` drives the soak against a `konfig-heapprof` Deployment
+(stream sink enabled via env + a writable `emptyDir`; a busybox sidecar shares
+the volume so the JSONL can be copied out of the distroless pod), captures the
+three heap phases + delta, runs `rate-report --top 20` (best-effort), and uploads
+the `streamprof` artifact (`stream.jsonl`, `rate-report.txt`, `*.pb.gz`,
+`steady-state-delta.txt`, logs):
+
+```sh
+gh workflow run streamprof-eval.yml                      # 600s soak, 90s warmup
+gh workflow run streamprof-eval.yml -f soak_seconds=1200 # longer soak
+gh run download <run-id> -n streamprof -D /tmp/streamprof
+cat /tmp/streamprof/rate-report.txt
+```
+
+**Acceptance follow-up (human):** from the uploaded `stream.jsonl`, confirm
+≥10 MB over a 600 s run, write the `rate-report --top 20` table to the findings
+doc, and open a per-callsite ClickUp sub-ticket for any konfig-crate site
+> 1 alloc/sec (ignore tonic/hyper frames).
+
+### Local
+
+Mirror the heap-profiling "Local" steps (1-replica `konfig-heapprof` pod), but
+add `KONFIG_SNMALLOC_STREAM_PATH=/var/log/konfig-stream/stream.jsonl` to the
+container env on a writable `emptyDir` mount, then drive `--scenario soak` and
+`rate-report` the copied-out JSONL.
+
 ## Teardown / cleanup
 
 Profiling-session cleanup (keeps pyroscope datastore by default):
