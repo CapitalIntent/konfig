@@ -89,7 +89,14 @@ Enforcement points (all keyed by `ClientIdentity`):
   close (RAII guard). Over budget ⇒ `RESOURCE_EXHAUSTED` at stream open.
 - **Applies** — a per-identity token bucket on the `Apply` path. Empty bucket ⇒
   `RESOURCE_EXHAUSTED` (mirrors the existing backpressure drop semantics so
-  clients already handle it).
+  clients already handle it). It covers every authenticated write that shares
+  the budget: `Apply` and `ApplySecret` cost one token each, `BatchApply` costs
+  one token per item (so batching cannot bypass the rate — an over-burst batch
+  is rejected whole, no partial write). `DryRunApply` does not mutate and is not
+  limited. Burst capacity is `maxAppliesBurst`; when unset it defaults to one
+  second of tokens (the refill rate), as there is no separate burst flag. This
+  per-tenant bucket supersedes the Phase-4 per-IP limiter on authenticated
+  paths; the per-IP layer stays as the coarser pre-auth guard.
 - **Cache** — see below.
 
 ## Cache isolation

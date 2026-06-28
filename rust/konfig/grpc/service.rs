@@ -87,6 +87,9 @@ impl KonfigService for KonfigServer {
             &request.get_ref().namespace,
             &request.get_ref().name,
         )?;
+        // Per-tenant apply rate-limit (CU-86aj8pvf1, MT-3): one token per Apply;
+        // RESOURCE_EXHAUSTED when the bucket is empty.
+        self.rate_limit_apply(&request, "apply", 1)?;
 
         // Audit (CU-86ahrwd6h): capture identity + request facets before
         // `into_inner()` consumes the request, run the handler, emit the record.
@@ -146,6 +149,14 @@ impl KonfigService for KonfigServer {
         for item in &request.get_ref().items {
             self.authorize(&request, Verb::Write, &item.namespace, &item.name)?;
         }
+        // Per-tenant apply rate-limit (CU-86aj8pvf1, MT-3): a batch costs one
+        // token per item, so batching cannot bypass the per-second rate. Whole
+        // batch rejected if the bucket lacks enough tokens (no partial write).
+        self.rate_limit_apply(
+            &request,
+            "batch_apply",
+            request.get_ref().items.len() as u32,
+        )?;
 
         // Audit (CU-86ahrwd6h): the mutation log must cover EVERY target, so we
         // emit one record per item. Capture each item's (namespace, name,
@@ -410,6 +421,9 @@ impl KonfigService for KonfigServer {
             &request.get_ref().namespace,
             &request.get_ref().name,
         )?;
+        // Per-tenant apply rate-limit (CU-86aj8pvf1, MT-3): secret applies share
+        // the identity's apply bucket, so they cannot bypass the rate.
+        self.rate_limit_apply(&request, "apply_secret", 1)?;
 
         // Audit (CU-86ahrwd6h).
         let identity = identity::extract_identity(&request);
