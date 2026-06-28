@@ -18,6 +18,12 @@ rules:
   - apiGroups: ["konfig.io"]
     resources: ["configschemas"]
     verbs: ["get", "list", "watch"]
+  # Per-tenant quotas (CU-86aj8pvcu, MT-1): the cluster-scoped TenantQuota
+  # watcher lists/watches TenantQuotas across the whole cluster. Read-only —
+  # konfig never mutates quotas; operators manage them out-of-band.
+  - apiGroups: ["konfig.io"]
+    resources: ["tenantquotas"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch"]
