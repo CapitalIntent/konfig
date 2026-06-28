@@ -206,6 +206,26 @@ arm64|amd64` (default arm64), positional image refs to override the set; env
 `NSENTER_IMAGE` to swap the nsenter helper (default `justincormack/nsenter1`).
 See the konfig-loadtest bench runbook for the full local-bench flow.
 
+# Per-release CPU profile archive (CU-86ahtj1v9)
+
+`.github/workflows/profile-release.yml` runs on every `v*` tag push (and manual
+dispatch): it stands up kind + an in-cluster pyroscope + the `konfig-profiling`
+image (in-process pyroscope agent), drives the `saturate` loadtest profile
+(CU-LOAD-1), then captures the CPU profile via pyroscope's flamebearer render
+API, converts it to pprof (`flamebearer_to_pprof.py`), and reduces a
+`samples.csv` (`tools/profiling/ci_release_capture.sh`).
+
+The bundle (`cpu.pprof`, `cpu.flamebearer.json`, `samples.csv`, `RELEASE.txt`,
+`konfig.log`) is uploaded as the **`release-profiles-<tag>`** GitHub Actions
+artifact (90-day retention; NOT AWS per memory rule) — the canonical
+quarterly-comparison archive, no loadtest re-run needed. Download it from the
+workflow run's Artifacts panel for the corresponding tag.
+
+```sh
+gh run download --name release-profiles-v1.2.3        # by tag
+go tool pprof -http=:0 cpu.pprof                       # inspect locally
+```
+
 # Local flamegraph (CU-86ahtj0m5)
 
 `bazel run //rust/konfig:flamegraph -- --duration 60` produces `flamegraph.svg`
