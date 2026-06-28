@@ -37,6 +37,7 @@ use crate::grpc::tls::{TlsPaths, build_server_tls_config, warn_tls_disabled};
 use crate::grpc::{ServerConfig, serve};
 use crate::metrics::{LastEventAtMap, last_event_at_for, spawn_tokio_runtime_sampler};
 use crate::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
+use crate::quota::{QuotaMode, QuotaSynced, QuotaTable, QuotaWatcher};
 use crate::schema::{SchemaSynced, SchemaTable, SchemaWatcher};
 use crate::secret_cache::SecretCache;
 use crate::secret_watcher::SecretWatcher;
@@ -272,6 +273,38 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 |_attempt| {
                     AclWatcher::new(acl_client.clone())
                         .run(Arc::clone(&acl_table), Arc::clone(&acl_synced))
+                },
+            )
+            .await;
+        });
+    }
+
+    // Spawn the cluster-scoped TenantQuota watcher (CU-86aj8pvcu, MT-1).
+    // Mirror of the ConfigACL watcher: it populates the identity→budget table
+    // the forthcoming quota enforcement points (MT-2..) read, and flips
+    // `quota_synced` once its initial list completes. Always run it so flipping
+    // `KONFIG_TENANT_QUOTA_MODE` to permissive/enforce via a rolling restart
+    // finds a warm, synced table — same rationale as the ConfigACL watcher.
+    let quota_mode = QuotaMode::from_env();
+    let quota_table = Arc::new(QuotaTable::new());
+    let quota_synced = Arc::new(QuotaSynced::new());
+    info!(
+        ?quota_mode,
+        "TenantQuota watcher: enforcement mode resolved"
+    );
+    {
+        let quota_client = kube_client.clone();
+        let quota_table = Arc::clone(&quota_table);
+        let quota_synced = Arc::clone(&quota_synced);
+        tokio::spawn(async move {
+            run_with_reconnect(
+                "tenantquota",
+                // TenantQuota is cluster-scoped — no namespace; pass empty.
+                String::new(),
+                || {},
+                |_attempt| {
+                    QuotaWatcher::new(quota_client.clone())
+                        .run(Arc::clone(&quota_table), Arc::clone(&quota_synced))
                 },
             )
             .await;

@@ -4,6 +4,7 @@
 //!
 //! - [`types`] — `ConfigSnapshot`, `ConfigSpec`, `SecretSnapshot`
 //! - [`acl`] — cluster-scoped `ConfigACL.konfig.io/v1` table + watcher (authz)
+//! - [`quota`] — cluster-scoped `TenantQuota.konfig.io/v1` table + watcher (per-tenant budgets)
 //! - [`cache`] — DashMap-backed multi-key lock-free config cache
 //! - [`secret_cache`] — DashMap-backed multi-key lock-free secret cache
 //! - [`watcher`] — kube-rs watcher for `Config.konfig.io/v1` CRDs
@@ -22,6 +23,7 @@ pub mod cow_cache;
 pub mod grpc;
 pub mod import;
 pub mod metrics;
+pub mod quota;
 pub mod schema;
 pub mod secret_cache;
 pub mod secret_watcher;

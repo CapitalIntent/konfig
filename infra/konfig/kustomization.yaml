@@ -16,6 +16,7 @@ resources:
   - crd.yaml
   - configacl-crd.yaml
   - configschema-crd.yaml
+  - tenantquota-crd.yaml
   - serviceaccount.yaml
   - clusterrole.yaml
   - clusterrolebinding.yaml

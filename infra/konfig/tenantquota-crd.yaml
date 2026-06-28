@@ -1,0 +1,70 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: tenantquotas.konfig.io
+  annotations:
+    # Establish before the Deployment so the cluster-scoped TenantQuota watcher
+    # (CU-86aj8pvcu) does not panic at startup, same as configs.konfig.io.
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  group: konfig.io
+  # Cluster-scoped: a TenantQuota bounds a client identity's consumption across
+  # the cluster, so the object itself is not namespaced. The watcher uses
+  # Api::all_with (vs Api::namespaced_with for Config). RBAC: see
+  # clusterrole.yaml (tenantquotas get/list/watch). Tenant == mTLS client
+  # identity (ADR-0002), keyed exactly like ConfigACL.
+  scope: Cluster
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - identity
+              properties:
+                identity:
+                  type: string
+                  description: >-
+                    Client identity this quota bounds. Must equal the
+                    ClientIdentity the server derives from the presented mTLS
+                    leaf cert — the first SAN URI (e.g. a SPIFFE id) or, absent
+                    that, the Subject CN. Same key as ConfigACL.
+                maxSubscribers:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  description: >-
+                    Max concurrent Subscribe / SubscribeSecrets streams for this
+                    identity. 0 (the default) means unlimited.
+                maxAppliesPerSecond:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  description: >-
+                    Apply token-bucket refill rate (tokens/second). 0 means
+                    unlimited.
+                maxAppliesBurst:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  description: >-
+                    Apply token-bucket capacity (max burst). 0 means unlimited.
+                cacheMemoryBudgetBytes:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                  description: >-
+                    Soft cap (bytes) on this identity's attributed cached
+                    payloads; eviction trims its view on breach. 0 means
+                    unlimited.
+  names:
+    plural: tenantquotas
+    singular: tenantquota
+    kind: TenantQuota
+    shortNames:
+      - tq
