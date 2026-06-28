@@ -37,7 +37,7 @@ use crate::grpc::tls::{TlsPaths, build_server_tls_config, warn_tls_disabled};
 use crate::grpc::{ServerConfig, serve};
 use crate::metrics::{LastEventAtMap, last_event_at_for, spawn_tokio_runtime_sampler};
 use crate::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
-use crate::quota::{QuotaMode, QuotaSynced, QuotaTable, QuotaWatcher};
+use crate::quota::{QuotaMode, QuotaSynced, QuotaTable, QuotaWatcher, SubscriberCounts};
 use crate::schema::{SchemaSynced, SchemaTable, SchemaWatcher};
 use crate::secret_cache::SecretCache;
 use crate::secret_watcher::SecretWatcher;
@@ -143,6 +143,15 @@ pub struct Args {
     /// unchanged. Default flips to 4 only after a bench validates the win.
     #[arg(long, env = "KONFIG_BROADCAST_SHARDS", default_value = "1")]
     pub broadcast_shards: usize,
+
+    /// Default per-tenant concurrent-subscriber cap when no `TenantQuota`
+    /// matches the caller identity (CU-86aj8pvdb, MT-2). `0` (the default) means
+    /// unlimited. A matching `TenantQuota.maxSubscribers` overrides this once the
+    /// quota watcher has synced; until then this flag applies (the boot-window
+    /// fail-safe). Only enforced when `KONFIG_TENANT_QUOTA_MODE` is `permissive`
+    /// (log-only would-deny) or `enforce` (RESOURCE_EXHAUSTED over budget).
+    #[arg(long, env = "KONFIG_DEFAULT_MAX_SUBSCRIBERS", default_value = "0")]
+    pub default_max_subscribers: u32,
 }
 
 /// Resolve a `ServerTlsConfig` from the TLS-related fields on `args`, or
@@ -288,6 +297,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let quota_mode = QuotaMode::from_env();
     let quota_table = Arc::new(QuotaTable::new());
     let quota_synced = Arc::new(QuotaSynced::new());
+    // Live per-identity concurrent-subscriber counts (CU-86aj8pvdb, MT-2). Built
+    // here so both the gRPC service and the RAII guard attached to every
+    // Subscribe / SubscribeSecrets stream share one accounting table.
+    let subscriber_counts = Arc::new(SubscriberCounts::new());
     info!(
         ?quota_mode,
         "TenantQuota watcher: enforcement mode resolved"
@@ -417,6 +430,11 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         acl_table,
         acl_synced,
         schema_table,
+        quota_mode,
+        quota_table,
+        quota_synced,
+        subscriber_counts,
+        default_max_subscribers: args.default_max_subscribers,
     })
     .await?;
 
@@ -546,6 +564,7 @@ mod tests {
             h2_max_concurrent_streams: None,
             coalesce_window_ms: 0,
             broadcast_shards: 1,
+            default_max_subscribers: 0,
         }
     }
 

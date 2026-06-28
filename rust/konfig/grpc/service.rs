@@ -288,7 +288,7 @@ impl KonfigService for KonfigServer {
         record_status(result)
     }
 
-    type SubscribeStream = ReceiverStream<Result<ConfigEvent, Status>>;
+    type SubscribeStream = GuardedStream<ReceiverStream<Result<ConfigEvent, Status>>>;
 
     #[tracing::instrument(
         name = "konfig.Subscribe",
@@ -308,6 +308,10 @@ impl KonfigService for KonfigServer {
         check_drain(&self.draining)?;
         // Name-less RPC: require `read` across the whole namespace ("*").
         self.authorize(&request, Verb::Read, &request.get_ref().namespace, "*")?;
+        // Per-tenant subscriber quota (CU-86aj8pvdb, MT-2): RESOURCE_EXHAUSTED
+        // over budget. The guard rides the response stream and releases the
+        // slot when the client disconnects or the server drains.
+        let guard = self.admit_subscriber(&request)?;
         record_status(
             subscribe::handle_subscribe(
                 Arc::clone(&self.cache),
@@ -320,7 +324,8 @@ impl KonfigService for KonfigServer {
                 self.broadcast_shards,
                 request.into_inner(),
             )
-            .await,
+            .await
+            .map(|resp| Response::new(GuardedStream::new(resp.into_inner(), guard))),
         )
     }
 
@@ -433,7 +438,7 @@ impl KonfigService for KonfigServer {
         record_status(result)
     }
 
-    type SubscribeSecretsStream = ReceiverStream<Result<SecretEvent, Status>>;
+    type SubscribeSecretsStream = GuardedStream<ReceiverStream<Result<SecretEvent, Status>>>;
 
     #[tracing::instrument(
         name = "konfig.SubscribeSecrets",
@@ -453,6 +458,9 @@ impl KonfigService for KonfigServer {
         check_drain(&self.draining)?;
         // Name-less RPC: require `read` across the whole namespace ("*").
         self.authorize(&request, Verb::Read, &request.get_ref().namespace, "*")?;
+        // Per-tenant subscriber quota (CU-86aj8pvdb, MT-2): SubscribeSecrets
+        // counts against the same per-identity budget as Subscribe.
+        let guard = self.admit_subscriber(&request)?;
         record_status(
             subscribe_secrets::handle_subscribe_secrets(
                 self.kube_client.clone(),
@@ -461,7 +469,8 @@ impl KonfigService for KonfigServer {
                 self.drain_notify(),
                 request.into_inner(),
             )
-            .await,
+            .await
+            .map(|resp| Response::new(GuardedStream::new(resp.into_inner(), guard))),
         )
     }
 }
