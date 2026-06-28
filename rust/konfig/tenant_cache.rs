@@ -87,10 +87,12 @@ impl TenantView {
             let Some((&tick, _)) = self.by_tick.iter().next() else {
                 break;
             };
-            if let Some(key) = self.by_tick.remove(&tick) {
-                if let Some(slot) = self.by_key.remove(&key) {
-                    self.total -= slot.bytes;
-                }
+            let key = self
+                .by_tick
+                .remove(&tick)
+                .expect("tick came from by_tick iteration");
+            if let Some(slot) = self.by_key.remove(&key) {
+                self.total -= slot.bytes;
             }
             evicted += 1;
         }
@@ -116,12 +118,13 @@ impl TenantCacheLedger {
     }
 
     /// Attribute `bytes` for `(kind, namespace, name)` to `identity` and refresh
-    /// the per-identity byte gauge. In [`QuotaMode::Enforce`], evict the
-    /// tenant's LRU entries until it is back within `budget`, bumping
-    /// `konfig_tenant_cache_evictions_total`. In `Permissive` the view is
-    /// accounted (gauge reflects over-budget) but never evicted, so operators
-    /// can size budgets against real traffic first. Callers never invoke this
-    /// for `Disabled` (the accountant is `None`).
+    /// the per-identity byte gauge. `evict_budget` is `Some(budget)` under
+    /// `enforce` — evict the tenant's LRU entries until back within `budget`,
+    /// bumping `konfig_tenant_cache_evictions_total` — and `None` under
+    /// `permissive`, where the view is accounted (the gauge reflects
+    /// over-budget) but never evicted, so operators can size budgets against
+    /// real traffic first. Callers never invoke this for `Disabled` (the
+    /// accountant is `None`).
     pub fn record(
         &self,
         identity: &str,
@@ -129,18 +132,16 @@ impl TenantCacheLedger {
         namespace: &str,
         name: &str,
         bytes: usize,
-        mode: QuotaMode,
-        budget: u64,
+        evict_budget: Option<u64>,
     ) {
         let key: Key = (kind, namespace.to_string(), name.to_string());
         let (total, evicted) = {
             let view = self.views.entry(identity.to_string()).or_default();
             let mut v = crate::sync_util::lock_recovered(&view);
             v.touch(key, bytes);
-            let evicted = if mode == QuotaMode::Enforce {
-                v.evict_to(budget)
-            } else {
-                0
+            let evicted = match evict_budget {
+                Some(budget) => v.evict_to(budget),
+                None => 0,
             };
             (v.total, evicted)
         };
@@ -193,17 +194,26 @@ impl CacheAccountant {
         }
     }
 
-    /// Attribute one served entry to this RPC's tenant.
+    /// Attribute one served entry to this RPC's tenant. `enforce` evicts to the
+    /// resolved budget; `permissive` accounts only (no eviction).
     pub fn record(&self, namespace: &str, name: &str, bytes: usize) {
+        let evict_budget = (self.mode == QuotaMode::Enforce).then_some(self.budget);
         self.ledger.record(
             &self.identity,
             self.kind,
             namespace,
             name,
             bytes,
-            self.mode,
-            self.budget,
+            evict_budget,
         );
+    }
+
+    /// Attribute a served entry described by a cost extractor's output, if any.
+    /// Keeps call sites a single statement (no nested `if let`).
+    pub fn record_cost(&self, cost: Option<(&str, &str, usize)>) {
+        if let Some((namespace, name, bytes)) = cost {
+            self.record(namespace, name, bytes);
+        }
     }
 }
 
@@ -281,9 +291,7 @@ where
         let this = self.get_mut();
         let polled = Pin::new(&mut this.inner).poll_next(cx);
         if let (Some(acct), Poll::Ready(Some(Ok(item)))) = (&this.acct, &polled) {
-            if let Some((namespace, name, bytes)) = (this.cost)(item) {
-                acct.record(namespace, name, bytes);
-            }
+            acct.record_cost((this.cost)(item));
         }
         polled
     }
@@ -305,6 +313,10 @@ impl<S, T> std::fmt::Debug for AccountedStream<S, T> {
 mod tests {
     use super::*;
 
+    // Budget arg mirrors the modes: `None` = permissive (account, never evict),
+    // `Some(b)` = enforce (evict the LRU view to `b`).
+    const PERMISSIVE: Option<u64> = None;
+
     fn ledger() -> TenantCacheLedger {
         TenantCacheLedger::new()
     }
@@ -312,8 +324,8 @@ mod tests {
     #[test]
     fn reserving_same_key_replaces_not_accumulates() {
         let l = ledger();
-        l.record("t", "config", "ns", "a", 100, QuotaMode::Permissive, 0);
-        l.record("t", "config", "ns", "a", 40, QuotaMode::Permissive, 0);
+        l.record("t", "config", "ns", "a", 100, PERMISSIVE);
+        l.record("t", "config", "ns", "a", 40, PERMISSIVE);
         // Re-serve replaces the byte cost; the view holds one entry, not two.
         assert_eq!(l.bytes_of("t"), 40);
     }
@@ -321,8 +333,8 @@ mod tests {
     #[test]
     fn config_and_secret_same_name_are_distinct_entries() {
         let l = ledger();
-        l.record("t", "config", "ns", "x", 10, QuotaMode::Permissive, 0);
-        l.record("t", "secret", "ns", "x", 7, QuotaMode::Permissive, 0);
+        l.record("t", "config", "ns", "x", 10, PERMISSIVE);
+        l.record("t", "secret", "ns", "x", 7, PERMISSIVE);
         // Same namespace+name but different kind ⇒ both counted.
         assert_eq!(l.bytes_of("t"), 17);
     }
@@ -330,9 +342,9 @@ mod tests {
     #[test]
     fn permissive_accounts_but_never_evicts() {
         let l = ledger();
-        // Budget of 10 bytes, but permissive must not evict — total exceeds it.
-        l.record("t", "config", "ns", "a", 8, QuotaMode::Permissive, 10);
-        l.record("t", "config", "ns", "b", 8, QuotaMode::Permissive, 10);
+        // Permissive (None) must not evict even though total exceeds a budget.
+        l.record("t", "config", "ns", "a", 8, PERMISSIVE);
+        l.record("t", "config", "ns", "b", 8, PERMISSIVE);
         assert_eq!(l.bytes_of("t"), 16);
     }
 
@@ -341,9 +353,9 @@ mod tests {
         let l = ledger();
         // Budget 10. Serve a(4), b(4), c(4): total would be 12 > 10, so the LRU
         // entry (a) is evicted, leaving b + c = 8.
-        l.record("t", "config", "ns", "a", 4, QuotaMode::Enforce, 10);
-        l.record("t", "config", "ns", "b", 4, QuotaMode::Enforce, 10);
-        l.record("t", "config", "ns", "c", 4, QuotaMode::Enforce, 10);
+        l.record("t", "config", "ns", "a", 4, Some(10));
+        l.record("t", "config", "ns", "b", 4, Some(10));
+        l.record("t", "config", "ns", "c", 4, Some(10));
         assert_eq!(l.bytes_of("t"), 8);
     }
 
@@ -352,11 +364,11 @@ mod tests {
         let l = ledger();
         // a, b, c with budget 8 → after c, a evicted (b,c = 8). Re-serving b
         // makes it MRU; serving d(4) now evicts c (the new LRU), keeping b + d.
-        l.record("t", "config", "ns", "a", 4, QuotaMode::Enforce, 8);
-        l.record("t", "config", "ns", "b", 4, QuotaMode::Enforce, 8);
-        l.record("t", "config", "ns", "c", 4, QuotaMode::Enforce, 8); // evicts a
-        l.record("t", "config", "ns", "b", 4, QuotaMode::Enforce, 8); // b now MRU
-        l.record("t", "config", "ns", "d", 4, QuotaMode::Enforce, 8); // evicts c
+        l.record("t", "config", "ns", "a", 4, Some(8));
+        l.record("t", "config", "ns", "b", 4, Some(8));
+        l.record("t", "config", "ns", "c", 4, Some(8)); // evicts a
+        l.record("t", "config", "ns", "b", 4, Some(8)); // b now MRU
+        l.record("t", "config", "ns", "d", 4, Some(8)); // evicts c
         assert_eq!(l.bytes_of("t"), 8);
     }
 
@@ -365,7 +377,7 @@ mod tests {
         let l = ledger();
         // One entry larger than the whole budget is not evicted right after
         // serving it (we always keep ≥1 — back-pressure, not a correctness gate).
-        l.record("t", "config", "ns", "big", 100, QuotaMode::Enforce, 10);
+        l.record("t", "config", "ns", "big", 100, Some(10));
         assert_eq!(l.bytes_of("t"), 100);
     }
 
@@ -373,15 +385,7 @@ mod tests {
     fn zero_budget_is_unlimited() {
         let l = ledger();
         for i in 0..50 {
-            l.record(
-                "t",
-                "config",
-                "ns",
-                &format!("k{i}"),
-                1000,
-                QuotaMode::Enforce,
-                0,
-            );
+            l.record("t", "config", "ns", &format!("k{i}"), 1000, Some(0));
         }
         assert_eq!(l.bytes_of("t"), 50_000);
     }
@@ -389,8 +393,8 @@ mod tests {
     #[test]
     fn distinct_identities_are_isolated() {
         let l = ledger();
-        l.record("t1", "config", "ns", "a", 30, QuotaMode::Enforce, 0);
-        l.record("t2", "config", "ns", "a", 70, QuotaMode::Enforce, 0);
+        l.record("t1", "config", "ns", "a", 30, Some(0));
+        l.record("t2", "config", "ns", "a", 70, Some(0));
         assert_eq!(l.bytes_of("t1"), 30);
         assert_eq!(l.bytes_of("t2"), 70);
     }

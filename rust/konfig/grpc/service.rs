@@ -47,9 +47,7 @@ impl KonfigService for KonfigServer {
         let acct = self.cache_accountant(&request, "config");
         let result = get::handle_get(Arc::clone(&self.cache), request.into_inner()).await;
         if let (Some(acct), Ok(resp)) = (&acct, &result) {
-            if let Some((ns, name, bytes)) = config_cost(resp.get_ref()) {
-                acct.record(ns, name, bytes);
-            }
+            acct.record_cost(config_cost(resp.get_ref()));
         }
         record_status(result)
     }
@@ -400,9 +398,7 @@ impl KonfigService for KonfigServer {
             secret_get::handle_get_secret(Arc::clone(&self.secret_cache), request.into_inner())
                 .await;
         if let (Some(acct), Ok(resp)) = (&acct, &result) {
-            if let Some((ns, name, bytes)) = secret_cost(resp.get_ref()) {
-                acct.record(ns, name, bytes);
-            }
+            acct.record_cost(secret_cost(resp.get_ref()));
         }
         record_status(result)
     }
