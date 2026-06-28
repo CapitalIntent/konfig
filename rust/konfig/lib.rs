@@ -32,6 +32,7 @@ pub mod startup;
 pub mod stream_sink;
 pub mod sync_util;
 pub mod telemetry;
+pub mod tenant_cache;
 pub mod types;
 pub mod value_parse;
 pub mod watcher;

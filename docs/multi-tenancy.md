@@ -108,8 +108,8 @@ Design:
 
 - **Per-tenant accounting, not per-tenant maps.** Keep the single lock-free
   cache (splitting it per tenant would multiply memory + watcher fan-out).
-  Attribute each cached entry's byte cost to the tenant(s) authorized to read
-  it, tracked in a per-identity `AtomicUsize` byte counter.
+  Attribute each served entry's byte cost to the tenant it was served to,
+  tracked in a per-identity *view* (byte total + LRU recency).
 - **Soft budget + eviction on breach.** When a tenant's attributed bytes exceed
   `cacheMemoryBudgetBytes`, evict that tenant's least-recently-served entries
   from its *view* (the entry stays for other tenants) and emit a
@@ -118,8 +118,38 @@ Design:
 - **Shared-entry rule.** An entry readable by N tenants counts against each;
   eviction from one tenant's view does not drop it while another is in budget.
 
-This keeps the hot read path unchanged (one `ArcSwap` load) and confines the new
-work to write/serve-time accounting.
+### Implementation (CU-86aj8pvg3, MT-4)
+
+`tenant_cache::TenantCacheLedger` holds a per-identity `TenantView`
+(`DashMap<identity, Mutex<view>>`, so distinct tenants never contend). A view is
+a byte total plus an LRU ordering keyed by `(kind, namespace, name)` — `kind`
+(`config` / `secret`) disambiguates a config and a secret sharing a name, and
+config + secret bytes share the **one** `cacheMemoryBudgetBytes`. Re-serving a
+key replaces its byte cost (latest size) and refreshes recency rather than
+double-counting. Byte cost is the JSON payload length (`content_json` /
+`data_json`) plus the key strings.
+
+Accounting runs at **serve time** via `tenant_cache::AccountedStream`, a thin
+adapter that wraps each RPC's response stream and tallies every delivered `Ok`
+item — so `Get` / `GetAll` / `GetSecret` / `GetAllSecrets` **and** the full
+`Subscribe` / `SubscribeSecrets` event flow (initial replay/snapshot **and every
+live broadcast event, per subscriber**) are attributed. The budget is resolved
+once per RPC (`effective_cache_budget`, mirroring `effective_subscriber_limit`);
+a mid-stream `TenantQuota` edit takes effect on the subscriber's next reconnect.
+
+Mode ladder: `off` ⇒ no accounting (the accountant is `None`, a transparent
+pass-through). `permissive` ⇒ account + `konfig_tenant_cache_bytes{identity}`
+gauge, but never evict (size budgets against real traffic first). `enforce` ⇒
+account + evict the tenant's LRU view entries on breach (keeping ≥1) +
+`konfig_tenant_cache_evictions_total{identity}`.
+
+**Hot-path note (deliberate).** Accounting every live broadcast event per
+subscriber is the most accurate attribution but adds per-event work on the
+per-subscriber delivery side (a gauge update, and under `enforce` a short
+per-identity mutex section). The lock-free `ConfigCache` / `SecretCache` reads
+and the broadcast fan-out (`send_to_all`) themselves stay untouched — the cost
+is confined to the per-subscriber stream wrapper and is skipped entirely when
+quotas are `off`.
 
 ## Network isolation
 
