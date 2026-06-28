@@ -59,8 +59,8 @@ use crate::proto::{
     konfig_service_server::{KonfigService, KonfigServiceServer},
 };
 use crate::quota::{
-    Admit, GuardedStream, QuotaMode, QuotaSynced, QuotaTable, SubscriberCounts, SubscriberGuard,
-    effective_subscriber_limit,
+    Admit, ApplyLimiter, ApplyOutcome, GuardedStream, QuotaMode, QuotaSynced, QuotaTable,
+    SubscriberCounts, SubscriberGuard, apply_admission, effective_subscriber_limit,
 };
 use crate::schema::SchemaTable;
 use crate::secret_cache::SecretCache;
@@ -170,6 +170,13 @@ pub struct ServerConfig {
     /// Default per-tenant concurrent-subscriber cap when no `TenantQuota` names
     /// the identity (MT-2, `--default-max-subscribers`). `0` = unlimited.
     pub default_max_subscribers: u32,
+    /// Per-identity Apply token bucket (CU-86aj8pvf1, MT-2/MT-3). Shared runtime
+    /// state read by the apply rate-limit guard.
+    pub apply_limiter: Arc<ApplyLimiter>,
+    /// Default per-tenant Apply refill rate (tokens/sec) when no `TenantQuota`
+    /// names the identity (MT-3, `--default-max-applies-per-second`). `0` =
+    /// unlimited. Burst capacity derives from the rate (no burst flag).
+    pub default_max_applies_per_second: u32,
 }
 
 /// Type-erased shutdown future.  Boxed so the field doesn't push a generic
@@ -244,6 +251,11 @@ pub struct KonfigServer {
     /// Default concurrent-subscriber cap when no `TenantQuota` names the caller
     /// (`--default-max-subscribers`). `0` = unlimited.
     pub(crate) default_max_subscribers: u32,
+    /// Per-identity Apply token bucket read by [`Self::rate_limit_apply`].
+    pub(crate) apply_limiter: Arc<ApplyLimiter>,
+    /// Default Apply refill rate (tokens/sec) when no `TenantQuota` names the
+    /// caller (`--default-max-applies-per-second`). `0` = unlimited.
+    pub(crate) default_max_applies_per_second: u32,
 }
 
 impl KonfigServer {
@@ -365,6 +377,65 @@ impl KonfigServer {
                 );
                 Err(Status::resource_exhausted(format!(
                     "tenant subscriber quota exhausted ({current}/{limit})"
+                )))
+            }
+        }
+    }
+
+    /// Per-tenant Apply rate-limit (CU-86aj8pvf1, MT-3). Called at the top of
+    /// the write RPCs (`apply` / `batch_apply` / `apply_secret`), after
+    /// `authorize`. Takes `cost` tokens from the identity's bucket
+    /// (`batch_apply` passes its item count); an empty bucket returns
+    /// `RESOURCE_EXHAUSTED` in `Enforce`, logs a would-deny in `Permissive`.
+    ///
+    /// Returns `Ok(())` immediately when quotas are `Disabled` (the default) or
+    /// when the resolved rate is `0` (unlimited) — zero-overhead, mirroring
+    /// `authorize` / `admit_subscriber`. `rpc` labels the would-deny metric.
+    /// This is the per-tenant axis that supersedes the Phase-4 per-IP limiter on
+    /// authenticated paths; the per-IP layer stays as a coarser pre-auth guard.
+    fn rate_limit_apply<T>(
+        &self,
+        request: &Request<T>,
+        rpc: &str,
+        cost: u32,
+    ) -> Result<(), Status> {
+        let identity = identity::extract_identity(request);
+        match apply_admission(
+            &self.apply_limiter,
+            &self.quota_table,
+            self.quota_synced.is_synced(),
+            self.quota_mode,
+            self.default_max_applies_per_second,
+            &identity.id,
+            cost,
+        ) {
+            ApplyOutcome::Allowed => Ok(()),
+            ApplyOutcome::OverBudget { rate, burst } => {
+                crate::metrics::record_tenant_quota_denied(rpc, "permissive");
+                warn!(
+                    identity = %identity.id,
+                    rpc,
+                    rate,
+                    burst,
+                    cost,
+                    mode = "permissive",
+                    "tenant apply rate would-deny (permissive — allowing)"
+                );
+                Ok(())
+            }
+            ApplyOutcome::Denied { rate, burst } => {
+                crate::metrics::record_tenant_quota_denied(rpc, "enforce");
+                warn!(
+                    identity = %identity.id,
+                    rpc,
+                    rate,
+                    burst,
+                    cost,
+                    mode = "enforce",
+                    "tenant apply rate exhausted — RESOURCE_EXHAUSTED"
+                );
+                Err(Status::resource_exhausted(format!(
+                    "tenant apply rate exhausted (rate={rate}/s, burst={burst}, cost={cost})"
                 )))
             }
         }
@@ -937,6 +1008,8 @@ mod tests {
             quota_synced: Arc::new(QuotaSynced::new()),
             subscriber_counts: Arc::new(SubscriberCounts::new()),
             default_max_subscribers: 0,
+            apply_limiter: Arc::new(ApplyLimiter::new()),
+            default_max_applies_per_second: 0,
         }
     }
 

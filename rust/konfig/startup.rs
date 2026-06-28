@@ -37,7 +37,9 @@ use crate::grpc::tls::{TlsPaths, build_server_tls_config, warn_tls_disabled};
 use crate::grpc::{ServerConfig, serve};
 use crate::metrics::{LastEventAtMap, last_event_at_for, spawn_tokio_runtime_sampler};
 use crate::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
-use crate::quota::{QuotaMode, QuotaSynced, QuotaTable, QuotaWatcher, SubscriberCounts};
+use crate::quota::{
+    ApplyLimiter, QuotaMode, QuotaSynced, QuotaTable, QuotaWatcher, SubscriberCounts,
+};
 use crate::schema::{SchemaSynced, SchemaTable, SchemaWatcher};
 use crate::secret_cache::SecretCache;
 use crate::secret_watcher::SecretWatcher;
@@ -152,6 +154,20 @@ pub struct Args {
     /// (log-only would-deny) or `enforce` (RESOURCE_EXHAUSTED over budget).
     #[arg(long, env = "KONFIG_DEFAULT_MAX_SUBSCRIBERS", default_value = "0")]
     pub default_max_subscribers: u32,
+
+    /// Default per-tenant Apply refill rate in tokens/second when no
+    /// `TenantQuota` matches the caller identity (CU-86aj8pvf1, MT-3). `0` (the
+    /// default) means unlimited. A matching `TenantQuota.maxAppliesPerSecond`
+    /// overrides this once the quota watcher has synced; until then this flag
+    /// applies (boot-window fail-safe). Burst capacity derives from the rate
+    /// (one second of tokens) — there is no separate burst flag. Only enforced
+    /// when `KONFIG_TENANT_QUOTA_MODE` is `permissive` or `enforce`.
+    #[arg(
+        long,
+        env = "KONFIG_DEFAULT_MAX_APPLIES_PER_SECOND",
+        default_value = "0"
+    )]
+    pub default_max_applies_per_second: u32,
 }
 
 /// Resolve a `ServerTlsConfig` from the TLS-related fields on `args`, or
@@ -301,6 +317,9 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // here so both the gRPC service and the RAII guard attached to every
     // Subscribe / SubscribeSecrets stream share one accounting table.
     let subscriber_counts = Arc::new(SubscriberCounts::new());
+    // Per-identity Apply token bucket (CU-86aj8pvf1, MT-3). Shared with the gRPC
+    // service's apply rate-limit guard.
+    let apply_limiter = Arc::new(ApplyLimiter::new());
     info!(
         ?quota_mode,
         "TenantQuota watcher: enforcement mode resolved"
@@ -435,6 +454,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         quota_synced,
         subscriber_counts,
         default_max_subscribers: args.default_max_subscribers,
+        apply_limiter,
+        default_max_applies_per_second: args.default_max_applies_per_second,
     })
     .await?;
 
@@ -565,6 +586,7 @@ mod tests {
             coalesce_window_ms: 0,
             broadcast_shards: 1,
             default_max_subscribers: 0,
+            default_max_applies_per_second: 0,
         }
     }
 

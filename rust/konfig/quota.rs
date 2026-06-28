@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -653,6 +654,189 @@ impl<S> std::fmt::Debug for GuardedStream<S> {
     }
 }
 
+// ── Apply rate-limit (MT-3, CU-86aj8pvf1) ──────────────────────────────
+
+/// Resolve the apply token-bucket `(refill_per_sec, burst_capacity)` for
+/// `identity`. A `rate` of `0` means **unlimited** — the caller skips the
+/// bucket entirely.
+///
+/// Per-tenant `TenantQuota` values are trusted only once the watcher has synced
+/// (the boot-window fail-safe, mirroring authz); until then, and whenever no
+/// quota names the identity, the `--default-max-applies-per-second` flag
+/// applies. A synced quota that names the identity wins even at `0` (explicit
+/// "unlimited for this tenant"). When the bucket is active but no explicit
+/// burst is set, capacity defaults to one second of tokens (`rate`, min 1) —
+/// there is deliberately no `--default-max-applies-burst` flag
+/// (see docs/multi-tenancy.md).
+pub fn effective_apply_rate(
+    table: &QuotaTable,
+    synced: bool,
+    default_rate: u32,
+    identity: &str,
+) -> (u32, u32) {
+    let (rate, burst) = if synced {
+        match table.quota_for(identity) {
+            Some(q) => (q.max_applies_per_second, q.max_applies_burst),
+            None => (default_rate, 0),
+        }
+    } else {
+        (default_rate, 0)
+    };
+    if rate == 0 {
+        return (0, 0); // unlimited — caller short-circuits before the bucket
+    }
+    let burst = if burst > 0 { burst } else { rate.max(1) };
+    (rate, burst)
+}
+
+/// Per-identity token bucket for the `Apply` path (CU-86aj8pvf1, MT-3) —
+/// runtime state, *not* from the CRD. Refill rate = `maxAppliesPerSecond`,
+/// capacity = `maxAppliesBurst`; an empty bucket denies in `enforce`. A
+/// `DashMap` makes the per-key refill-and-take atomic without a global lock. A
+/// fresh identity starts with a full bucket so an initial burst is allowed.
+#[derive(Debug, Default)]
+pub struct ApplyLimiter {
+    inner: DashMap<String, Bucket>,
+}
+
+#[derive(Debug)]
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+}
+
+/// Outcome of an apply admission, returned by [`ApplyLimiter::admit`].
+pub enum ApplyDecision {
+    /// Allowed. In `Permissive`, `over_budget` is `true` when the bucket was
+    /// empty (a would-deny in `Enforce`); the caller logs + bumps the
+    /// would-deny metric.
+    Allowed { over_budget: bool },
+    /// Denied (`Enforce`, empty bucket). Caller returns `RESOURCE_EXHAUSTED`.
+    Denied,
+}
+
+impl ApplyLimiter {
+    pub fn new() -> Self {
+        Self {
+            inner: DashMap::new(),
+        }
+    }
+
+    /// Refill `identity`'s bucket by `elapsed * rate` (capped at `burst`) as of
+    /// `now`, then take `cost` tokens if available. Returns `true` iff the take
+    /// succeeded. Assumes `rate > 0` (unlimited is handled before here).
+    fn try_acquire_at(
+        &self,
+        identity: &str,
+        rate: u32,
+        burst: u32,
+        cost: u32,
+        now: Instant,
+    ) -> bool {
+        let cap = f64::from(burst);
+        let mut e = self
+            .inner
+            .entry(identity.to_string())
+            .or_insert_with(|| Bucket {
+                tokens: cap,
+                last: now,
+            });
+        let elapsed = now.saturating_duration_since(e.last).as_secs_f64();
+        e.tokens = (e.tokens + elapsed * f64::from(rate)).min(cap);
+        e.last = now;
+        let cost = f64::from(cost);
+        if e.tokens >= cost {
+            e.tokens -= cost;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn admit_at(
+        &self,
+        identity: &str,
+        mode: QuotaMode,
+        rate: u32,
+        burst: u32,
+        cost: u32,
+        now: Instant,
+    ) -> ApplyDecision {
+        let ok = self.try_acquire_at(identity, rate, burst, cost, now);
+        match mode {
+            QuotaMode::Enforce => {
+                if ok {
+                    ApplyDecision::Allowed { over_budget: false }
+                } else {
+                    ApplyDecision::Denied
+                }
+            }
+            // Permissive (and the defensive Disabled path) always allow but
+            // still drain the bucket, so the would-deny signal reflects real
+            // traffic and operators can size budgets before flipping to enforce.
+            QuotaMode::Permissive | QuotaMode::Disabled => {
+                ApplyDecision::Allowed { over_budget: !ok }
+            }
+        }
+    }
+
+    /// Mode-aware admission for `cost` apply tokens from `identity` under a
+    /// resolved `(rate, burst)`. `rate == 0` (unlimited) is handled by the
+    /// caller before reaching here.
+    pub fn admit(
+        &self,
+        identity: &str,
+        mode: QuotaMode,
+        rate: u32,
+        burst: u32,
+        cost: u32,
+    ) -> ApplyDecision {
+        self.admit_at(identity, mode, rate, burst, cost, Instant::now())
+    }
+}
+
+/// What the apply rate-limit guard should *do* for one request — the pure
+/// decision, with the metric/log side effects and `RESOURCE_EXHAUSTED` mapping
+/// left to the caller (CU-86aj8pvf1, MT-3). Keeping this here makes the policy
+/// (mode short-circuit → resolve → bucket) unit-testable without a gRPC
+/// request, so the thin `KonfigServer::rate_limit_apply` glue stays low-risk.
+pub enum ApplyOutcome {
+    /// Allow with nothing to record (quotas off, unlimited rate, or within
+    /// budget).
+    Allowed,
+    /// Allow but the bucket was empty under `Permissive` — record a would-deny.
+    OverBudget { rate: u32, burst: u32 },
+    /// Deny under `Enforce` — return `RESOURCE_EXHAUSTED`.
+    Denied { rate: u32, burst: u32 },
+}
+
+/// Resolve and apply the per-tenant apply rate-limit policy for `identity`,
+/// consuming `cost` tokens from `limiter`. Short-circuits to `Allowed` when
+/// quotas are `Disabled` or the resolved rate is `0` (unlimited); otherwise
+/// drains the bucket and maps the [`ApplyDecision`] to an [`ApplyOutcome`].
+pub fn apply_admission(
+    limiter: &ApplyLimiter,
+    table: &QuotaTable,
+    synced: bool,
+    mode: QuotaMode,
+    default_rate: u32,
+    identity: &str,
+    cost: u32,
+) -> ApplyOutcome {
+    if mode == QuotaMode::Disabled {
+        return ApplyOutcome::Allowed;
+    }
+    let (rate, burst) = effective_apply_rate(table, synced, default_rate, identity);
+    if rate == 0 {
+        return ApplyOutcome::Allowed; // unlimited for this identity
+    }
+    match limiter.admit(identity, mode, rate, burst, cost) {
+        ApplyDecision::Allowed { over_budget: false } => ApplyOutcome::Allowed,
+        ApplyDecision::Allowed { over_budget: true } => ApplyOutcome::OverBudget { rate, burst },
+        ApplyDecision::Denied => ApplyOutcome::Denied { rate, burst },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,5 +1177,166 @@ mod tests {
         drop(g);
         // Back to zero — the map entry is reaped so idle tenants do not leak.
         assert_eq!(counts.current("mt2-reap"), 0);
+    }
+
+    // ── Apply rate-limit (MT-3) ────────────────────────────────────────
+
+    #[test]
+    fn apply_rate_uses_synced_quota() {
+        let table = QuotaTable::new();
+        let mut m = Inner::new();
+        m.insert(
+            "svc-a".to_string(),
+            TenantQuota {
+                max_subscribers: 0,
+                max_applies_per_second: 50,
+                max_applies_burst: 100,
+                cache_memory_budget_bytes: 0,
+            },
+        );
+        table.replace_for_test(m);
+        assert_eq!(effective_apply_rate(&table, true, 5, "svc-a"), (50, 100));
+    }
+
+    #[test]
+    fn apply_rate_falls_back_to_default_and_derives_burst() {
+        let table = QuotaTable::new();
+        // No quota names "svc-x" → default rate applies; burst derives to 1s of
+        // tokens (= rate) because there is no burst flag.
+        assert_eq!(effective_apply_rate(&table, true, 25, "svc-x"), (25, 25));
+    }
+
+    #[test]
+    fn apply_rate_unsynced_ignores_quota() {
+        let table = QuotaTable::new();
+        let mut m = Inner::new();
+        m.insert(
+            "svc-a".to_string(),
+            TenantQuota {
+                max_subscribers: 0,
+                max_applies_per_second: 50,
+                max_applies_burst: 100,
+                cache_memory_budget_bytes: 0,
+            },
+        );
+        table.replace_for_test(m);
+        // Un-synced → never trust the CRD; the flag default applies.
+        assert_eq!(effective_apply_rate(&table, false, 9, "svc-a"), (9, 9));
+    }
+
+    #[test]
+    fn apply_rate_zero_is_unlimited() {
+        let table = QuotaTable::new();
+        // Default rate 0 → unlimited → (0, 0); caller skips the bucket.
+        assert_eq!(effective_apply_rate(&table, true, 0, "svc-x"), (0, 0));
+    }
+
+    #[test]
+    fn token_bucket_drains_then_refills() {
+        let lim = ApplyLimiter::new();
+        let t0 = Instant::now();
+        // Fresh bucket starts full (burst = 3): three takes succeed, fourth fails.
+        for _ in 0..3 {
+            assert!(lim.try_acquire_at("svc-a", 10, 3, 1, t0));
+        }
+        assert!(!lim.try_acquire_at("svc-a", 10, 3, 1, t0));
+        // 0.1s later at rate 10/s → +1 token → one more take, then empty again.
+        let t1 = t0 + std::time::Duration::from_millis(100);
+        assert!(lim.try_acquire_at("svc-a", 10, 3, 1, t1));
+        assert!(!lim.try_acquire_at("svc-a", 10, 3, 1, t1));
+    }
+
+    #[test]
+    fn token_bucket_caps_at_burst() {
+        let lim = ApplyLimiter::new();
+        let t0 = Instant::now();
+        assert!(lim.try_acquire_at("svc-a", 10, 2, 1, t0));
+        // Idle a long time → refill must cap at burst (2), not accumulate to 10.
+        let t1 = t0 + std::time::Duration::from_secs(100);
+        assert!(lim.try_acquire_at("svc-a", 10, 2, 1, t1));
+        assert!(lim.try_acquire_at("svc-a", 10, 2, 1, t1));
+        assert!(!lim.try_acquire_at("svc-a", 10, 2, 1, t1));
+    }
+
+    #[test]
+    fn batch_cost_consumes_multiple_tokens() {
+        let lim = ApplyLimiter::new();
+        let t0 = Instant::now();
+        // Burst 5: a batch of 4 succeeds, leaving 1; a second batch of 4 fails.
+        assert!(lim.try_acquire_at("svc-a", 1, 5, 4, t0));
+        assert!(!lim.try_acquire_at("svc-a", 1, 5, 4, t0));
+        // A single token is still available.
+        assert!(lim.try_acquire_at("svc-a", 1, 5, 1, t0));
+    }
+
+    #[test]
+    fn enforce_denies_empty_permissive_flags_it() {
+        let lim = ApplyLimiter::new();
+        let t0 = Instant::now();
+        // Drain the single-token bucket.
+        assert!(matches!(
+            lim.admit_at("svc-a", QuotaMode::Enforce, 1, 1, 1, t0),
+            ApplyDecision::Allowed { over_budget: false }
+        ));
+        // Enforce: empty → denied.
+        assert!(matches!(
+            lim.admit_at("svc-a", QuotaMode::Enforce, 1, 1, 1, t0),
+            ApplyDecision::Denied
+        ));
+        // Permissive on a separate identity: empty → allowed but flagged.
+        assert!(matches!(
+            lim.admit_at("svc-b", QuotaMode::Permissive, 1, 1, 1, t0),
+            ApplyDecision::Allowed { over_budget: false }
+        ));
+        assert!(matches!(
+            lim.admit_at("svc-b", QuotaMode::Permissive, 1, 1, 1, t0),
+            ApplyDecision::Allowed { over_budget: true }
+        ));
+    }
+
+    #[test]
+    fn apply_admission_disabled_and_unlimited_short_circuit() {
+        let lim = ApplyLimiter::new();
+        let table = QuotaTable::new();
+        // Disabled mode: never touches the bucket.
+        assert!(matches!(
+            apply_admission(&lim, &table, true, QuotaMode::Disabled, 1, "svc-a", 99),
+            ApplyOutcome::Allowed
+        ));
+        // Enforce but default rate 0 (no quota) ⇒ unlimited ⇒ allowed.
+        assert!(matches!(
+            apply_admission(&lim, &table, true, QuotaMode::Enforce, 0, "svc-a", 99),
+            ApplyOutcome::Allowed
+        ));
+    }
+
+    #[test]
+    fn apply_admission_enforce_denies_when_drained() {
+        let lim = ApplyLimiter::new();
+        let table = QuotaTable::new();
+        // Default rate 1, burst derives to 1: first apply allowed, second denied
+        // (sub-millisecond refill ≪ 1 token).
+        assert!(matches!(
+            apply_admission(&lim, &table, true, QuotaMode::Enforce, 1, "svc-a", 1),
+            ApplyOutcome::Allowed
+        ));
+        assert!(matches!(
+            apply_admission(&lim, &table, true, QuotaMode::Enforce, 1, "svc-a", 1),
+            ApplyOutcome::Denied { rate: 1, burst: 1 }
+        ));
+    }
+
+    #[test]
+    fn apply_admission_permissive_flags_over_budget() {
+        let lim = ApplyLimiter::new();
+        let table = QuotaTable::new();
+        assert!(matches!(
+            apply_admission(&lim, &table, true, QuotaMode::Permissive, 1, "svc-a", 1),
+            ApplyOutcome::Allowed
+        ));
+        assert!(matches!(
+            apply_admission(&lim, &table, true, QuotaMode::Permissive, 1, "svc-a", 1),
+            ApplyOutcome::OverBudget { rate: 1, burst: 1 }
+        ));
     }
 }
