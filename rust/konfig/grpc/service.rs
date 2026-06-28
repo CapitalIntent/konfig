@@ -3,6 +3,10 @@
 
 use super::*;
 
+use crate::tenant_cache::{
+    AccountedStream, config_cost, config_event_cost, secret_cost, secret_event_cost,
+};
+
 #[tonic::async_trait]
 impl KonfigService for KonfigServer {
     // ── OTEL root spans + entry logging ─────────────────────────────────────
@@ -39,10 +43,16 @@ impl KonfigService for KonfigServer {
             &request.get_ref().namespace,
             &request.get_ref().name,
         )?;
-        record_status(get::handle_get(Arc::clone(&self.cache), request.into_inner()).await)
+        // CU-86aj8pvg3 (MT-4): attribute the served Config's bytes to the tenant.
+        let acct = self.cache_accountant(&request, "config");
+        let result = get::handle_get(Arc::clone(&self.cache), request.into_inner()).await;
+        if let (Some(acct), Ok(resp)) = (&acct, &result) {
+            acct.record_cost(config_cost(resp.get_ref()));
+        }
+        record_status(result)
     }
 
-    type GetAllStream = ReceiverStream<Result<Config, Status>>;
+    type GetAllStream = AccountedStream<ReceiverStream<Result<Config, Status>>, Config>;
 
     #[tracing::instrument(
         name = "konfig.GetAll",
@@ -62,7 +72,16 @@ impl KonfigService for KonfigServer {
         check_drain(&self.draining)?;
         // Name-less RPC: require `read` across the whole namespace ("*").
         self.authorize(&request, Verb::Read, &request.get_ref().namespace, "*")?;
-        record_status(get::handle_get_all(Arc::clone(&self.cache), request.into_inner()).await)
+        // CU-86aj8pvg3 (MT-4): wrap the stream so every served Config is
+        // attributed to the tenant as it is delivered.
+        let acct = self.cache_accountant(&request, "config");
+        record_status(
+            get::handle_get_all(Arc::clone(&self.cache), request.into_inner())
+                .await
+                .map(|resp| {
+                    Response::new(AccountedStream::new(resp.into_inner(), acct, config_cost))
+                }),
+        )
     }
 
     #[tracing::instrument(
@@ -299,7 +318,8 @@ impl KonfigService for KonfigServer {
         record_status(result)
     }
 
-    type SubscribeStream = GuardedStream<ReceiverStream<Result<ConfigEvent, Status>>>;
+    type SubscribeStream =
+        GuardedStream<AccountedStream<ReceiverStream<Result<ConfigEvent, Status>>, ConfigEvent>>;
 
     #[tracing::instrument(
         name = "konfig.Subscribe",
@@ -323,6 +343,9 @@ impl KonfigService for KonfigServer {
         // over budget. The guard rides the response stream and releases the
         // slot when the client disconnects or the server drains.
         let guard = self.admit_subscriber(&request)?;
+        // CU-86aj8pvg3 (MT-4): account every event (replay + live) delivered to
+        // this subscriber by wrapping its stream; the fan-out itself is untouched.
+        let acct = self.cache_accountant(&request, "config");
         record_status(
             subscribe::handle_subscribe(
                 Arc::clone(&self.cache),
@@ -336,7 +359,12 @@ impl KonfigService for KonfigServer {
                 request.into_inner(),
             )
             .await
-            .map(|resp| Response::new(GuardedStream::new(resp.into_inner(), guard))),
+            .map(|resp| {
+                Response::new(GuardedStream::new(
+                    AccountedStream::new(resp.into_inner(), acct, config_event_cost),
+                    guard,
+                ))
+            }),
         )
     }
 
@@ -364,13 +392,19 @@ impl KonfigService for KonfigServer {
             &request.get_ref().namespace,
             &request.get_ref().name,
         )?;
-        record_status(
+        // CU-86aj8pvg3 (MT-4): attribute the served secret's bytes to the tenant.
+        let acct = self.cache_accountant(&request, "secret");
+        let result =
             secret_get::handle_get_secret(Arc::clone(&self.secret_cache), request.into_inner())
-                .await,
-        )
+                .await;
+        if let (Some(acct), Ok(resp)) = (&acct, &result) {
+            acct.record_cost(secret_cost(resp.get_ref()));
+        }
+        record_status(result)
     }
 
-    type GetAllSecretsStream = ReceiverStream<Result<SecretResponse, Status>>;
+    type GetAllSecretsStream =
+        AccountedStream<ReceiverStream<Result<SecretResponse, Status>>, SecretResponse>;
 
     #[tracing::instrument(
         name = "konfig.GetAllSecrets",
@@ -390,12 +424,16 @@ impl KonfigService for KonfigServer {
         check_drain(&self.draining)?;
         // Name-less RPC: require `read` across the whole namespace ("*").
         self.authorize(&request, Verb::Read, &request.get_ref().namespace, "*")?;
+        // CU-86aj8pvg3 (MT-4): wrap the stream so every served secret is
+        // attributed to the tenant as it is delivered.
+        let acct = self.cache_accountant(&request, "secret");
         record_status(
             secret_get::handle_get_all_secrets(
                 Arc::clone(&self.secret_cache),
                 request.into_inner(),
             )
-            .await,
+            .await
+            .map(|resp| Response::new(AccountedStream::new(resp.into_inner(), acct, secret_cost))),
         )
     }
 
@@ -452,7 +490,8 @@ impl KonfigService for KonfigServer {
         record_status(result)
     }
 
-    type SubscribeSecretsStream = GuardedStream<ReceiverStream<Result<SecretEvent, Status>>>;
+    type SubscribeSecretsStream =
+        GuardedStream<AccountedStream<ReceiverStream<Result<SecretEvent, Status>>, SecretEvent>>;
 
     #[tracing::instrument(
         name = "konfig.SubscribeSecrets",
@@ -475,6 +514,9 @@ impl KonfigService for KonfigServer {
         // Per-tenant subscriber quota (CU-86aj8pvdb, MT-2): SubscribeSecrets
         // counts against the same per-identity budget as Subscribe.
         let guard = self.admit_subscriber(&request)?;
+        // CU-86aj8pvg3 (MT-4): account every secret event (replay + live)
+        // delivered to this subscriber by wrapping its stream.
+        let acct = self.cache_accountant(&request, "secret");
         record_status(
             subscribe_secrets::handle_subscribe_secrets(
                 self.kube_client.clone(),
@@ -484,7 +526,12 @@ impl KonfigService for KonfigServer {
                 request.into_inner(),
             )
             .await
-            .map(|resp| Response::new(GuardedStream::new(resp.into_inner(), guard))),
+            .map(|resp| {
+                Response::new(GuardedStream::new(
+                    AccountedStream::new(resp.into_inner(), acct, secret_event_cost),
+                    guard,
+                ))
+            }),
         )
     }
 }

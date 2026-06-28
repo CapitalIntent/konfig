@@ -60,10 +60,12 @@ use crate::proto::{
 };
 use crate::quota::{
     Admit, ApplyLimiter, ApplyOutcome, GuardedStream, QuotaMode, QuotaSynced, QuotaTable,
-    SubscriberCounts, SubscriberGuard, apply_admission, effective_subscriber_limit,
+    SubscriberCounts, SubscriberGuard, apply_admission, effective_cache_budget,
+    effective_subscriber_limit,
 };
 use crate::schema::SchemaTable;
 use crate::secret_cache::SecretCache;
+use crate::tenant_cache::{CacheAccountant, TenantCacheLedger};
 
 mod context;
 mod drain;
@@ -177,6 +179,12 @@ pub struct ServerConfig {
     /// names the identity (MT-3, `--default-max-applies-per-second`). `0` =
     /// unlimited. Burst capacity derives from the rate (no burst flag).
     pub default_max_applies_per_second: u32,
+    /// Per-identity cache byte ledger (CU-86aj8pvg3, MT-4). Shared runtime
+    /// state read by the serve-time cache accountant.
+    pub cache_ledger: Arc<TenantCacheLedger>,
+    /// Default per-tenant cache byte budget when no `TenantQuota` names the
+    /// identity (MT-4, `--default-cache-budget-bytes`). `0` = unlimited.
+    pub default_cache_budget_bytes: u64,
 }
 
 /// Type-erased shutdown future.  Boxed so the field doesn't push a generic
@@ -256,6 +264,11 @@ pub struct KonfigServer {
     /// Default Apply refill rate (tokens/sec) when no `TenantQuota` names the
     /// caller (`--default-max-applies-per-second`). `0` = unlimited.
     pub(crate) default_max_applies_per_second: u32,
+    /// Per-identity cache byte ledger read by [`Self::cache_accountant`].
+    pub(crate) cache_ledger: Arc<TenantCacheLedger>,
+    /// Default per-tenant cache byte budget when no `TenantQuota` names the
+    /// caller (`--default-cache-budget-bytes`). `0` = unlimited.
+    pub(crate) default_cache_budget_bytes: u64,
 }
 
 impl KonfigServer {
@@ -439,6 +452,35 @@ impl KonfigServer {
                 )))
             }
         }
+    }
+
+    /// Build a per-RPC cache accountant for `kind` (`"config"` | `"secret"`),
+    /// or `None` when quotas are `Disabled` (zero serve-time overhead). Resolves
+    /// the caller identity + effective `cacheMemoryBudgetBytes` once at RPC
+    /// start; the returned accountant rides the response stream and attributes
+    /// every delivered entry (CU-86aj8pvg3, MT-4).
+    fn cache_accountant<T>(
+        &self,
+        request: &Request<T>,
+        kind: &'static str,
+    ) -> Option<CacheAccountant> {
+        if self.quota_mode == QuotaMode::Disabled {
+            return None;
+        }
+        let identity = identity::extract_identity(request).id;
+        let budget = effective_cache_budget(
+            &self.quota_table,
+            self.quota_synced.is_synced(),
+            self.default_cache_budget_bytes,
+            &identity,
+        );
+        Some(CacheAccountant::new(
+            Arc::clone(&self.cache_ledger),
+            identity,
+            self.quota_mode,
+            budget,
+            kind,
+        ))
     }
 }
 
@@ -1010,6 +1052,8 @@ mod tests {
             default_max_subscribers: 0,
             apply_limiter: Arc::new(ApplyLimiter::new()),
             default_max_applies_per_second: 0,
+            cache_ledger: Arc::new(TenantCacheLedger::new()),
+            default_cache_budget_bytes: 0,
         }
     }
 

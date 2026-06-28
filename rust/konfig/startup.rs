@@ -43,6 +43,7 @@ use crate::quota::{
 use crate::schema::{SchemaSynced, SchemaTable, SchemaWatcher};
 use crate::secret_cache::SecretCache;
 use crate::secret_watcher::SecretWatcher;
+use crate::tenant_cache::TenantCacheLedger;
 use crate::types::ConfigSnapshot;
 use crate::watcher::{Watcher, run_with_reconnect};
 
@@ -168,6 +169,15 @@ pub struct Args {
         default_value = "0"
     )]
     pub default_max_applies_per_second: u32,
+
+    /// Default per-tenant cache byte budget when no `TenantQuota` matches the
+    /// caller identity (CU-86aj8pvg3, MT-4). `0` (the default) means unlimited.
+    /// A matching `TenantQuota.cacheMemoryBudgetBytes` overrides this once the
+    /// quota watcher has synced; until then this flag applies (boot fail-safe).
+    /// Only accounted/enforced when `KONFIG_TENANT_QUOTA_MODE` is `permissive`
+    /// or `enforce`.
+    #[arg(long, env = "KONFIG_DEFAULT_CACHE_BUDGET_BYTES", default_value = "0")]
+    pub default_cache_budget_bytes: u64,
 }
 
 /// Resolve a `ServerTlsConfig` from the TLS-related fields on `args`, or
@@ -320,6 +330,9 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Per-identity Apply token bucket (CU-86aj8pvf1, MT-3). Shared with the gRPC
     // service's apply rate-limit guard.
     let apply_limiter = Arc::new(ApplyLimiter::new());
+    // Per-identity cache byte ledger (CU-86aj8pvg3, MT-4). Shared with the gRPC
+    // service's serve-time cache accountant.
+    let cache_ledger = Arc::new(TenantCacheLedger::new());
     info!(
         ?quota_mode,
         "TenantQuota watcher: enforcement mode resolved"
@@ -456,6 +469,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         default_max_subscribers: args.default_max_subscribers,
         apply_limiter,
         default_max_applies_per_second: args.default_max_applies_per_second,
+        cache_ledger,
+        default_cache_budget_bytes: args.default_cache_budget_bytes,
     })
     .await?;
 
@@ -587,6 +602,7 @@ mod tests {
             broadcast_shards: 1,
             default_max_subscribers: 0,
             default_max_applies_per_second: 0,
+            default_cache_budget_bytes: 0,
         }
     }
 

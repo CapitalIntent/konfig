@@ -356,6 +356,26 @@ lazy_static::lazy_static! {
         "Per-tenant quota denials by rpc and enforcement mode",
         &["rpc", "mode"]
     ).expect("failed to register konfig_tenant_quota_denied_total");
+
+    /// Attributed cached payload bytes per tenant identity (CU-86aj8pvg3,
+    /// MT-4): the sum of the distinct config + secret entries the tenant has
+    /// been served, each at its latest size. A per-tenant working-set gauge
+    /// operators size `cacheMemoryBudgetBytes` against.
+    pub static ref TENANT_CACHE_BYTES: GaugeVec = register_gauge_vec!(
+        "konfig_tenant_cache_bytes",
+        "Attributed cached payload bytes per tenant identity",
+        &["identity"]
+    ).expect("failed to register konfig_tenant_cache_bytes");
+
+    /// Per-tenant cache-view evictions (CU-86aj8pvg3, MT-4): least-recently-
+    /// served entries dropped from a tenant's view when it breaches its budget
+    /// under `enforce`. A sustained non-zero rate means the tenant is over
+    /// budget — the back-pressure signal.
+    pub static ref TENANT_CACHE_EVICTIONS_TOTAL: CounterVec = register_counter_vec!(
+        "konfig_tenant_cache_evictions_total",
+        "Per-tenant cache-view evictions on budget breach",
+        &["identity"]
+    ).expect("failed to register konfig_tenant_cache_evictions_total");
 }
 
 /// Spawn the background tokio runtime-metrics sampler.
@@ -433,6 +453,20 @@ pub fn record_tenant_quota_denied(rpc: &str, mode: &str) {
     TENANT_QUOTA_DENIED_TOTAL
         .with_label_values(&[rpc, mode])
         .inc();
+}
+
+/// Set `identity`'s attributed cache-byte gauge (CU-86aj8pvg3, MT-4).
+pub fn set_tenant_cache_bytes(identity: &str, bytes: usize) {
+    TENANT_CACHE_BYTES
+        .with_label_values(&[identity])
+        .set(bytes as f64);
+}
+
+/// Record `n` cache-view evictions for `identity` (CU-86aj8pvg3, MT-4).
+pub fn record_tenant_cache_evictions(identity: &str, n: u64) {
+    TENANT_CACHE_EVICTIONS_TOTAL
+        .with_label_values(&[identity])
+        .inc_by(n as f64);
 }
 
 // ── Last-event-at tracking ────────────────────────────────────────────────────

@@ -154,6 +154,8 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         default_max_subscribers: cfg.default_max_subscribers,
         apply_limiter: cfg.apply_limiter,
         default_max_applies_per_second: cfg.default_max_applies_per_second,
+        cache_ledger: cfg.cache_ledger,
+        default_cache_budget_bytes: cfg.default_cache_budget_bytes,
     };
     let svc = KonfigServiceServer::new(server);
 

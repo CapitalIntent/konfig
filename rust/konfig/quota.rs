@@ -689,6 +689,28 @@ pub fn effective_apply_rate(
     (rate, burst)
 }
 
+/// Resolve the per-tenant cache byte budget for `identity` (CU-86aj8pvg3,
+/// MT-4). `0` means **unlimited** (never evict). Mirrors
+/// [`effective_subscriber_limit`]: a synced `TenantQuota` that names the
+/// identity wins (even at `0`, an explicit "unlimited for this tenant");
+/// otherwise — and during the un-synced boot window (fail-safe) — the
+/// `--default-cache-budget-bytes` flag applies.
+pub fn effective_cache_budget(
+    table: &QuotaTable,
+    synced: bool,
+    default_budget: u64,
+    identity: &str,
+) -> u64 {
+    if synced {
+        match table.quota_for(identity) {
+            Some(q) => q.cache_memory_budget_bytes,
+            None => default_budget,
+        }
+    } else {
+        default_budget
+    }
+}
+
 /// Per-identity token bucket for the `Apply` path (CU-86aj8pvf1, MT-3) —
 /// runtime state, *not* from the CRD. Refill rate = `maxAppliesPerSecond`,
 /// capacity = `maxAppliesBurst`; an empty bucket denies in `enforce`. A
@@ -1082,6 +1104,37 @@ mod tests {
         // A synced quota with maxSubscribers:0 means unlimited for that tenant,
         // overriding even a non-zero flag default.
         assert_eq!(effective_subscriber_limit(&table, true, 5, "svc-a"), 0);
+    }
+
+    fn quota_with_budget(cache_memory_budget_bytes: u64) -> TenantQuota {
+        TenantQuota {
+            max_subscribers: 0,
+            max_applies_per_second: 0,
+            max_applies_burst: 0,
+            cache_memory_budget_bytes,
+        }
+    }
+
+    #[test]
+    fn effective_cache_budget_uses_synced_quota_over_default() {
+        let table = table_with("svc-a", quota_with_budget(1024));
+        // synced + matching quota → quota wins over the flag default.
+        assert_eq!(effective_cache_budget(&table, true, 4096, "svc-a"), 1024);
+    }
+
+    #[test]
+    fn effective_cache_budget_falls_back_to_default_when_no_quota() {
+        let table = table_with("svc-a", quota_with_budget(1024));
+        // synced but no quota names "svc-b" → flag default applies.
+        assert_eq!(effective_cache_budget(&table, true, 4096, "svc-b"), 4096);
+    }
+
+    #[test]
+    fn effective_cache_budget_ignores_quota_until_synced() {
+        let table = table_with("svc-a", quota_with_budget(1024));
+        // un-synced → never trust the CRD value; the flag default applies
+        // (boot fail-safe — a stale/empty table cannot shrink a tenant's view).
+        assert_eq!(effective_cache_budget(&table, false, 4096, "svc-a"), 4096);
     }
 
     #[test]
