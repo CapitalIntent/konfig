@@ -336,6 +336,26 @@ lazy_static::lazy_static! {
         "tokio_io_driver_ready_total",
         "I/O driver readiness events processed in the last interval"
     ).expect("register tokio_io_driver_ready_total");
+
+    /// Live concurrent Subscribe + SubscribeSecrets streams per tenant identity
+    /// (CU-86aj8pvdb, MT-2). Incremented when a stream opens, decremented (RAII)
+    /// when it closes; the series is cleared at zero so idle tenants do not leak
+    /// cardinality. `identity` is the mTLS client identity (ADR-0002).
+    pub static ref TENANT_SUBSCRIBERS: GaugeVec = register_gauge_vec!(
+        "konfig_tenant_subscribers",
+        "Live concurrent Subscribe/SubscribeSecrets streams per tenant identity",
+        &["identity"]
+    ).expect("failed to register konfig_tenant_subscribers");
+
+    /// Per-tenant quota denials (CU-86aj8pvdb, MT-2). `rpc` is the limited RPC
+    /// (e.g. `subscribe`); `mode` is `permissive` (would-deny, allowed) or
+    /// `enforce` (RESOURCE_EXHAUSTED returned). Identity is intentionally NOT a
+    /// label here — denials are aggregated by rpc+mode to bound cardinality.
+    pub static ref TENANT_QUOTA_DENIED_TOTAL: CounterVec = register_counter_vec!(
+        "konfig_tenant_quota_denied_total",
+        "Per-tenant quota denials by rpc and enforcement mode",
+        &["rpc", "mode"]
+    ).expect("failed to register konfig_tenant_quota_denied_total");
 }
 
 /// Spawn the background tokio runtime-metrics sampler.
@@ -390,6 +410,29 @@ impl Drop for SubGauge {
     fn drop(&mut self) {
         ACTIVE_SUBSCRIBERS.with_label_values(&[&self.0]).dec();
     }
+}
+
+/// Set the live concurrent-subscriber gauge for `identity` (CU-86aj8pvdb).
+pub fn set_tenant_subscribers(identity: &str, n: u32) {
+    TENANT_SUBSCRIBERS
+        .with_label_values(&[identity])
+        .set(f64::from(n));
+}
+
+/// Remove `identity`'s subscriber series once it drops to zero, so the gauge
+/// does not retain one zero-valued series per tenant that ever connected.
+pub fn clear_tenant_subscribers(identity: &str) {
+    // Err only when the label set was never observed — a no-op for us.
+    let _ = TENANT_SUBSCRIBERS.remove_label_values(&[identity]);
+}
+
+/// Record one per-tenant quota denial for `rpc` under enforcement `mode`
+/// (`permissive` would-deny, or `enforce` actual deny). See
+/// [`TENANT_QUOTA_DENIED_TOTAL`].
+pub fn record_tenant_quota_denied(rpc: &str, mode: &str) {
+    TENANT_QUOTA_DENIED_TOTAL
+        .with_label_values(&[rpc, mode])
+        .inc();
 }
 
 // ── Last-event-at tracking ────────────────────────────────────────────────────

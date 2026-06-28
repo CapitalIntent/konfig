@@ -58,6 +58,10 @@ use crate::proto::{
     RevertResponse, SecretEvent, SecretResponse, SubscribeRequest, SubscribeSecretsRequest,
     konfig_service_server::{KonfigService, KonfigServiceServer},
 };
+use crate::quota::{
+    Admit, GuardedStream, QuotaMode, QuotaSynced, QuotaTable, SubscriberCounts, SubscriberGuard,
+    effective_subscriber_limit,
+};
 use crate::schema::SchemaTable;
 use crate::secret_cache::SecretCache;
 
@@ -150,6 +154,22 @@ pub struct ServerConfig {
     /// `Apply` RPC path to validate `content` before patching. Empty registry
     /// (no schema for a key) ⇒ accept anything.
     pub schema_table: Arc<SchemaTable>,
+    /// Per-tenant quota enforcement mode (CU-86aj8pvdb, MT-2). Resolved once
+    /// from `KONFIG_TENANT_QUOTA_MODE` at startup; `Disabled` (the default)
+    /// makes the subscriber-admission guard a zero-overhead short-circuit.
+    pub quota_mode: QuotaMode,
+    /// Lock-free `identity → budget` table populated by the cluster-scoped
+    /// `TenantQuota` watcher (MT-1). Read by the subscriber-admission guard.
+    pub quota_table: Arc<QuotaTable>,
+    /// Initial-sync flag for `quota_table`. Until it flips, the enforce-mode
+    /// guard falls back to the flag default (never denies on un-synced policy).
+    pub quota_synced: Arc<QuotaSynced>,
+    /// Live per-identity concurrent-subscriber counts (MT-2). Shared so the
+    /// RAII guard can decrement on stream end; both stream kinds count here.
+    pub subscriber_counts: Arc<SubscriberCounts>,
+    /// Default per-tenant concurrent-subscriber cap when no `TenantQuota` names
+    /// the identity (MT-2, `--default-max-subscribers`). `0` = unlimited.
+    pub default_max_subscribers: u32,
 }
 
 /// Type-erased shutdown future.  Boxed so the field doesn't push a generic
@@ -210,6 +230,20 @@ pub struct KonfigServer {
     /// (CU-86ahrwd5g). Passed to `apply::handle_apply` so `apply_inner`
     /// validates `content` before patching. No schema for a key ⇒ accept.
     pub(crate) schema_table: Arc<SchemaTable>,
+    /// Per-tenant quota enforcement mode (CU-86aj8pvdb, MT-2). `Disabled`
+    /// short-circuits [`Self::admit_subscriber`] before any accounting.
+    pub(crate) quota_mode: QuotaMode,
+    /// Lock-free `identity → budget` table read by [`Self::admit_subscriber`].
+    pub(crate) quota_table: Arc<QuotaTable>,
+    /// Initial-sync flag for [`Self::quota_table`]; gates the enforce-mode
+    /// fail-safe (fall back to the flag default until synced).
+    pub(crate) quota_synced: Arc<QuotaSynced>,
+    /// Live per-identity concurrent-subscriber counts shared with the RAII
+    /// guard attached to each Subscribe / SubscribeSecrets stream.
+    pub(crate) subscriber_counts: Arc<SubscriberCounts>,
+    /// Default concurrent-subscriber cap when no `TenantQuota` names the caller
+    /// (`--default-max-subscribers`). `0` = unlimited.
+    pub(crate) default_max_subscribers: u32,
 }
 
 impl KonfigServer {
@@ -275,6 +309,65 @@ impl KonfigServer {
             namespace,
             name,
         )
+    }
+
+    /// Per-tenant subscriber admission (CU-86aj8pvdb, MT-2). Called at the top
+    /// of `subscribe` / `subscribe_secrets`, after `authorize`. Returns the RAII
+    /// [`SubscriberGuard`] to attach to the response stream, or
+    /// `RESOURCE_EXHAUSTED` when an `Enforce`-mode caller is over budget.
+    ///
+    /// `None` (no guard, no accounting) when quotas are `Disabled` — the
+    /// default — so the disabled path stays zero-overhead, exactly like
+    /// `authorize`. Both stream kinds share one [`SubscriberCounts`] keyed by
+    /// identity, so a tenant's Subscribe and SubscribeSecrets streams count
+    /// against the one `maxSubscribers` budget.
+    fn admit_subscriber<T>(&self, request: &Request<T>) -> Result<Option<SubscriberGuard>, Status> {
+        if self.quota_mode == QuotaMode::Disabled {
+            return Ok(None);
+        }
+        let identity = identity::extract_identity(request);
+        let limit = effective_subscriber_limit(
+            &self.quota_table,
+            self.quota_synced.is_synced(),
+            self.default_max_subscribers,
+            &identity.id,
+        );
+        match self
+            .subscriber_counts
+            .admit(&identity.id, self.quota_mode, limit)
+        {
+            Admit::Allowed {
+                guard,
+                current,
+                limit,
+                over_budget,
+            } => {
+                if over_budget {
+                    crate::metrics::record_tenant_quota_denied("subscribe", "permissive");
+                    warn!(
+                        identity = %identity.id,
+                        current,
+                        limit,
+                        mode = "permissive",
+                        "tenant subscriber quota would-deny (permissive — allowing)"
+                    );
+                }
+                Ok(Some(guard))
+            }
+            Admit::Denied { current, limit } => {
+                crate::metrics::record_tenant_quota_denied("subscribe", "enforce");
+                warn!(
+                    identity = %identity.id,
+                    current,
+                    limit,
+                    mode = "enforce",
+                    "tenant subscriber quota exhausted — RESOURCE_EXHAUSTED"
+                );
+                Err(Status::resource_exhausted(format!(
+                    "tenant subscriber quota exhausted ({current}/{limit})"
+                )))
+            }
+        }
     }
 }
 
@@ -837,6 +930,13 @@ mod tests {
             acl_table: Arc::new(AclTable::new()),
             acl_synced: Arc::new(AclSynced::new()),
             schema_table: Arc::new(SchemaTable::new()),
+            // Quotas disabled in the drain-plumbing tests — admit_subscriber
+            // short-circuits, so these tests exercise the original path.
+            quota_mode: QuotaMode::Disabled,
+            quota_table: Arc::new(QuotaTable::new()),
+            quota_synced: Arc::new(QuotaSynced::new()),
+            subscriber_counts: Arc::new(SubscriberCounts::new()),
+            default_max_subscribers: 0,
         }
     }
 

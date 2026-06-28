@@ -19,11 +19,14 @@
 //! flag defaults).
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 
 use arc_swap::ArcSwap;
-use futures_util::{StreamExt, TryStreamExt};
+use dashmap::DashMap;
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use kube::api::ApiResource;
 use kube::core::DynamicObject;
 use kube::runtime::watcher::{self as kube_watcher, Event, watcher as kube_watch_stream};
@@ -449,6 +452,207 @@ pub enum WatcherError {
     Watcher(#[from] kube_watcher::Error),
 }
 
+// ── Subscriber accounting (MT-2, CU-86aj8pvdb) ────────────────────────────────
+
+/// Resolve the concurrent-subscriber limit for `identity` (`0` = unlimited).
+///
+/// Per-tenant `TenantQuota.maxSubscribers` is only trusted once the watcher has
+/// completed its initial list (`synced`) — mirroring the authz fail-safe — so
+/// the boot window can never wrongly exhaust a tenant. Until then, and whenever
+/// no quota names the identity, the server-flag `default_max` applies. A synced
+/// quota that names the identity wins even at `0` (an explicit "unlimited for
+/// this tenant", overriding the flag default).
+pub fn effective_subscriber_limit(
+    table: &QuotaTable,
+    synced: bool,
+    default_max: u32,
+    identity: &str,
+) -> u32 {
+    if synced {
+        match table.quota_for(identity) {
+            Some(q) => q.max_subscribers,
+            None => default_max,
+        }
+    } else {
+        default_max
+    }
+}
+
+/// Live per-identity concurrent-subscriber counts — runtime state, *not* from
+/// the CRD. Shared across the `Subscribe` and `SubscribeSecrets` handlers; both
+/// stream kinds count against the one per-tenant `maxSubscribers` budget. A
+/// `DashMap` makes the per-key check-and-increment atomic without a global
+/// lock, and the `konfig_tenant_subscribers` gauge is mirrored on every
+/// admit/release so it always reflects the live count.
+#[derive(Debug, Default)]
+pub struct SubscriberCounts {
+    inner: DashMap<String, u32>,
+}
+
+/// Admission decision returned by [`SubscriberCounts::admit`].
+pub enum Admit {
+    /// Stream allowed — hold `guard` for its lifetime. In `Permissive`,
+    /// `over_budget` is `true` when the limit was exceeded (would-deny, but
+    /// allowed); the caller logs + bumps the would-deny metric.
+    Allowed {
+        guard: SubscriberGuard,
+        current: u32,
+        limit: u32,
+        over_budget: bool,
+    },
+    /// Stream denied (`Enforce`, over budget). Caller returns
+    /// `RESOURCE_EXHAUSTED`.
+    Denied { current: u32, limit: u32 },
+}
+
+impl SubscriberCounts {
+    pub fn new() -> Self {
+        Self {
+            inner: DashMap::new(),
+        }
+    }
+
+    /// Current live stream count for `identity`.
+    pub fn current(&self, identity: &str) -> u32 {
+        self.inner.get(identity).map(|v| *v).unwrap_or(0)
+    }
+
+    /// Decide admission for one new stream from `identity` under `mode` +
+    /// resolved `limit` (`0` = unlimited). `Disabled` callers must short-circuit
+    /// *before* calling — they skip accounting entirely for zero overhead — so
+    /// this only handles `Permissive` / `Enforce`; a defensive `Disabled` call
+    /// is treated as an unbounded allow.
+    pub fn admit(self: &Arc<Self>, identity: &str, mode: QuotaMode, limit: u32) -> Admit {
+        match mode {
+            QuotaMode::Enforce => match self.try_increment(identity, limit) {
+                Ok(current) => Admit::Allowed {
+                    guard: self.guard(identity),
+                    current,
+                    limit,
+                    over_budget: false,
+                },
+                Err(current) => Admit::Denied { current, limit },
+            },
+            // Permissive (and the defensive Disabled path) count unconditionally
+            // so the gauge and the would-deny signal stay accurate over budget.
+            QuotaMode::Permissive | QuotaMode::Disabled => {
+                let current = self.increment_unchecked(identity);
+                let over_budget = mode == QuotaMode::Permissive && limit != 0 && current > limit;
+                Admit::Allowed {
+                    guard: self.guard(identity),
+                    current,
+                    limit,
+                    over_budget,
+                }
+            }
+        }
+    }
+
+    /// Atomically admit iff under `limit` (`0` = unlimited). `Ok(new_count)` on
+    /// success, `Err(current)` on breach (no increment). The per-key DashMap
+    /// entry lock makes the check-and-increment race-free across handlers.
+    fn try_increment(&self, identity: &str, limit: u32) -> Result<u32, u32> {
+        let mut e = self.inner.entry(identity.to_string()).or_insert(0);
+        if limit != 0 && *e >= limit {
+            return Err(*e);
+        }
+        *e += 1;
+        let n = *e;
+        drop(e);
+        crate::metrics::set_tenant_subscribers(identity, n);
+        Ok(n)
+    }
+
+    /// Unconditionally admit one stream. Returns the new count.
+    fn increment_unchecked(&self, identity: &str) -> u32 {
+        let mut e = self.inner.entry(identity.to_string()).or_insert(0);
+        *e += 1;
+        let n = *e;
+        drop(e);
+        crate::metrics::set_tenant_subscribers(identity, n);
+        n
+    }
+
+    /// Release one stream for `identity` (called by [`SubscriberGuard::drop`]).
+    /// Reaps the entry at zero so neither the map nor the gauge series retains
+    /// one entry per tenant that ever connected.
+    fn release(&self, identity: &str) {
+        let now_zero = match self.inner.get_mut(identity) {
+            Some(mut e) => {
+                *e = e.saturating_sub(1);
+                *e == 0
+            }
+            None => false,
+        };
+        if now_zero {
+            self.inner.remove_if(identity, |_, &v| v == 0);
+            crate::metrics::clear_tenant_subscribers(identity);
+        } else {
+            crate::metrics::set_tenant_subscribers(identity, self.current(identity));
+        }
+    }
+
+    fn guard(self: &Arc<Self>, identity: &str) -> SubscriberGuard {
+        SubscriberGuard {
+            counts: Arc::clone(self),
+            identity: identity.to_string(),
+        }
+    }
+}
+
+/// RAII guard: releases its identity's subscriber slot on drop. Held for the
+/// lifetime of the `Subscribe` / `SubscribeSecrets` stream via [`GuardedStream`];
+/// when the client disconnects, the server drains, or the stream otherwise ends,
+/// the stream — and hence this guard — drops, freeing the slot.
+#[derive(Debug)]
+pub struct SubscriberGuard {
+    counts: Arc<SubscriberCounts>,
+    identity: String,
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        self.counts.release(&self.identity);
+    }
+}
+
+/// Attaches an optional [`SubscriberGuard`] to a response stream so the guard
+/// drops — releasing the tenant's slot — exactly when the stream is dropped.
+/// `S: Unpin` (tonic's `ReceiverStream` is) so no pin-projection is required;
+/// `poll_next` simply forwards to the inner stream.
+pub struct GuardedStream<S> {
+    inner: S,
+    _guard: Option<SubscriberGuard>,
+}
+
+impl<S> GuardedStream<S> {
+    pub fn new(inner: S, guard: Option<SubscriberGuard>) -> Self {
+        Self {
+            inner,
+            _guard: guard,
+        }
+    }
+}
+
+impl<S: Stream + Unpin> Stream for GuardedStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+}
+
+// Hand-written so callers can `{:?}` a `Response<GuardedStream<_>>` (the tonic
+// trait test paths do) without requiring the wrapped stream `S: Debug` — the
+// inner stream has no meaningful debug form anyway.
+impl<S> std::fmt::Debug for GuardedStream<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardedStream")
+            .field("guard", &self._guard)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,5 +849,149 @@ mod tests {
         assert!(matches!(outcome, PumpOutcome::StreamEnded));
         assert!(synced.is_synced());
         assert_eq!(table.quota_for("svc-a").unwrap().max_subscribers, 7);
+    }
+
+    // ── Subscriber accounting (MT-2) ──────────────────────────────────────
+
+    fn table_with(identity: &str, q: TenantQuota) -> QuotaTable {
+        let table = QuotaTable::new();
+        let mut m = Inner::new();
+        m.insert(identity.to_string(), q);
+        table.replace_for_test(m);
+        table
+    }
+
+    fn quota(max_subscribers: u32) -> TenantQuota {
+        TenantQuota {
+            max_subscribers,
+            max_applies_per_second: 0,
+            max_applies_burst: 0,
+            cache_memory_budget_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn effective_limit_uses_synced_quota_over_default() {
+        let table = table_with("svc-a", quota(3));
+        // synced + matching quota → quota wins over the flag default.
+        assert_eq!(effective_subscriber_limit(&table, true, 99, "svc-a"), 3);
+    }
+
+    #[test]
+    fn effective_limit_falls_back_to_default_when_no_quota() {
+        let table = table_with("svc-a", quota(3));
+        // synced but no quota names "svc-b" → flag default applies.
+        assert_eq!(effective_subscriber_limit(&table, true, 7, "svc-b"), 7);
+    }
+
+    #[test]
+    fn effective_limit_ignores_quota_until_synced() {
+        let table = table_with("svc-a", quota(3));
+        // un-synced → never trust the CRD value; use the flag default. This is
+        // the boot-window fail-safe: a stale/empty table cannot exhaust a tenant.
+        assert_eq!(effective_subscriber_limit(&table, false, 7, "svc-a"), 7);
+    }
+
+    #[test]
+    fn effective_limit_zero_quota_is_explicit_unlimited() {
+        let table = table_with("svc-a", quota(0));
+        // A synced quota with maxSubscribers:0 means unlimited for that tenant,
+        // overriding even a non-zero flag default.
+        assert_eq!(effective_subscriber_limit(&table, true, 5, "svc-a"), 0);
+    }
+
+    #[test]
+    fn enforce_admits_under_limit_and_denies_at_limit() {
+        let counts = Arc::new(SubscriberCounts::new());
+        let g1 = match counts.admit("mt2-enforce", QuotaMode::Enforce, 2) {
+            Admit::Allowed { guard, current, .. } => {
+                assert_eq!(current, 1);
+                guard
+            }
+            Admit::Denied { .. } => panic!("first stream must be admitted"),
+        };
+        let _g2 = match counts.admit("mt2-enforce", QuotaMode::Enforce, 2) {
+            Admit::Allowed { guard, current, .. } => {
+                assert_eq!(current, 2);
+                guard
+            }
+            Admit::Denied { .. } => panic!("second stream must be admitted (at limit)"),
+        };
+        // Third over the limit of 2 → denied, count unchanged.
+        match counts.admit("mt2-enforce", QuotaMode::Enforce, 2) {
+            Admit::Denied { current, limit } => {
+                assert_eq!(current, 2);
+                assert_eq!(limit, 2);
+            }
+            Admit::Allowed { .. } => panic!("third stream must be denied"),
+        }
+        assert_eq!(counts.current("mt2-enforce"), 2);
+        // Dropping a guard frees a slot; a new stream is then admitted.
+        drop(g1);
+        assert_eq!(counts.current("mt2-enforce"), 1);
+        let _g3 = match counts.admit("mt2-enforce", QuotaMode::Enforce, 2) {
+            Admit::Allowed { guard, .. } => guard,
+            Admit::Denied { .. } => panic!("slot freed by drop(g1) must be re-admitted"),
+        };
+        assert_eq!(counts.current("mt2-enforce"), 2);
+    }
+
+    #[test]
+    fn enforce_zero_limit_is_unlimited() {
+        let counts = Arc::new(SubscriberCounts::new());
+        // Hold every guard — dropping them would release the slots and defeat
+        // the assertion below.
+        let mut guards = Vec::new();
+        for _ in 0..50 {
+            match counts.admit("mt2-unlimited", QuotaMode::Enforce, 0) {
+                Admit::Allowed {
+                    guard, over_budget, ..
+                } => {
+                    assert!(!over_budget, "limit 0 is unlimited — never over budget");
+                    guards.push(guard);
+                }
+                Admit::Denied { .. } => panic!("limit 0 must never deny"),
+            }
+        }
+        assert_eq!(counts.current("mt2-unlimited"), 50);
+        assert_eq!(guards.len(), 50);
+    }
+
+    #[test]
+    fn permissive_allows_over_budget_but_flags_it() {
+        let counts = Arc::new(SubscriberCounts::new());
+        let _g1 = match counts.admit("mt2-perm", QuotaMode::Permissive, 1) {
+            Admit::Allowed { guard, .. } => guard,
+            Admit::Denied { .. } => panic!("permissive must never deny"),
+        };
+        // Second exceeds the limit of 1, but permissive admits it AND flags the
+        // would-deny so the operator sees the signal before flipping to enforce.
+        let _g2 = match counts.admit("mt2-perm", QuotaMode::Permissive, 1) {
+            Admit::Allowed {
+                guard,
+                current,
+                over_budget,
+                ..
+            } => {
+                assert_eq!(current, 2);
+                assert!(over_budget, "permissive must flag the breach");
+                guard
+            }
+            Admit::Denied { .. } => panic!("permissive must never deny"),
+        };
+        assert_eq!(counts.current("mt2-perm"), 2);
+    }
+
+    #[test]
+    fn guard_release_reaps_identity_at_zero() {
+        let counts = Arc::new(SubscriberCounts::new());
+        let g = match counts.admit("mt2-reap", QuotaMode::Enforce, 5) {
+            Admit::Allowed { guard, .. } => guard,
+            Admit::Denied { .. } => unreachable!(),
+        };
+        assert_eq!(counts.current("mt2-reap"), 1);
+        drop(g);
+        // Back to zero — the map entry is reaped so idle tenants do not leak.
+        assert_eq!(counts.current("mt2-reap"), 0);
     }
 }
