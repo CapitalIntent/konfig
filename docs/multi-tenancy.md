@@ -163,6 +163,23 @@ Optional, opt-in per-tenant **egress** control via standard K8s
   under `infra/konfig/overlays/tenants/`.
 - Off by default — clusters without a policy-enforcing CNI are unaffected.
 
+### Implementation (MT-5)
+
+CU-86aj8pvgx ships the overlay at `infra/konfig/overlays/tenants/`:
+
+- `registry.yaml` is the source of truth — shared egress `defaults` (konfig
+  namespace/port, cluster DNS) plus a `tenants` list (namespace, pod selector,
+  optional `extraEgress`). `tenant.identity` cross-references the mTLS
+  `ClientIdentity` keying `TenantQuota`/`ConfigACL` (ADR-0002) for humans; the
+  CNI selects on namespace + pod labels, not the cert.
+- `generate.py` renders one default-deny **egress** `NetworkPolicy` per tenant
+  (`konfig-tenant-egress-<name>`) that allowlists only DNS (UDP/TCP 53) + the
+  konfig gRPC port, then appends each `extraEgress` peer. `--check` lets CI fail
+  if `registry.yaml` changed without regenerating the committed manifests.
+- The overlay is **not** referenced from `infra/konfig/kustomization.yaml`; it
+  is applied explicitly with `kubectl apply -k infra/konfig/overlays/tenants/`
+  on clusters with a policy-enforcing CNI. See that directory's README.
+
 ## Isolation guarantees (current vs proposed)
 
 | Axis | Today | After this design |
@@ -201,7 +218,7 @@ Created under milestone CU-86aj4chpd (see ADR-0002 for the decision link):
 4. **Per-tenant cache budget + eviction** (CU-86aj8pvg3) — per-identity byte
    accounting + serve-time eviction + `konfig_tenant_cache_*` metrics.
 5. **Per-tenant NetworkPolicy overlay** (CU-86aj8pvgx) — `infra/konfig/overlays/tenants/`
-   generator + docs.
+   generator + docs. *Done* — see "Network isolation → Implementation (MT-5)".
 6. **Tenant metrics + dashboard** (CU-86aj8pvj7) — `konfig_tenant_subscribers`,
    `_applies_total`, `_cache_bytes`, `_evictions_total`, `_quota_denied_total`.
    *Done* — see "Implementation (MT-6)" below.
