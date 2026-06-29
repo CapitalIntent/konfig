@@ -42,7 +42,7 @@ konfig serves config from three sources, unified in a single gRPC API:
 |--------|-----------------|------|-------|
 | `Config.konfig.io/v1` CRD | Create the resource | ClusterRole | Primary path. Enforces `schema_version` monotonicity. |
 | ConfigMap | Label `konfig.io/managed=true` | ClusterRole | Zero-friction migration for existing ConfigMaps. Off by default. |
-| Secret | Label `konfig.io/managed=true` | Role per namespace (never ClusterRoleBinding) | Values base64-encoded on wire; consumers decode. |
+| Secret | Label `konfig.io/managed=true` | Role per namespace (never ClusterRoleBinding) | Values base64-encoded on wire; consumers decode. Optional KMS envelope encryption proposed — see [kms-encryption.md](kms-encryption.md). |
 
 ## Consistency model
 
@@ -64,6 +64,7 @@ konfig is a **CP system**:
 | Single broadcast channel per namespace | O(1) fan-out regardless of subscriber count; 100 subscribers at p50 < 2 ms on Docker Desktop |
 | Stateless Deployment (not StatefulSet) | Watch stream is rebuilt on restart from etcd; no persistent state |
 | Raw YAML + Kustomize, not Helm | One topology, no drift between two parallel sources — see [ADR-0001](adr/0001-deployment-raw-yaml.md) |
+| KMS envelope encryption for managed Secrets (proposed) | base64 is not encryption; wrap values with a per-secret DEK under a KMS master key, decrypt only on serve — see [ADR-0003](adr/0003-kms-envelope-encryption.md) |
 
 ## RBAC model
 
