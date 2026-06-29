@@ -132,6 +132,7 @@ konfig server is down.
 - [Configuration](docs/configuration.md) — ConfigMap keys, Deployment args, runtime overrides
 - [Consumer integration](docs/consumer-integration.md) — gRPC client usage, error handling, reconnect
 - [Existing ConfigMaps and Secrets](docs/configmaps-secrets.md) — opt-in label, data formats, migration
+- [Secret encryption (KMS envelope)](docs/kms-encryption.md) — **proposed**: envelope-encrypt managed Secret values, decryptable only by the server ([ADR-0003](docs/adr/0003-kms-envelope-encryption.md))
 - [konfig-cli reference](docs/cli.md) — all commands and flags
 - [Runbook](docs/runbook.md) — health checks, metrics, partition recovery, upgrading
 - [mTLS rollout + cert rotation](docs/mtls-rollout.md) — dual-listener rollout, zero-downtime cert rotation, expiry alerting
