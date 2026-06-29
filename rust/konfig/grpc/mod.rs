@@ -413,7 +413,7 @@ impl KonfigServer {
         cost: u32,
     ) -> Result<(), Status> {
         let identity = identity::extract_identity(request);
-        match apply_admission(
+        let outcome = apply_admission(
             &self.apply_limiter,
             &self.quota_table,
             self.quota_synced.is_synced(),
@@ -421,7 +421,16 @@ impl KonfigServer {
             self.default_max_applies_per_second,
             &identity.id,
             cost,
-        ) {
+        );
+        // Count admitted applies per tenant (CU-86aj8pvj7, MT-6). Denied applies
+        // never run, so they are not counted (they surface in
+        // konfig_tenant_quota_denied_total). Gated on an active quota mode to
+        // avoid emitting per-identity series when multi-tenancy is off.
+        if self.quota_mode != QuotaMode::Disabled && !matches!(outcome, ApplyOutcome::Denied { .. })
+        {
+            crate::metrics::record_tenant_applies(&identity.id, cost);
+        }
+        match outcome {
             ApplyOutcome::Allowed => Ok(()),
             ApplyOutcome::OverBudget { rate, burst } => {
                 crate::metrics::record_tenant_quota_denied(rpc, "permissive");
@@ -1062,6 +1071,57 @@ mod tests {
     fn dummy_client() -> kube::Client {
         let cfg = kube::Config::new("http://127.0.0.1:0".parse().expect("valid URL"));
         kube::Client::try_from(cfg).expect("infallible — only constructs HTTP client")
+    }
+
+    /// `rate_limit_apply` glue (CU-86aj8pvj7, MT-6): bare requests resolve to the
+    /// `"anonymous"` identity, and an empty quota table falls back to the flag
+    /// default rate. Exercises the three arms in one sequential test (the
+    /// process-global counter makes parallel `"anonymous"` mutation unsafe):
+    /// quotas-off admits without counting, an active quota counts an admitted
+    /// apply, and an exhausted bucket denies without counting.
+    #[tokio::test]
+    async fn rate_limit_apply_counts_admitted_but_not_off_or_denied() {
+        let before = crate::metrics::TENANT_APPLIES_TOTAL
+            .with_label_values(&["anonymous"])
+            .get();
+
+        // 1) Quotas off → admitted, but NOT counted (no per-identity series off).
+        let off = test_server();
+        assert!(off.rate_limit_apply(&Request::new(()), "apply", 1).is_ok());
+        assert_eq!(
+            crate::metrics::TENANT_APPLIES_TOTAL
+                .with_label_values(&["anonymous"])
+                .get(),
+            before,
+            "applies must not be counted when the quota mode is off"
+        );
+
+        // 2) Enforce + default rate 1/s, burst 1 → first apply admitted + counted.
+        let mut srv = test_server();
+        srv.quota_mode = QuotaMode::Enforce;
+        srv.default_max_applies_per_second = 1;
+        assert!(srv.rate_limit_apply(&Request::new(()), "apply", 1).is_ok());
+        assert_eq!(
+            crate::metrics::TENANT_APPLIES_TOTAL
+                .with_label_values(&["anonymous"])
+                .get(),
+            before + 1.0,
+            "an admitted apply under an active quota must increment the counter"
+        );
+
+        // 3) Bucket now empty → next apply RESOURCE_EXHAUSTED and NOT counted.
+        let denied = srv.rate_limit_apply(&Request::new(()), "apply", 1);
+        assert_eq!(
+            denied.expect_err("bucket exhausted").code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(
+            crate::metrics::TENANT_APPLIES_TOTAL
+                .with_label_values(&["anonymous"])
+                .get(),
+            before + 1.0,
+            "a denied apply must not increment the applies counter"
+        );
     }
 
     // ── snapshot_to_proto ─────────────────────────────────────────────────────

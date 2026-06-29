@@ -12,9 +12,21 @@ backed by a **Tempo** datasource holding the OTLP spans exported by the
   (`konfig.watch_event`), 409 retry counts (`konfig.apply_attempt`), and a
   top-N slowest `konfig.Subscribe` streams table. All TraceQL against Tempo.
 
+- `konfig-tenants.json` — Multi-tenancy quota & cache metrics (CU-86aj8pvj7,
+  MT-6): subscribers, admitted applies/s (`konfig_tenant_applies_total`),
+  attributed cache bytes, LRU evictions/s, and quota denials/s by rpc+mode.
+  PromQL against **Prometheus** (not Tempo); a `$identity` template variable
+  (from `label_values(konfig_tenant_subscribers, identity)`) scopes the
+  per-tenant panels. Bind the `DS_PROMETHEUS` input to your Prometheus
+  datasource on import.
+
 The TraceQL metrics queries (`quantile_over_time`, `rate()`) require Tempo's
 metrics-generator / TraceQL-metrics to be enabled. Without it the latency/rate
 panels return no data; the top-N table works with the search API alone.
+
+`konfig-tenants.json` has no Tempo dependency — it queries the konfig
+`/metrics` endpoint via Prometheus and works as soon as konfig is scraped and a
+tenant quota mode is active (`permissive`/`enforce`).
 
 ## Provisioning
 
