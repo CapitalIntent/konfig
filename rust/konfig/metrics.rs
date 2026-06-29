@@ -376,6 +376,19 @@ lazy_static::lazy_static! {
         "Per-tenant cache-view evictions on budget breach",
         &["identity"]
     ).expect("failed to register konfig_tenant_cache_evictions_total");
+
+    /// Per-tenant admitted Apply volume (CU-86aj8pvj7, MT-6): cost-weighted
+    /// count of applies that passed the rate limiter, by identity. `Apply` /
+    /// `ApplySecret` add 1, `BatchApply` adds its item count (the token cost).
+    /// Paired with `konfig_tenant_quota_denied_total` (the rate-limited
+    /// attempts), this gives per-tenant Apply demand. Only emitted when the
+    /// quota mode is active (`permissive`/`enforce`), bounding identity
+    /// cardinality on clusters not using multi-tenancy.
+    pub static ref TENANT_APPLIES_TOTAL: CounterVec = register_counter_vec!(
+        "konfig_tenant_applies_total",
+        "Per-tenant admitted Apply volume (cost-weighted) by identity",
+        &["identity"]
+    ).expect("failed to register konfig_tenant_applies_total");
 }
 
 /// Spawn the background tokio runtime-metrics sampler.
@@ -467,6 +480,13 @@ pub fn record_tenant_cache_evictions(identity: &str, n: u64) {
     TENANT_CACHE_EVICTIONS_TOTAL
         .with_label_values(&[identity])
         .inc_by(n as f64);
+}
+
+/// Record `n` admitted applies for `identity` (CU-86aj8pvj7, MT-6).
+pub fn record_tenant_applies(identity: &str, n: u32) {
+    TENANT_APPLIES_TOTAL
+        .with_label_values(&[identity])
+        .inc_by(f64::from(n));
 }
 
 // ── Last-event-at tracking ────────────────────────────────────────────────────
@@ -802,6 +822,27 @@ mod tests {
                 "metric {required} missing from default registry — /metrics endpoint will not expose it"
             );
         }
+    }
+
+    #[test]
+    fn tenant_applies_total_registers_and_counts() {
+        // Cost-weighted: 1 (single apply) + 3 (batch of 3) = 4 for this tenant.
+        record_tenant_applies("svc-applies-metric-test", 1);
+        record_tenant_applies("svc-applies-metric-test", 3);
+        assert_eq!(
+            TENANT_APPLIES_TOTAL
+                .with_label_values(&["svc-applies-metric-test"])
+                .get(),
+            4.0
+        );
+        let names: std::collections::HashSet<String> = prometheus::gather()
+            .iter()
+            .map(|mf| mf.name().to_string())
+            .collect();
+        assert!(
+            names.contains("konfig_tenant_applies_total"),
+            "konfig_tenant_applies_total missing from default registry — /metrics will not expose it"
+        );
     }
 
     #[test]

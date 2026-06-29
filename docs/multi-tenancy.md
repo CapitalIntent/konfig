@@ -204,7 +204,34 @@ Created under milestone CU-86aj4chpd (see ADR-0002 for the decision link):
    generator + docs.
 6. **Tenant metrics + dashboard** (CU-86aj8pvj7) — `konfig_tenant_subscribers`,
    `_applies_total`, `_cache_bytes`, `_evictions_total`, `_quota_denied_total`.
+   *Done* — see "Implementation (MT-6)" below.
 
 KMS envelope encryption for managed Secrets (CU-86ahrwd6m) is tracked
 separately under the same milestone; the tenant model informs its key scoping
 (key-per-tenant-identity) but it does not block this design.
+
+## Implementation (MT-6)
+
+CU-86aj8pvj7 closes the observability loop for MT-1..MT-4. Four of the five
+metrics were already emitted by the earlier tickets; MT-6 adds the missing
+per-tenant Apply counter and a Grafana dashboard.
+
+- **`konfig_tenant_applies_total{identity}`** (`metrics::record_tenant_applies`)
+  — cost-weighted count of applies that *passed* the rate limiter, recorded in
+  `KonfigServer::rate_limit_apply` (`grpc/mod.rs`). `Apply` / `ApplySecret` add
+  1; `BatchApply` adds its item count (the token cost). Denied applies are not
+  counted here — they never run and already surface in
+  `konfig_tenant_quota_denied_total`. Recording is gated on an active quota mode
+  (`permissive`/`enforce`) so clusters with multi-tenancy `off` emit no
+  per-identity series (cardinality control, mirroring the cache ledger).
+- **Already emitted:** `konfig_tenant_subscribers{identity}` (MT-2),
+  `konfig_tenant_quota_denied_total{rpc,mode}` (MT-2/MT-3 — labeled by rpc+mode,
+  not identity, to bound cardinality), `konfig_tenant_cache_bytes{identity}` and
+  `konfig_tenant_cache_evictions_total{identity}` (MT-4).
+- **Dashboard:** `infra/profiling/grafana-dashboards/konfig-tenants.json`
+  (Prometheus, schemaVersion 39): stat row (active tenants, subscribers, cache
+  bytes, apply rate) + per-tenant timeseries for each metric + a denials-by-
+  rpc+mode panel. A `$identity` template variable
+  (`label_values(konfig_tenant_subscribers, identity)`) scopes the per-tenant
+  panels. Provisioning + binding the `DS_PROMETHEUS` input: see that directory's
+  README.
