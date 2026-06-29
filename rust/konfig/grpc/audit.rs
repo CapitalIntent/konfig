@@ -1,8 +1,11 @@
-//! Audit log for mutating RPCs (CU-86ahrwd6h).
+//! Audit log for mutating RPCs (CU-86ahrwd6h) and secret reads (CU-86ahnne5r).
 //!
-//! Every `Apply` / `ApplySecret` / `Revert` emits one [`AuditRecord`] capturing
-//! who (mTLS client identity + peer addr), what (rpc + namespace/name +
+//! Every mutating RPC (`Apply` / `ApplySecret` / `Revert`) and every secret read
+//! (`GetSecret` / `GetAllSecrets` / `SubscribeSecrets`) emits one [`AuditRecord`]
+//! capturing who (mTLS client identity + peer addr), what (rpc + namespace/name +
 //! schema/resource version), and the outcome (`success` / `error:<code>`).
+//! Secret reads carry no incoming body, so they omit `schema_version` and emit
+//! only the stdout sink (no K8s Event — reads are high-frequency).
 //!
 //! Two sinks:
 //!   1. **stdout JSON line — always on.** Written with `println!` (NOT
@@ -30,7 +33,8 @@ pub const K8S_EVENTS_ENV: &str = "KONFIG_AUDIT_K8S_EVENTS";
 /// One audit log entry for a mutating RPC. Serialised to a single JSON line.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditRecord {
-    /// RPC name (`"Apply"`, `"ApplySecret"`, `"Revert"`).
+    /// RPC name (`"Apply"`, `"ApplySecret"`, `"Revert"`, `"GetSecret"`,
+    /// `"GetAllSecrets"`, `"SubscribeSecrets"`).
     pub rpc: String,
     pub namespace: String,
     pub name: String,

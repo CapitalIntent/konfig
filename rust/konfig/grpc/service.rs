@@ -7,6 +7,67 @@ use crate::tenant_cache::{
     AccountedStream, config_cost, config_event_cost, secret_cost, secret_event_cost,
 };
 
+/// Caller context for a secret **read** audit line (CU-86ahnne5r).
+///
+/// Secret reads are security-relevant, so `GetSecret` / `GetAllSecrets` /
+/// `SubscribeSecrets` each emit the same canonical stdout [`audit::AuditRecord`]
+/// as the mutating RPCs. No K8s Event is emitted for reads: they are
+/// high-frequency and the Event sink is reserved for mutations. `schema_version`
+/// is always `None` (reads carry no incoming body); `resource_version` is filled
+/// for point reads (`GetSecret`) and left `None` for the namespace-wide streams.
+///
+/// Captured up front — before `request.into_inner()` consumes the request — so
+/// the identity / peer addr / request-id survive into the post-handler emit.
+/// Consistent with the mutating RPCs, the record reflects the handler outcome;
+/// requests rejected earlier by the drain/authz/quota guards return via `?`
+/// before reaching here and are not audited.
+struct ReadAudit {
+    rpc: &'static str,
+    namespace: String,
+    name: String,
+    identity: String,
+    addr: String,
+    rid: String,
+}
+
+impl ReadAudit {
+    fn capture<T>(rpc: &'static str, request: &Request<T>, namespace: &str, name: &str) -> Self {
+        Self {
+            rpc,
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            identity: identity::extract_identity(request).id,
+            addr: client_addr(request),
+            rid: request_id(request),
+        }
+    }
+
+    /// Build the audit record from the handler `result` (pure — unit-tested).
+    fn record<R>(
+        &self,
+        result: &Result<Response<R>, Status>,
+        resource_version: Option<String>,
+    ) -> audit::AuditRecord {
+        audit::AuditRecord {
+            rpc: self.rpc.to_string(),
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+            client_identity: self.identity.clone(),
+            client_addr: self.addr.clone(),
+            result: audit::result_str(result),
+            schema_version: None,
+            resource_version,
+            timestamp_ms: audit::now_ms(),
+            request_id: self.rid.clone(),
+        }
+    }
+
+    /// Emit the read audit record to the canonical stdout sink.
+    fn emit<R>(self, result: &Result<Response<R>, Status>, resource_version: Option<String>) {
+        audit::emit(&self.record(result, resource_version));
+    }
+}
+
 #[tonic::async_trait]
 impl KonfigService for KonfigServer {
     // ── OTEL root spans + entry logging ─────────────────────────────────────
@@ -394,12 +455,22 @@ impl KonfigService for KonfigServer {
         )?;
         // CU-86aj8pvg3 (MT-4): attribute the served secret's bytes to the tenant.
         let acct = self.cache_accountant(&request, "secret");
+        let read_audit = ReadAudit::capture(
+            "GetSecret",
+            &request,
+            &request.get_ref().namespace,
+            &request.get_ref().name,
+        );
         let result =
             secret_get::handle_get_secret(Arc::clone(&self.secret_cache), request.into_inner())
                 .await;
         if let (Some(acct), Ok(resp)) = (&acct, &result) {
             acct.record_cost(secret_cost(resp.get_ref()));
         }
+        read_audit.emit(
+            &result,
+            audit::resource_version_of(&result, |r| &r.resource_version),
+        );
         record_status(result)
     }
 
@@ -427,14 +498,16 @@ impl KonfigService for KonfigServer {
         // CU-86aj8pvg3 (MT-4): wrap the stream so every served secret is
         // attributed to the tenant as it is delivered.
         let acct = self.cache_accountant(&request, "secret");
-        record_status(
-            secret_get::handle_get_all_secrets(
-                Arc::clone(&self.secret_cache),
-                request.into_inner(),
-            )
-            .await
-            .map(|resp| Response::new(AccountedStream::new(resp.into_inner(), acct, secret_cost))),
+        let read_audit =
+            ReadAudit::capture("GetAllSecrets", &request, &request.get_ref().namespace, "*");
+        let result = secret_get::handle_get_all_secrets(
+            Arc::clone(&self.secret_cache),
+            request.into_inner(),
         )
+        .await
+        .map(|resp| Response::new(AccountedStream::new(resp.into_inner(), acct, secret_cost)));
+        read_audit.emit(&result, None);
+        record_status(result)
     }
 
     #[tracing::instrument(
@@ -517,21 +590,64 @@ impl KonfigService for KonfigServer {
         // CU-86aj8pvg3 (MT-4): account every secret event (replay + live)
         // delivered to this subscriber by wrapping its stream.
         let acct = self.cache_accountant(&request, "secret");
-        record_status(
-            subscribe_secrets::handle_subscribe_secrets(
-                self.kube_client.clone(),
-                Arc::clone(&self.secret_cache),
-                Arc::clone(&self.secret_namespace_broadcasts),
-                self.drain_notify(),
-                request.into_inner(),
-            )
-            .await
-            .map(|resp| {
-                Response::new(GuardedStream::new(
-                    AccountedStream::new(resp.into_inner(), acct, secret_event_cost),
-                    guard,
-                ))
-            }),
+        let read_audit = ReadAudit::capture(
+            "SubscribeSecrets",
+            &request,
+            &request.get_ref().namespace,
+            "*",
+        );
+        let result = subscribe_secrets::handle_subscribe_secrets(
+            self.kube_client.clone(),
+            Arc::clone(&self.secret_cache),
+            Arc::clone(&self.secret_namespace_broadcasts),
+            self.drain_notify(),
+            request.into_inner(),
         )
+        .await
+        .map(|resp| {
+            Response::new(GuardedStream::new(
+                AccountedStream::new(resp.into_inner(), acct, secret_event_cost),
+                guard,
+            ))
+        });
+        read_audit.emit(&result, None);
+        record_status(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A captured read-audit context builds a `success` record with the
+    /// resource_version threaded through and `schema_version` always absent
+    /// (reads carry no incoming body).
+    #[test]
+    fn read_audit_record_success_has_rv_and_no_schema_version() {
+        let req = Request::new(());
+        let ra = ReadAudit::capture("GetSecret", &req, "default", "db-creds");
+        let ok: Result<Response<()>, Status> = Ok(Response::new(()));
+        let rec = ra.record(&ok, Some("rv-7".to_string()));
+        assert_eq!(rec.rpc, "GetSecret");
+        assert_eq!(rec.namespace, "default");
+        assert_eq!(rec.name, "db-creds");
+        assert_eq!(rec.result, "success");
+        assert_eq!(rec.resource_version.as_deref(), Some("rv-7"));
+        assert!(rec.schema_version.is_none());
+    }
+
+    /// On an error result the audit record carries the snake-cased gRPC code
+    /// and drops the resource_version.
+    #[test]
+    fn read_audit_record_error_maps_code_and_drops_rv() {
+        let req = Request::new(());
+        let ra = ReadAudit::capture("GetAllSecrets", &req, "payments", "*");
+        let err: Result<Response<()>, Status> = Err(Status::permission_denied("nope"));
+        let rec = ra.record(&err, None);
+        assert_eq!(rec.rpc, "GetAllSecrets");
+        assert_eq!(rec.name, "*");
+        assert_eq!(rec.result, "error:permission_denied");
+        assert!(rec.resource_version.is_none());
+        assert!(rec.schema_version.is_none());
     }
 }
