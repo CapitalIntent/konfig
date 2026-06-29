@@ -87,6 +87,14 @@ dial9 serve --local-dir /tmp/dial9-traces --port 9191
 
 Enable tracing first (see [Configuration](configuration.md#telemetry)).
 
+For captured reference traces (Apply write path, watch→cache update, broadcast
+fan-out to 100 subscribers, Subscribe stream) and a local Jaeger reproduce-flow,
+see [`docs/observability/`](observability/README.md). Note the gotcha documented
+there: the rich child spans (`cache_*`, `watch_event`, `broadcast_dispatch`,
+`apply_attempt`) are DEBUG-level and gated by the same `EnvFilter` as logs — at
+the default `konfig=info` only the bare RPC root spans export. Raise specific
+submodules (e.g. `RUST_LOG=konfig::grpc::subscribe=debug`) to surface them.
+
 ## Latency investigation
 
 When an Apply or Subscribe latency SLI breaches (see [SLOs](slo.md)), use the

@@ -1,0 +1,234 @@
+{
+  "data": [
+    {
+      "traceID": "0352da9d977b7e70bf6ec567a48ae49c",
+      "spans": [
+        {
+          "traceID": "0352da9d977b7e70bf6ec567a48ae49c",
+          "spanID": "7d36e309d5b6029d",
+          "operationName": "konfig.cache_update",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "0352da9d977b7e70bf6ec567a48ae49c",
+              "spanID": "7f8292a527aca192"
+            }
+          ],
+          "startTime": 1782764676890016,
+          "duration": 4,
+          "tags": [
+            {
+              "key": "busy_ns",
+              "type": "int64",
+              "value": 4250
+            },
+            {
+              "key": "code.file.path",
+              "type": "string",
+              "value": "rust/konfig/cache.rs"
+            },
+            {
+              "key": "code.line.number",
+              "type": "int64",
+              "value": 83
+            },
+            {
+              "key": "code.module.name",
+              "type": "string",
+              "value": "konfig::cache"
+            },
+            {
+              "key": "idle_ns",
+              "type": "int64",
+              "value": 1000
+            },
+            {
+              "key": "internal.span.format",
+              "type": "string",
+              "value": "otlp"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "konfig"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            },
+            {
+              "key": "target",
+              "type": "string",
+              "value": "konfig::cache"
+            },
+            {
+              "key": "thread.id",
+              "type": "int64",
+              "value": 2
+            },
+            {
+              "key": "thread.name",
+              "type": "string",
+              "value": "tokio-rt-worker"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        },
+        {
+          "traceID": "0352da9d977b7e70bf6ec567a48ae49c",
+          "spanID": "7f8292a527aca192",
+          "operationName": "konfig.watch_event",
+          "references": [],
+          "startTime": 1782764676889986,
+          "duration": 37,
+          "tags": [
+            {
+              "key": "busy_ns",
+              "type": "int64",
+              "value": 33791
+            },
+            {
+              "key": "code.file.path",
+              "type": "string",
+              "value": "rust/konfig/watcher.rs"
+            },
+            {
+              "key": "code.line.number",
+              "type": "int64",
+              "value": 294
+            },
+            {
+              "key": "code.module.name",
+              "type": "string",
+              "value": "konfig::watcher"
+            },
+            {
+              "key": "event_type",
+              "type": "string",
+              "value": "Apply"
+            },
+            {
+              "key": "idle_ns",
+              "type": "int64",
+              "value": 4209
+            },
+            {
+              "key": "internal.span.format",
+              "type": "string",
+              "value": "otlp"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "konfig"
+            },
+            {
+              "key": "resource_version",
+              "type": "string",
+              "value": "1858"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            },
+            {
+              "key": "target",
+              "type": "string",
+              "value": "konfig::watcher"
+            },
+            {
+              "key": "thread.id",
+              "type": "int64",
+              "value": 2
+            },
+            {
+              "key": "thread.name",
+              "type": "string",
+              "value": "tokio-rt-worker"
+            }
+          ],
+          "logs": [
+            {
+              "timestamp": 1782764676890015,
+              "fields": [
+                {
+                  "key": "event",
+                  "type": "string",
+                  "value": "Config applied — cache updated"
+                },
+                {
+                  "key": "code.file.path",
+                  "type": "string",
+                  "value": "rust/konfig/watcher.rs"
+                },
+                {
+                  "key": "code.line.number",
+                  "type": "int64",
+                  "value": 311
+                },
+                {
+                  "key": "code.module.name",
+                  "type": "string",
+                  "value": "konfig::watcher"
+                },
+                {
+                  "key": "level",
+                  "type": "string",
+                  "value": "INFO"
+                },
+                {
+                  "key": "name",
+                  "type": "string",
+                  "value": "konfig-loadtest"
+                },
+                {
+                  "key": "schema_version",
+                  "type": "string",
+                  "value": "401"
+                },
+                {
+                  "key": "target",
+                  "type": "string",
+                  "value": "konfig::watcher"
+                }
+              ]
+            }
+          ],
+          "processID": "p1",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "konfig",
+          "tags": [
+            {
+              "key": "telemetry.sdk.language",
+              "type": "string",
+              "value": "rust"
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "type": "string",
+              "value": "opentelemetry"
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "type": "string",
+              "value": "0.32.1"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    }
+  ],
+  "total": 0,
+  "limit": 0,
+  "offset": 0,
+  "errors": null
+}
