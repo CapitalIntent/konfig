@@ -1,0 +1,225 @@
+{
+  "data": [
+    {
+      "traceID": "ac80d407db6213b46a731f7501dc447a",
+      "spans": [
+        {
+          "traceID": "ac80d407db6213b46a731f7501dc447a",
+          "spanID": "57f0c4c0a73e2eea",
+          "operationName": "konfig.Subscribe",
+          "references": [],
+          "startTime": 1782764679265383,
+          "duration": 61,
+          "tags": [
+            {
+              "key": "busy_ns",
+              "type": "int64",
+              "value": 60418
+            },
+            {
+              "key": "client_addr",
+              "type": "string",
+              "value": "10.244.0.10:59906"
+            },
+            {
+              "key": "code.file.path",
+              "type": "string",
+              "value": "rust/konfig/grpc/service.rs"
+            },
+            {
+              "key": "code.line.number",
+              "type": "int64",
+              "value": 385
+            },
+            {
+              "key": "code.module.name",
+              "type": "string",
+              "value": "konfig::grpc::service"
+            },
+            {
+              "key": "idle_ns",
+              "type": "int64",
+              "value": 916
+            },
+            {
+              "key": "internal.span.format",
+              "type": "string",
+              "value": "otlp"
+            },
+            {
+              "key": "namespace",
+              "type": "string",
+              "value": "konfig-system"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "konfig"
+            },
+            {
+              "key": "request_id",
+              "type": "string",
+              "value": "18bda7028108ceed-15d8"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            },
+            {
+              "key": "status_code",
+              "type": "string",
+              "value": "Ok"
+            },
+            {
+              "key": "target",
+              "type": "string",
+              "value": "konfig::grpc::service"
+            },
+            {
+              "key": "thread.id",
+              "type": "int64",
+              "value": 2
+            },
+            {
+              "key": "thread.name",
+              "type": "string",
+              "value": "tokio-rt-worker"
+            }
+          ],
+          "logs": [
+            {
+              "timestamp": 1782764679265437,
+              "fields": [
+                {
+                  "key": "event",
+                  "type": "string",
+                  "value": "rpc start"
+                },
+                {
+                  "key": "client_addr",
+                  "type": "string",
+                  "value": "10.244.0.10:59906"
+                },
+                {
+                  "key": "code.file.path",
+                  "type": "string",
+                  "value": "rust/konfig/grpc/context.rs"
+                },
+                {
+                  "key": "code.line.number",
+                  "type": "int64",
+                  "value": 125
+                },
+                {
+                  "key": "code.module.name",
+                  "type": "string",
+                  "value": "konfig::grpc::context"
+                },
+                {
+                  "key": "level",
+                  "type": "string",
+                  "value": "INFO"
+                },
+                {
+                  "key": "namespace",
+                  "type": "string",
+                  "value": "konfig-system"
+                },
+                {
+                  "key": "request_id",
+                  "type": "string",
+                  "value": "18bda7028108ceed-15d8"
+                },
+                {
+                  "key": "rpc",
+                  "type": "string",
+                  "value": "konfig.Subscribe"
+                },
+                {
+                  "key": "target",
+                  "type": "string",
+                  "value": "konfig::grpc::context"
+                }
+              ]
+            },
+            {
+              "timestamp": 1782764679265442,
+              "fields": [
+                {
+                  "key": "event",
+                  "type": "string",
+                  "value": "Subscribe RPC"
+                },
+                {
+                  "key": "code.file.path",
+                  "type": "string",
+                  "value": "rust/konfig/grpc/subscribe.rs"
+                },
+                {
+                  "key": "code.line.number",
+                  "type": "int64",
+                  "value": 63
+                },
+                {
+                  "key": "code.module.name",
+                  "type": "string",
+                  "value": "konfig::grpc::subscribe"
+                },
+                {
+                  "key": "level",
+                  "type": "string",
+                  "value": "DEBUG"
+                },
+                {
+                  "key": "namespace",
+                  "type": "string",
+                  "value": "konfig-system"
+                },
+                {
+                  "key": "resume_rv",
+                  "type": "string",
+                  "value": "1884"
+                },
+                {
+                  "key": "target",
+                  "type": "string",
+                  "value": "konfig::grpc::subscribe"
+                }
+              ]
+            }
+          ],
+          "processID": "p1",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "konfig",
+          "tags": [
+            {
+              "key": "telemetry.sdk.language",
+              "type": "string",
+              "value": "rust"
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "type": "string",
+              "value": "opentelemetry"
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "type": "string",
+              "value": "0.32.1"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    }
+  ],
+  "total": 0,
+  "limit": 0,
+  "offset": 0,
+  "errors": null
+}

@@ -1,0 +1,369 @@
+{
+  "data": [
+    {
+      "traceID": "14b06f757c5161eababc732c625ff27f",
+      "spans": [
+        {
+          "traceID": "14b06f757c5161eababc732c625ff27f",
+          "spanID": "aacca36babd03c41",
+          "operationName": "konfig.Apply",
+          "references": [],
+          "startTime": 1782764677984129,
+          "duration": 4319,
+          "tags": [
+            {
+              "key": "busy_ns",
+              "type": "int64",
+              "value": 250124
+            },
+            {
+              "key": "client_addr",
+              "type": "string",
+              "value": "10.244.0.10:51422"
+            },
+            {
+              "key": "code.file.path",
+              "type": "string",
+              "value": "rust/konfig/grpc/service.rs"
+            },
+            {
+              "key": "code.line.number",
+              "type": "int64",
+              "value": 148
+            },
+            {
+              "key": "code.module.name",
+              "type": "string",
+              "value": "konfig::grpc::service"
+            },
+            {
+              "key": "idle_ns",
+              "type": "int64",
+              "value": 4070168
+            },
+            {
+              "key": "internal.span.format",
+              "type": "string",
+              "value": "otlp"
+            },
+            {
+              "key": "name",
+              "type": "string",
+              "value": "konfig-loadtest"
+            },
+            {
+              "key": "namespace",
+              "type": "string",
+              "value": "konfig-system"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "konfig"
+            },
+            {
+              "key": "request_id",
+              "type": "string",
+              "value": "18bda7028108ceed-1eb"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            },
+            {
+              "key": "status_code",
+              "type": "string",
+              "value": "Ok"
+            },
+            {
+              "key": "target",
+              "type": "string",
+              "value": "konfig::grpc::service"
+            },
+            {
+              "key": "thread.id",
+              "type": "int64",
+              "value": 2
+            },
+            {
+              "key": "thread.name",
+              "type": "string",
+              "value": "tokio-rt-worker"
+            }
+          ],
+          "logs": [
+            {
+              "timestamp": 1782764677984168,
+              "fields": [
+                {
+                  "key": "event",
+                  "type": "string",
+                  "value": "rpc start"
+                },
+                {
+                  "key": "client_addr",
+                  "type": "string",
+                  "value": "10.244.0.10:51422"
+                },
+                {
+                  "key": "code.file.path",
+                  "type": "string",
+                  "value": "rust/konfig/grpc/context.rs"
+                },
+                {
+                  "key": "code.line.number",
+                  "type": "int64",
+                  "value": 117
+                },
+                {
+                  "key": "code.module.name",
+                  "type": "string",
+                  "value": "konfig::grpc::context"
+                },
+                {
+                  "key": "level",
+                  "type": "string",
+                  "value": "INFO"
+                },
+                {
+                  "key": "name",
+                  "type": "string",
+                  "value": "konfig-loadtest"
+                },
+                {
+                  "key": "namespace",
+                  "type": "string",
+                  "value": "konfig-system"
+                },
+                {
+                  "key": "request_id",
+                  "type": "string",
+                  "value": "18bda7028108ceed-1eb"
+                },
+                {
+                  "key": "rpc",
+                  "type": "string",
+                  "value": "konfig.Apply"
+                },
+                {
+                  "key": "target",
+                  "type": "string",
+                  "value": "konfig::grpc::context"
+                }
+              ]
+            },
+            {
+              "timestamp": 1782764677984195,
+              "fields": [
+                {
+                  "key": "event",
+                  "type": "string",
+                  "value": "Apply RPC"
+                },
+                {
+                  "key": "code.file.path",
+                  "type": "string",
+                  "value": "rust/konfig/grpc/apply.rs"
+                },
+                {
+                  "key": "code.line.number",
+                  "type": "int64",
+                  "value": 48
+                },
+                {
+                  "key": "code.module.name",
+                  "type": "string",
+                  "value": "konfig::grpc::apply"
+                },
+                {
+                  "key": "level",
+                  "type": "string",
+                  "value": "DEBUG"
+                },
+                {
+                  "key": "name",
+                  "type": "string",
+                  "value": "konfig-loadtest"
+                },
+                {
+                  "key": "namespace",
+                  "type": "string",
+                  "value": "konfig-system"
+                },
+                {
+                  "key": "target",
+                  "type": "string",
+                  "value": "konfig::grpc::apply"
+                }
+              ]
+            },
+            {
+              "timestamp": 1782764677988423,
+              "fields": [
+                {
+                  "key": "event",
+                  "type": "string",
+                  "value": "Apply succeeded"
+                },
+                {
+                  "key": "code.file.path",
+                  "type": "string",
+                  "value": "rust/konfig/grpc/apply.rs"
+                },
+                {
+                  "key": "code.line.number",
+                  "type": "int64",
+                  "value": 419
+                },
+                {
+                  "key": "code.module.name",
+                  "type": "string",
+                  "value": "konfig::grpc::apply"
+                },
+                {
+                  "key": "level",
+                  "type": "string",
+                  "value": "INFO"
+                },
+                {
+                  "key": "name",
+                  "type": "string",
+                  "value": "konfig-loadtest"
+                },
+                {
+                  "key": "namespace",
+                  "type": "string",
+                  "value": "konfig-system"
+                },
+                {
+                  "key": "resource_version",
+                  "type": "string",
+                  "value": "1870"
+                },
+                {
+                  "key": "schema_version",
+                  "type": "string",
+                  "value": "411"
+                },
+                {
+                  "key": "target",
+                  "type": "string",
+                  "value": "konfig::grpc::apply"
+                }
+              ]
+            }
+          ],
+          "processID": "p1",
+          "warnings": null
+        },
+        {
+          "traceID": "14b06f757c5161eababc732c625ff27f",
+          "spanID": "55163215705d20a2",
+          "operationName": "konfig.apply_attempt",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "14b06f757c5161eababc732c625ff27f",
+              "spanID": "aacca36babd03c41"
+            }
+          ],
+          "startTime": 1782764677985372,
+          "duration": 3001,
+          "tags": [
+            {
+              "key": "attempt",
+              "type": "string",
+              "value": "0"
+            },
+            {
+              "key": "busy_ns",
+              "type": "int64",
+              "value": 44250
+            },
+            {
+              "key": "code.file.path",
+              "type": "string",
+              "value": "rust/konfig/grpc/apply.rs"
+            },
+            {
+              "key": "code.line.number",
+              "type": "int64",
+              "value": 544
+            },
+            {
+              "key": "code.module.name",
+              "type": "string",
+              "value": "konfig::grpc::apply"
+            },
+            {
+              "key": "idle_ns",
+              "type": "int64",
+              "value": 2957541
+            },
+            {
+              "key": "internal.span.format",
+              "type": "string",
+              "value": "otlp"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "konfig"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            },
+            {
+              "key": "target",
+              "type": "string",
+              "value": "konfig::grpc::apply"
+            },
+            {
+              "key": "thread.id",
+              "type": "int64",
+              "value": 2
+            },
+            {
+              "key": "thread.name",
+              "type": "string",
+              "value": "tokio-rt-worker"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "konfig",
+          "tags": [
+            {
+              "key": "telemetry.sdk.language",
+              "type": "string",
+              "value": "rust"
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "type": "string",
+              "value": "opentelemetry"
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "type": "string",
+              "value": "0.32.1"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    }
+  ],
+  "total": 0,
+  "limit": 0,
+  "offset": 0,
+  "errors": null
+}
