@@ -1,0 +1,51 @@
+# Tenant registry — source of truth for per-tenant egress NetworkPolicies.
+#
+# CU-86aj8pvgx (MT-5). See README.md and docs/multi-tenancy.md ("Network
+# isolation"). This overlay is OFF BY DEFAULT: it is not referenced from
+# infra/konfig/kustomization.yaml and is applied only on clusters that run a
+# policy-enforcing CNI (Cilium, Calico, …):
+#
+#   kubectl apply -k infra/konfig/overlays/tenants/
+#
+# Workflow: edit this file, then regenerate the manifests:
+#
+#   python3 infra/konfig/overlays/tenants/generate.py
+#
+# Each tenant gets a default-deny **egress** NetworkPolicy that allowlists only
+# DNS + the konfig gRPC endpoint (plus any per-tenant extras below), so a
+# compromised tenant workload cannot exfiltrate to arbitrary destinations.
+
+# Egress targets shared by every generated tenant policy.
+defaults:
+  # Namespace + pod label of the konfig server (matches infra/konfig base).
+  konfigNamespace: konfig-system
+  konfigPort: 50051
+  # Cluster DNS — kube-dns/CoreDNS in kube-system.
+  dns:
+    namespace: kube-system
+    selectorLabel: k8s-app
+    selectorValue: kube-dns
+
+# Tenants whose workload pods should be egress-restricted. `identity` is the
+# mTLS ClientIdentity used by the matching TenantQuota/ConfigACL (ADR-0002);
+# it is documentation-only here — the CNI selects on namespace + pod labels,
+# not the cert identity.
+tenants:
+  - name: payments
+    identity: spiffe://corp/payments
+    namespace: payments
+    podSelector:
+      app.kubernetes.io/part-of: payments
+    # Extra destinations this tenant legitimately needs beyond konfig + DNS.
+    extraEgress:
+      - description: payments primary Postgres
+        namespace: data
+        podSelector:
+          app: postgres
+        ports: [5432]
+
+  - name: analytics
+    identity: spiffe://corp/analytics
+    namespace: analytics
+    podSelector:
+      app.kubernetes.io/part-of: analytics
