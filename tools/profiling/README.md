@@ -109,29 +109,46 @@ Exit `0` = clean, `1` = a top-N frame's self-% rose > `--threshold` (relative)
 or a new frame entered the top-N above `--new-frame-floor-pct`, `2` = bad input.
 Sub-`--min-base-pct` frames are exempt from the relative gate (sampling noise).
 
-## Remaining work to make this a live CI gate (needs a cluster)
+## Remaining work to make this a live CI gate (needs a Linux cluster)
 
-The script is complete + self-tested. Wiring it into `loadtest-integration.yml`
-as a blocking gate still needs a Linux/kind run (cannot be produced or verified
-on macOS):
+The Python toolchain is **complete and validated end-to-end** — `flamediff.py`
+and `flamebearer_to_pprof.py --top-frames N` both pass `--self-test`, and the
+converter was confirmed against a *real* Grafana Pyroscope `render` flamebearer
+(CU-86ahtj1a8 standup, 2026-06-29):
 
-1. **Capture the baseline from `main`.** Run the loadtest against a
-   `konfig-profiling` Deployment + pyroscope/alloy (see `infra/profiling/`),
-   then capture the flamebearer (pyroscope render API, `format=json`) and reduce
-   it locally with `flamebearer_to_pprof.py --top-frames 5` (see below), and
-   commit the result as `.profiling-baseline.json`.
-2. **Add a post-loadtest step** to `loadtest-integration.yml` that captures the
-   flamebearer, reduces it with `flamebearer_to_pprof.py --top-frames 5` →
-   `current.json`, then `python3 tools/profiling/flamediff.py current.json
-   .profiling-baseline.json --output=$GITHUB_STEP_SUMMARY`. Gate the job on its
-   exit code. (Also emit `cpu-profile.pprof` via the same converter for
-   interactive drill-down on regressions.)
+```sh
+# Validated working render query (Grafana Pyroscope 1.9.0):
+curl -s "$PYRO/pyroscope/render?query=process_cpu:samples:count:cpu:nanoseconds%7Bservice_name%3D%22konfig%22%7D&from=now-10m&until=now&format=json" \
+  | python3 tools/profiling/flamebearer_to_pprof.py --top-frames 5 > current.json
+python3 tools/profiling/flamediff.py current.json .profiling-baseline.json --output="$GITHUB_STEP_SUMMARY"
+```
+
+What still needs a **Linux** kind run (cannot be produced or verified on macOS):
+
+1. **Capture the baseline from `main`** and commit it as `.profiling-baseline.json`.
+   This is the blocker — see the ingestion finding below.
+2. **Add a post-loadtest step** to `loadtest-integration.yml` running the two
+   commands above; gate the job on flamediff's exit code. Keep it a *separate,
+   non-blocking* job until a baseline exists — an unverified pyroscope query must
+   never break every PR.
 3. **Verify the gate fires:** open a throwaway PR with an intentional hot-path
    regression (e.g. a `sleep` in the apply path) and confirm CI fails; revert.
 
-Until the baseline is captured the gate is intentionally NOT wired into the
-required smoke gate — an unverified pyroscope query must not be allowed to break
-every PR.
+### Findings from the local standup (why the baseline needs Linux CI)
+
+- **Ingestion path is alloy eBPF, not the in-process agent.** The
+  `konfig-profiling` image's in-process `pyroscope-rs` agent
+  (`PYROSCOPE_SERVER_ADDRESS`) does **not** ingest into Grafana Pyroscope 1.9.0
+  (legacy `/ingest` format) — a local standup left `service_name=konfig` with
+  zero series. The supported path is the **alloy `pyroscope.ebpf`** DaemonSet
+  (`infra/profiling/alloy-*.yaml`) scraping konfig pods → pyroscope with
+  `service_name=konfig`. eBPF needs host-kernel perf access, which is unavailable
+  in kind-on-Apple-Silicon — hence the baseline must come from a Linux CI runner.
+- **The in-process agent needs a relaxed seccomp profile.** If you do use it,
+  `pprof-rs` fails at startup with `Error: AdHoc("create profiler error")` under
+  the default restricted seccomp. The konfig container must run with
+  `securityContext: { seccompProfile: { type: Unconfined }, capabilities: { add: ["SYS_PTRACE"] } }`
+  for the signal/timer-based sampler to initialize.
 
 # flamebearer_to_pprof.py — pprof + summary export (CU-86aj7kawc)
 
