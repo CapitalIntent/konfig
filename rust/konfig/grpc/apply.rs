@@ -406,13 +406,23 @@ pub async fn apply_spec(
         return Err(status);
     }
 
-    let patch_body = json!({
+    let mut patch_body = json!({
         "apiVersion": format!("{GROUP}/{VERSION}"),
         "kind": "Config",
         "metadata": { "name": name, "namespace": namespace },
         "spec": serde_json::to_value(&spec)
             .map_err(|e| Status::internal(format!("serialize error: {e}")))?
     });
+
+    // Stitch the trace across the etcd/watch boundary: stamp the current Apply
+    // span's W3C traceparent onto the object so the watcher can `add_link` the
+    // subscriber fan-out back to this Apply (Apply→subscriber waterfall). No-op
+    // when tracing is off (`current_traceparent` → None), so the common path
+    // writes no extra annotation.
+    if let Some(traceparent) = crate::telemetry::current_traceparent() {
+        patch_body["metadata"]["annotations"][crate::telemetry::TRACEPARENT_ANNOTATION] =
+            serde_json::Value::String(traceparent);
+    }
 
     match patch_with_retry(&api, name, patch_body).await {
         Ok(rv) => {
