@@ -1253,8 +1253,10 @@ mod tests {
             Ok(config_event(1, "rv-2")),
             Err(Status::resource_exhausted("subscriber lagged")),
         ];
-        let mut stream =
-            std::pin::pin!(sse_event_stream(futures_util::stream::iter(items), frame_config_event));
+        let mut stream = std::pin::pin!(sse_event_stream(
+            futures_util::stream::iter(items),
+            frame_config_event
+        ));
         let mut out = Vec::new();
         while let Some(Ok(chunk)) = stream.next().await {
             out.extend_from_slice(&chunk);
@@ -1275,8 +1277,10 @@ mod tests {
     #[tokio::test]
     async fn sse_event_stream_ends_cleanly_when_upstream_closes() {
         let items: Vec<Result<ConfigEvent, Status>> = vec![Ok(config_event(3, "rv-1"))];
-        let mut stream =
-            std::pin::pin!(sse_event_stream(futures_util::stream::iter(items), frame_config_event));
+        let mut stream = std::pin::pin!(sse_event_stream(
+            futures_util::stream::iter(items),
+            frame_config_event
+        ));
         let mut out = Vec::new();
         while let Some(Ok(chunk)) = stream.next().await {
             out.extend_from_slice(&chunk);
