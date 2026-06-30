@@ -163,10 +163,22 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
     // the metric sampler above it is a detached background task: it shares this
     // `KonfigServer` instance (cheap `Arc` clone), so every gate — drain,
     // per-tenant authz, quota, audit, metrics — still applies to JSON callers.
-    // It binds its own `--http-addr` and dies with the process on shutdown.
+    // It dies with the process on shutdown.
+    //
+    // Bind the listener HERE on the startup path (not inside the detached task)
+    // so a port clash fails LOUDLY — panicking startup like the `/metrics`
+    // server's bind — instead of silently killing the spawned task and leaving
+    // a "healthy" pod with no gateway. The operator explicitly asked for the
+    // gateway via `--http-addr` (and we already fail-fast on a missing token),
+    // so refusing to start on a bind error is the right signal.
     if let Some(gateway) = cfg.http_gateway {
         info!(addr = %gateway.addr, "HTTP/JSON gateway enabled");
-        tokio::spawn(super::http_gateway::serve_gateway(server, gateway));
+        let listener = tokio::net::TcpListener::bind(gateway.addr)
+            .await
+            .expect("bind HTTP/JSON gateway listener");
+        tokio::spawn(super::http_gateway::serve_gateway(
+            server, gateway, listener,
+        ));
     }
 
     let mut builder = tonic::transport::Server::builder()
