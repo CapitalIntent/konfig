@@ -28,13 +28,13 @@ use kube::Client;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{broadcast, oneshot};
 use tonic::transport::ServerTlsConfig;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::acl::{AclSynced, AclTable, AclWatcher};
 use crate::cache::ConfigCache;
 use crate::grpc::authz::Mode as AuthzMode;
 use crate::grpc::tls::{TlsPaths, build_server_tls_config, warn_tls_disabled};
-use crate::grpc::{ServerConfig, serve};
+use crate::grpc::{HttpGatewayConfig, ServerConfig, serve};
 use crate::metrics::{LastEventAtMap, last_event_at_for, spawn_tokio_runtime_sampler};
 use crate::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
 use crate::quota::{
@@ -178,6 +178,43 @@ pub struct Args {
     /// or `enforce`.
     #[arg(long, env = "KONFIG_DEFAULT_CACHE_BUDGET_BYTES", default_value = "0")]
     pub default_cache_budget_bytes: u64,
+
+    /// HTTP/JSON gateway listen address (CU-86ahrwd70). When set, a sibling
+    /// `axum` server starts on this address and transcodes JSON ⇄ proto for the
+    /// full unary `KonfigService` surface (browsers / non-gRPC clients). Unset
+    /// (the default) ⇒ gateway OFF; only gRPC + grpc-Web on `--grpc-addr`.
+    ///
+    /// The gateway is plaintext and reaches konfig as the `anonymous` identity,
+    /// and it exposes writes + secret reads — so it REQUIRES `--http-auth-token`
+    /// unless `--http-insecure` is explicitly passed (startup fails fast
+    /// otherwise, mirroring `--tls`). Run it cluster-internal.
+    #[arg(long, env = "KONFIG_HTTP_ADDR")]
+    pub http_addr: Option<SocketAddr>,
+
+    /// Bearer token required on every HTTP/JSON gateway request
+    /// (`Authorization: Bearer <token>`). REQUIRED when `--http-addr` is set,
+    /// unless `--http-insecure` is passed. Ignored when the gateway is off.
+    #[arg(long, env = "KONFIG_HTTP_AUTH_TOKEN")]
+    pub http_auth_token: Option<String>,
+
+    /// Value returned in `Access-Control-Allow-Origin` on gateway responses and
+    /// CORS preflights (e.g. `https://backstage.example`). Unset (the default)
+    /// ⇒ no CORS headers emitted (same-origin browser requests only).
+    #[arg(long, env = "KONFIG_HTTP_CORS_ALLOW_ORIGIN")]
+    pub http_cors_allow_origin: Option<String>,
+
+    /// Explicitly disable the HTTP/JSON gateway's bearer-token requirement.
+    /// Only meaningful with `--http-addr`. Leaves writes + secret reads
+    /// unauthenticated on a plaintext port — run cluster-internal ONLY. Without
+    /// this, `--http-addr` set with no token fails startup (fail-safe). Like
+    /// `--tls`, takes an explicit value: `--http-insecure=true`.
+    #[arg(
+        long,
+        env = "KONFIG_HTTP_INSECURE",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub http_insecure: bool,
 }
 
 /// Resolve a `ServerTlsConfig` from the TLS-related fields on `args`, or
@@ -215,6 +252,61 @@ pub fn resolve_tls_config(
     Ok(Some(cfg))
 }
 
+/// Resolve the optional HTTP/JSON gateway config (CU-86ahrwd70) from the
+/// gateway-related fields on `args`. Returns:
+///   - `Ok(None)` when `--http-addr` is unset — the gateway stays off.
+///   - `Ok(Some(..))` with `auth_token: None` when `--http-insecure` is set
+///     (logs a loud warning — the port then exposes writes + secret reads with
+///     no auth).
+///   - `Ok(Some(..))` with the bearer token when `--http-addr` + a non-empty
+///     `--http-auth-token` are both present.
+///   - `Err(..)` when `--http-addr` is set without a token and `--http-insecure`
+///     was NOT passed — fail-fast before any kube call, mirroring
+///     [`resolve_tls_config`], so an operator cannot accidentally expose an
+///     unauthenticated write/secret surface.
+///
+/// Extracted so the branches are unit-testable without the full startup.
+pub fn resolve_http_gateway_config(
+    args: &Args,
+) -> Result<Option<HttpGatewayConfig>, Box<dyn std::error::Error>> {
+    let Some(addr) = args.http_addr else {
+        return Ok(None);
+    };
+
+    if args.http_insecure {
+        warn!(
+            %addr,
+            "HTTP/JSON gateway: --http-insecure set — bearer-token auth DISABLED. \
+             This port exposes writes and secret reads with NO authentication; \
+             run it cluster-internal only."
+        );
+        return Ok(Some(HttpGatewayConfig {
+            addr,
+            auth_token: None,
+            cors_allow_origin: args.http_cors_allow_origin.clone(),
+            insecure: true,
+        }));
+    }
+
+    let token = args
+        .http_auth_token
+        .clone()
+        .filter(|t| !t.is_empty())
+        .ok_or(
+            "HTTP/JSON gateway enabled (--http-addr) but \
+             --http-auth-token/KONFIG_HTTP_AUTH_TOKEN not set. The gateway exposes \
+             writes and secret reads over plaintext, so a bearer token is required. \
+             Pass --http-insecure=true to explicitly opt out (cluster-internal only).",
+        )?;
+
+    Ok(Some(HttpGatewayConfig {
+        addr,
+        auth_token: Some(token),
+        cors_allow_origin: args.http_cors_allow_origin.clone(),
+        insecure: false,
+    }))
+}
+
 /// Filter out empty secret-namespace entries left behind by `--secret-namespaces=`
 /// or a trailing comma in `KONFIG_SECRET_NAMESPACES`.
 ///
@@ -246,6 +338,11 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve TLS up-front so a misconfig fails startup before we touch
     // the kube API or spawn any watcher.
     let tls_config = resolve_tls_config(&args)?;
+
+    // Resolve the optional HTTP/JSON gateway (CU-86ahrwd70) here too, so an
+    // `--http-addr` without a bearer token (and no `--http-insecure`) fails
+    // fast before any kube call — same fail-safe contract as TLS.
+    let http_gateway = resolve_http_gateway_config(&args)?;
 
     // Spawn tokio runtime-metrics sampler — publishes `tokio_*` gauges every
     // 5 s on the same `/metrics` endpoint as the Prometheus app metrics.
@@ -471,6 +568,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         default_max_applies_per_second: args.default_max_applies_per_second,
         cache_ledger,
         default_cache_budget_bytes: args.default_cache_budget_bytes,
+        http_gateway,
     })
     .await?;
 
@@ -603,6 +701,10 @@ mod tests {
             default_max_subscribers: 0,
             default_max_applies_per_second: 0,
             default_cache_budget_bytes: 0,
+            http_addr: None,
+            http_auth_token: None,
+            http_cors_allow_origin: None,
+            http_insecure: false,
         }
     }
 
@@ -641,6 +743,73 @@ mod tests {
         let err = resolve_tls_config(&args).err().expect("must error");
         let msg = err.to_string();
         assert!(msg.contains("tls-client-ca") || msg.contains("KONFIG_TLS_CLIENT_CA"));
+    }
+
+    // ── HTTP/JSON gateway resolution (CU-86ahrwd70) ───────────────────────────
+
+    /// No `--http-addr` ⇒ gateway off (`Ok(None)`), regardless of token.
+    #[test]
+    fn resolve_http_gateway_none_when_addr_unset() {
+        let cfg = resolve_http_gateway_config(&args_with_tls_off()).expect("ok");
+        assert!(cfg.is_none(), "no --http-addr yields no gateway");
+    }
+
+    /// `--http-addr` set without a token and without `--http-insecure` must
+    /// fail startup — the gateway exposes writes + secret reads.
+    #[test]
+    fn resolve_http_gateway_addr_without_token_errors() {
+        let mut args = args_with_tls_off();
+        args.http_addr = Some("0.0.0.0:8080".parse().unwrap());
+        let err = resolve_http_gateway_config(&args).expect_err("must error without a token");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("http-auth-token") || msg.contains("KONFIG_HTTP_AUTH_TOKEN"),
+            "error must name the missing token flag, got: {msg}"
+        );
+    }
+
+    /// An empty token string is treated as absent (same fail-fast path).
+    #[test]
+    fn resolve_http_gateway_empty_token_errors() {
+        let mut args = args_with_tls_off();
+        args.http_addr = Some("0.0.0.0:8080".parse().unwrap());
+        args.http_auth_token = Some(String::new());
+        assert!(
+            resolve_http_gateway_config(&args).is_err(),
+            "an empty token must not satisfy the requirement"
+        );
+    }
+
+    /// `--http-addr` + a token ⇒ a secure gateway config with the token + CORS.
+    #[test]
+    fn resolve_http_gateway_addr_with_token_ok() {
+        let mut args = args_with_tls_off();
+        args.http_addr = Some("0.0.0.0:8080".parse().unwrap());
+        args.http_auth_token = Some("s3cret".to_string());
+        args.http_cors_allow_origin = Some("https://backstage.example".to_string());
+        let cfg = resolve_http_gateway_config(&args)
+            .expect("ok")
+            .expect("gateway enabled");
+        assert_eq!(cfg.addr, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(cfg.auth_token.as_deref(), Some("s3cret"));
+        assert_eq!(
+            cfg.cors_allow_origin.as_deref(),
+            Some("https://backstage.example")
+        );
+        assert!(!cfg.insecure);
+    }
+
+    /// `--http-insecure=true` allows a tokenless gateway (explicit opt-out).
+    #[test]
+    fn resolve_http_gateway_insecure_allows_no_token() {
+        let mut args = args_with_tls_off();
+        args.http_addr = Some("0.0.0.0:8080".parse().unwrap());
+        args.http_insecure = true;
+        let cfg = resolve_http_gateway_config(&args)
+            .expect("ok")
+            .expect("gateway enabled");
+        assert!(cfg.insecure);
+        assert!(cfg.auth_token.is_none());
     }
 
     #[test]

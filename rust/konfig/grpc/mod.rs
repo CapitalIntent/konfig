@@ -22,6 +22,7 @@ pub mod apply;
 pub mod audit;
 pub mod authz;
 pub mod get;
+pub mod http_gateway;
 pub mod identity;
 pub mod revert;
 pub mod secret_apply;
@@ -78,6 +79,7 @@ pub(crate) use context::{
 };
 pub use drain::DRAIN_TIMEOUT;
 pub(crate) use drain::check_drain;
+pub use http_gateway::HttpGatewayConfig;
 #[cfg(test)]
 pub(crate) use serve::apply_h2_overrides;
 pub use serve::serve;
@@ -185,6 +187,11 @@ pub struct ServerConfig {
     /// Default per-tenant cache byte budget when no `TenantQuota` names the
     /// identity (MT-4, `--default-cache-budget-bytes`). `0` = unlimited.
     pub default_cache_budget_bytes: u64,
+    /// Optional sibling HTTP/JSON gateway (CU-86ahrwd70). `Some` engages an
+    /// `axum` server on a separate `--http-addr` that transcodes JSON ⇄ proto
+    /// and reuses this `KonfigServer`'s handlers (and every gate). `None` (the
+    /// default) leaves the gateway off — gRPC/grpc-Web only.
+    pub http_gateway: Option<HttpGatewayConfig>,
 }
 
 /// Type-erased shutdown future.  Boxed so the field doesn't push a generic
@@ -541,6 +548,52 @@ pub(crate) fn snapshot_to_proto(snap: &crate::types::ConfigSnapshot) -> Config {
             .map(|t| t.elapsed().as_millis() as i64)
             .unwrap_or(-1),
     }
+}
+
+/// Drain-plumbing test server: authz + quotas disabled (guards short-circuit),
+/// empty caches, a non-connecting dummy kube client. `pub(crate)` so sibling
+/// test modules (e.g. [`http_gateway`]) can build a real `KonfigServer` and
+/// exercise the RPC handlers without standing up kube.
+#[cfg(test)]
+pub(crate) fn test_server() -> KonfigServer {
+    KonfigServer {
+        cache: Arc::new(ConfigCache::new(crate::types::ConfigSnapshot::default())),
+        secret_cache: Arc::new(SecretCache::new()),
+        kube_client: dummy_client(),
+        namespace_broadcasts: Arc::new(DashMap::new()),
+        namespace_replay_buffers: Arc::new(DashMap::new()),
+        watcher_handles: Arc::new(DashMap::new()),
+        secret_namespace_broadcasts: Arc::new(DashMap::new()),
+        draining: Arc::new(AtomicBool::new(false)),
+        drain_notify: Arc::new(Notify::new()),
+        coalesce_window: Duration::ZERO,
+        broadcast_shards: 1,
+        // Authz disabled in the drain-plumbing tests — the guard
+        // short-circuits, so these tests exercise the original path.
+        authz_mode: AuthzMode::Disabled,
+        acl_table: Arc::new(AclTable::new()),
+        acl_synced: Arc::new(AclSynced::new()),
+        schema_table: Arc::new(SchemaTable::new()),
+        // Quotas disabled in the drain-plumbing tests — admit_subscriber
+        // short-circuits, so these tests exercise the original path.
+        quota_mode: QuotaMode::Disabled,
+        quota_table: Arc::new(QuotaTable::new()),
+        quota_synced: Arc::new(QuotaSynced::new()),
+        subscriber_counts: Arc::new(SubscriberCounts::new()),
+        default_max_subscribers: 0,
+        apply_limiter: Arc::new(ApplyLimiter::new()),
+        default_max_applies_per_second: 0,
+        cache_ledger: Arc::new(TenantCacheLedger::new()),
+        default_cache_budget_bytes: 0,
+    }
+}
+
+/// Build a `kube::Client` from the in-tree default config.  Never actually
+/// connects — the tests above only touch the drain plumbing.
+#[cfg(test)]
+fn dummy_client() -> kube::Client {
+    let cfg = kube::Config::new("http://127.0.0.1:0".parse().expect("valid URL"));
+    kube::Client::try_from(cfg).expect("infallible — only constructs HTTP client")
 }
 
 #[cfg(test)]
@@ -1031,46 +1084,6 @@ mod tests {
             name: "x".into(),
         });
         assert_eq!(client_addr(&req), "unknown");
-    }
-
-    fn test_server() -> KonfigServer {
-        KonfigServer {
-            cache: Arc::new(ConfigCache::new(crate::types::ConfigSnapshot::default())),
-            secret_cache: Arc::new(SecretCache::new()),
-            kube_client: dummy_client(),
-            namespace_broadcasts: Arc::new(DashMap::new()),
-            namespace_replay_buffers: Arc::new(DashMap::new()),
-            watcher_handles: Arc::new(DashMap::new()),
-            secret_namespace_broadcasts: Arc::new(DashMap::new()),
-            draining: Arc::new(AtomicBool::new(false)),
-            drain_notify: Arc::new(Notify::new()),
-            coalesce_window: Duration::ZERO,
-            broadcast_shards: 1,
-            // Authz disabled in the drain-plumbing tests — the guard
-            // short-circuits, so these tests exercise the original path.
-            authz_mode: AuthzMode::Disabled,
-            acl_table: Arc::new(AclTable::new()),
-            acl_synced: Arc::new(AclSynced::new()),
-            schema_table: Arc::new(SchemaTable::new()),
-            // Quotas disabled in the drain-plumbing tests — admit_subscriber
-            // short-circuits, so these tests exercise the original path.
-            quota_mode: QuotaMode::Disabled,
-            quota_table: Arc::new(QuotaTable::new()),
-            quota_synced: Arc::new(QuotaSynced::new()),
-            subscriber_counts: Arc::new(SubscriberCounts::new()),
-            default_max_subscribers: 0,
-            apply_limiter: Arc::new(ApplyLimiter::new()),
-            default_max_applies_per_second: 0,
-            cache_ledger: Arc::new(TenantCacheLedger::new()),
-            default_cache_budget_bytes: 0,
-        }
-    }
-
-    /// Build a `kube::Client` from the in-tree default config.  Never actually
-    /// connects — the tests above only touch the drain plumbing.
-    fn dummy_client() -> kube::Client {
-        let cfg = kube::Config::new("http://127.0.0.1:0".parse().expect("valid URL"));
-        kube::Client::try_from(cfg).expect("infallible — only constructs HTTP client")
     }
 
     /// `rate_limit_apply` glue (CU-86aj8pvj7, MT-6): bare requests resolve to the
