@@ -27,22 +27,27 @@ RPC roots) plus `konfig.{apply_attempt,cache_get,cache_update,watch_event,broadc
 ## Span model (read before interpreting the traces)
 
 konfig's write and distribution paths are **decoupled by the Kubernetes watch
-boundary**, so there is intentionally *no* single Apply→per-subscriber waterfall:
+boundary**, so they are separate traces *stitched together by an OTEL span link*
+carried across that boundary:
 
-1. `Apply` patches the `Config` CRD in etcd and returns — trace #1
+1. `Apply` patches the `Config` CRD in etcd and stamps its own W3C `traceparent`
+   onto the object as the `konfig.io/traceparent` annotation — trace #1
    (`konfig.Apply` → `konfig.apply_attempt`).
-2. The watcher independently observes that change over its watch stream and
-   updates the cache — trace #2 (`konfig.watch_event` → `konfig.cache_update`).
+2. The watcher independently observes that change over its watch stream, recovers
+   the `traceparent` from the annotation, and updates the cache — trace #2
+   (`konfig.watch_event` → `konfig.cache_update`).
 3. A coalesce-flush task fans the event out to all subscriber shards —
-   `konfig.broadcast_dispatch` with `subscribers=N`.
+   `konfig.broadcast_dispatch` with `subscribers=N`. This span carries an OTEL
+   **link** back to the originating Apply's span context (one link per batched
+   event), so a Jaeger trace follows Apply → fan-out across the etcd/watch and
+   broadcast-channel boundaries.
 
-The per-event fan-out is therefore represented by the **aggregate
-`broadcast_dispatch(subscribers=N)`** span, not by N individual subscriber-receipt
-spans. This is the "refuted" branch the parent ticket anticipated
-("subscribe.rs broadcast path may need explicit span injection"). A single
-connected trace would require context propagation across the etcd/watch boundary
-(Apply→watch) and across the broadcast channel (broadcast→subscriber) — tracked
-as a follow-up (see "Gaps" below).
+The per-event fan-out is still the **aggregate `broadcast_dispatch(subscribers=N)`**
+span — not N individual subscriber-receipt spans (synchronous channel sends; see
+Gaps). The dispatch span is *linked* (not parented) to Apply: links are the
+OTEL-canonical way to express async, fan-in causality without forcing every event
+into one giant trace. Fully dormant when tracing is off — no active span → no
+annotation written → no link added → zero hot-path cost.
 
 ## Child spans (DEBUG) export independently of the log level (CU-86aj9pvff)
 
@@ -119,16 +124,18 @@ curl -s "localhost:16686/api/traces/<traceID>" | jq . > traces/<name>.json
 
 ## Gaps / follow-ups
 
-- **Single connected Apply→subscriber waterfall** is not captured (decoupled by
-  the watch boundary + coalesce-flush task). Fan-out is the aggregate
-  `broadcast_dispatch(subscribers=N)` span. Connecting the paths needs explicit
-  OTEL context propagation through the resource annotation and broadcast channel.
+- ~~**Single connected Apply→subscriber waterfall** is not captured.~~ **Linked
+  in code** — Apply stamps its `traceparent` onto the object
+  (`konfig.io/traceparent` annotation) and `broadcast_dispatch` `add_link`s back
+  to it (see Span model above). End-to-end Jaeger evidence is captured per
+  `docs/cluster-eval-runbook.md` (Session C).
 - **Per-subscriber receipt spans** are not emitted (the parent's "if refuted"
   note) — `send_to_all` is synchronous into channels and not individually spanned.
 - ~~**OTEL export is dark at INFO**: child spans require per-module debug
   directives that also flood logs.~~ **RESOLVED (CU-86aj9pvff)** — the OTEL
   layer now has its own filter (`konfig=debug` default, `OTEL_TRACES_LEVEL`
   override), independent of `RUST_LOG`. See the section above.
-- **Watcher reconnect/backoff trace** not captured here (requires disrupting
-  API-server access; the loadtest S3 is *client* reconnect, not the konfig
-  watcher reconnecting to the apiserver).
+- ~~**Watcher reconnect/backoff trace** not captured here.~~ **Span added in
+  code** — `run_with_reconnect` and the Config watcher emit `konfig.watch_connect`
+  spans carrying `attempt` + `backoff_ms`. Capturing the trace under a real
+  API-server disruption is per `docs/cluster-eval-runbook.md` (Session B).

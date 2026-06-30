@@ -42,6 +42,14 @@ pub struct BroadcastFrame {
     /// `ConfigEvent`.  Shared `Arc` clone from `ConfigSnapshot::labels` — a
     /// refcount bump per frame, not a `BTreeMap` deep copy.
     pub labels: Arc<BTreeMap<String, String>>,
+    /// W3C span context of the originating Apply, recovered by the watcher from
+    /// the object's `konfig.io/traceparent` annotation (Apply→subscriber
+    /// waterfall). `None` when tracing is off or the write carried no
+    /// traceparent. The `konfig.broadcast_dispatch` span `add_link`s to this so
+    /// a Jaeger trace connects Apply → fan-out across the etcd/watch and
+    /// broadcast-channel boundaries. A small `Clone` value (trace+span id +
+    /// flags), so the per-frame cost is one cheap clone only when present.
+    pub parent_span: Option<opentelemetry::trace::SpanContext>,
 }
 
 /// Broadcast ring-buffer capacity per namespace.
@@ -340,6 +348,7 @@ mod tests {
             sent_at: Instant::now(),
             event,
             labels: Arc::new(BTreeMap::new()),
+            parent_span: None,
         });
         bcast_tx.send(frame).expect("send failed");
 
@@ -399,6 +408,7 @@ mod tests {
                 sent_at: Instant::now() - Duration::from_millis(1),
                 event,
                 labels: Arc::new(BTreeMap::new()),
+                parent_span: None,
             });
             bcast_tx.send(frame).expect("send failed");
         }
@@ -462,6 +472,7 @@ mod tests {
                 sent_at: Instant::now() - Duration::from_millis(1),
                 event,
                 labels: Arc::new(BTreeMap::new()),
+                parent_span: None,
             });
             bcast_tx.send(frame).expect("send failed");
         }

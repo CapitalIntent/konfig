@@ -18,6 +18,7 @@ use prost::Message as _;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::grpc::snapshot_to_proto;
 use crate::metrics::{APPLY_TO_BROADCAST_SECONDS, EVENTS_BROADCAST, H2_DATA_FRAME_BYTES};
@@ -283,6 +284,12 @@ async fn pump_immediate<S>(
                 "konfig.broadcast_dispatch",
                 subscribers = shards.total_receiver_count(),
             );
+            // Link the fan-out back to the originating Apply, if its span
+            // context rode in on the object's traceparent annotation
+            // (Apply→subscriber waterfall). No-op when tracing is off.
+            if let Some(sc) = &frame.parent_span {
+                span.add_link(sc.clone());
+            }
             let _enter = span.enter();
             if shards.send_to_all(frame) {
                 events_broadcast.inc();
@@ -384,6 +391,16 @@ fn process_namespace_event(
     // the replay entry and the broadcast frame.
     let labels = Arc::clone(&snap.labels);
 
+    // Recover the originating Apply's span context from the traceparent
+    // annotation so the dispatch span can link the fan-out back to the Apply
+    // (Apply→subscriber waterfall). Absent / tracing-off → None → no link.
+    let parent_span = obj
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(crate::telemetry::TRACEPARENT_ANNOTATION))
+        .and_then(|tp| crate::telemetry::span_context_from_traceparent(tp));
+
     H2_DATA_FRAME_BYTES.observe(config_event.encoded_len() as f64);
 
     // Push into replay buffer before broadcasting so a subscriber that
@@ -404,6 +421,7 @@ fn process_namespace_event(
         sent_at,
         event: config_event,
         labels,
+        parent_span,
     }))
 }
 
@@ -429,6 +447,12 @@ fn flush_batch(
     );
     let _enter = span.enter();
     for frame in batch.drain(..) {
+        // Link the dispatch to each batched event's originating Apply
+        // (Apply→subscriber waterfall) — a coalesced burst may span several
+        // Applies, so the span can carry several links. No-op when tracing off.
+        if let Some(sc) = &frame.parent_span {
+            span.add_link(sc.clone());
+        }
         if shards.send_to_all(frame) {
             events_broadcast.inc();
         }
@@ -1099,5 +1123,53 @@ mod tests {
         );
         let buf = crate::sync_util::lock_recovered(&replay);
         assert_eq!(buf.len(), total);
+    }
+
+    /// Apply→subscriber waterfall: a Config carrying a `traceparent` annotation
+    /// must yield a frame whose `parent_span` recovers the originating Apply's
+    /// trace/span ids, so the dispatch span can `add_link` to it.
+    #[test]
+    fn process_event_recovers_parent_span_from_traceparent() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let replay = Arc::new(Mutex::new(VecDeque::new()));
+
+        let mut obj = dyn_config("cfg", "ns", 1, "100");
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        obj.metadata.annotations = Some(
+            [(
+                crate::telemetry::TRACEPARENT_ANNOTATION.to_string(),
+                tp.to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let frame = process_namespace_event(Event::Apply(obj), &replay)
+            .expect("annotated Config must produce a frame");
+        let sc = frame
+            .parent_span
+            .clone()
+            .expect("traceparent annotation → linked parent span");
+        assert_eq!(
+            sc.trace_id().to_string(),
+            "0af7651916cd43dd8448eb211c80319c"
+        );
+        assert_eq!(sc.span_id().to_string(), "b7ad6b7169203331");
+    }
+
+    /// No traceparent annotation → `parent_span` stays empty; the dispatch span
+    /// is simply unlinked (the common, tracing-off path).
+    #[test]
+    fn process_event_without_traceparent_has_no_parent_span() {
+        let replay = Arc::new(Mutex::new(VecDeque::new()));
+        let obj = dyn_config("cfg", "ns", 1, "100");
+        let frame = process_namespace_event(Event::Apply(obj), &replay)
+            .expect("Config must produce a frame");
+        assert!(
+            frame.parent_span.is_none(),
+            "no annotation → no parent link"
+        );
     }
 }

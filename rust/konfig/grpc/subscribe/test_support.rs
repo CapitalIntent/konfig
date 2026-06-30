@@ -51,6 +51,7 @@ pub(crate) fn make_frame(event: ConfigEvent) -> Arc<BroadcastFrame> {
         sent_at: Instant::now(),
         event: Arc::new(event),
         labels: Arc::new(BTreeMap::new()),
+        parent_span: None,
     })
 }
 

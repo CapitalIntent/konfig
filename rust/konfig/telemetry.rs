@@ -242,6 +242,77 @@ where
     tracing_opentelemetry::layer().with_tracer(tracer)
 }
 
+// ── W3C trace-context propagation across the etcd/watch boundary ─────────────
+//
+// The Apply RPC runs under the `konfig.Apply` span, but the watcher that later
+// observes that write (over the K8s watch stream) runs on a *different* task
+// with no in-process link — the etcd/watch boundary breaks the trace. To stitch
+// them back together we carry the Apply span's W3C `traceparent` on the Config
+// object as an annotation: Apply writes it, the watcher reads it back and
+// `add_link`s the broadcast-dispatch span to it. Dormant when tracing is off
+// (no active span context → no annotation written → no link added → 0 cost).
+
+/// Annotation key carrying the originating Apply span's W3C `traceparent`.
+/// Namespaced under `konfig.io/` like the rest of our object metadata.
+pub const TRACEPARENT_ANNOTATION: &str = "konfig.io/traceparent";
+
+/// Minimal in-memory carrier so the global text-map propagator can read/write a
+/// `traceparent` without pulling in `opentelemetry-http` — the transport here
+/// is a CRD annotation, not HTTP headers.
+#[derive(Default)]
+struct MapCarrier(std::collections::HashMap<String, String>);
+
+impl opentelemetry::propagation::Injector for MapCarrier {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_string(), value);
+    }
+}
+
+impl opentelemetry::propagation::Extractor for MapCarrier {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(String::as_str).collect()
+    }
+}
+
+/// W3C `traceparent` for the *current* span, or `None` when no sampled span is
+/// active (tracing off, or this path isn't under an exported span). Called on
+/// the Apply write path to stamp the value onto the Config object so the
+/// watcher can later link the subscriber fan-out back to this Apply.
+pub fn current_traceparent() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let cx = tracing::Span::current().context();
+    // No valid span context (e.g. OTEL export disabled) → nothing to propagate.
+    if !cx.span().span_context().is_valid() {
+        return None;
+    }
+    let mut carrier = MapCarrier::default();
+    opentelemetry::global::get_text_map_propagator(|p| p.inject_context(&cx, &mut carrier));
+    carrier.0.remove("traceparent")
+}
+
+/// Parse a W3C `traceparent` string back into a remote [`opentelemetry::trace::SpanContext`],
+/// or `None` if it is absent / malformed / not sampled-valid. Called on the
+/// watcher path to recover the originating Apply's span context from the Config
+/// object's annotation so the broadcast-dispatch span can `add_link` to it.
+pub fn span_context_from_traceparent(
+    traceparent: &str,
+) -> Option<opentelemetry::trace::SpanContext> {
+    use opentelemetry::trace::TraceContextExt;
+
+    let mut carrier = MapCarrier::default();
+    carrier
+        .0
+        .insert("traceparent".to_string(), traceparent.to_string());
+    let cx = opentelemetry::global::get_text_map_propagator(|p| p.extract(&carrier));
+    let sc = cx.span().span_context().clone();
+    sc.is_valid().then_some(sc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +327,64 @@ mod tests {
         assert!(
             dbg.contains("ParentBased"),
             "unset sampler must default to ParentBased(AlwaysOn); got {dbg}"
+        );
+    }
+
+    /// Install the W3C propagator (idempotent; prod does this in
+    /// `build_tracer_provider`). Tests share process-global state, so make the
+    /// propagator deterministic before exercising the trace-context helpers.
+    fn install_w3c_propagator() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+    }
+
+    /// A known-valid W3C `traceparent` must parse back to the same trace/span
+    /// ids with the sampled flag set — this is the watcher side of the
+    /// Apply→subscriber waterfall link.
+    #[test]
+    fn span_context_from_traceparent_parses_w3c() {
+        install_w3c_propagator();
+        // Canonical W3C example traceparent (version 00, sampled).
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let sc = span_context_from_traceparent(tp).expect("valid traceparent → SpanContext");
+        assert!(sc.is_valid(), "parsed context must be valid");
+        assert!(sc.is_sampled(), "sampled flag (01) must round-trip");
+        assert_eq!(
+            sc.trace_id().to_string(),
+            "0af7651916cd43dd8448eb211c80319c"
+        );
+        assert_eq!(sc.span_id().to_string(), "b7ad6b7169203331");
+    }
+
+    /// Absent / malformed / all-zero traceparents must yield `None` so the
+    /// watcher silently falls back to an unlinked span instead of attaching a
+    /// bogus link.
+    #[test]
+    fn span_context_from_traceparent_rejects_bad_input() {
+        install_w3c_propagator();
+        assert!(span_context_from_traceparent("").is_none(), "empty → None");
+        assert!(
+            span_context_from_traceparent("not-a-traceparent").is_none(),
+            "garbage → None"
+        );
+        assert!(
+            span_context_from_traceparent(
+                "00-00000000000000000000000000000000-0000000000000000-01"
+            )
+            .is_none(),
+            "all-zero ids are invalid per the W3C spec → None"
+        );
+    }
+
+    /// With no OTEL layer / no active sampled span (a plain unit test), the
+    /// Apply side must produce no traceparent — proving the mechanism is fully
+    /// dormant when tracing is off (zero hot-path cost).
+    #[test]
+    fn current_traceparent_is_none_without_active_span() {
+        assert!(
+            current_traceparent().is_none(),
+            "no active sampled span → no traceparent stamped"
         );
     }
 
