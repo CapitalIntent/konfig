@@ -162,6 +162,86 @@ curl -sS http://konfig:8080/konfig.v1.KonfigService/ApplySecret \
 
 The server base64-encodes the YAML map values before patching.
 
+## Streaming (SSE)
+
+The infinite `Subscribe` / `SubscribeSecrets` RPCs cannot collapse into one JSON
+body, so they are served as [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+— an HTTP-native, one-way `text/event-stream` that any browser (`EventSource`)
+or `curl` can read. These are a **thin presentation layer**: each endpoint
+re-frames the *same* in-process broadcast fan-out the gRPC `Subscribe` clients
+use (same replay, same resume, same lag handling) — no new watch logic.
+
+- **Method/Path**: `GET /v1/configs/{namespace}/{name}/watch` and
+  `GET /v1/secrets/{namespace}/{name}/watch` (one key per connection).
+- **Auth**: the *same* uniform bearer gate as the rest of the gateway — applies
+  to config **and** secret streams. `--http-insecure` bypasses both.
+- **Readiness**: during cold start (before the watcher's first list warms the
+  cache) the endpoint returns `503` + `Retry-After: 1`; retry shortly.
+
+### Frame shape
+
+Each change is one SSE frame:
+
+```
+event: MODIFIED
+id: 12346
+data: {"namespace":"default","name":"app-config","schema_version":4,"content_json":"{...}","resource_version":"12346","age_ms":5,"stale_since_ms":-1}
+```
+
+- `event:` is the change type — `SNAPSHOT` (the current state sent first),
+  `ADDED`, `MODIFIED`, or `DELETED`.
+- `id:` is the `resource_version`. The browser remembers the last `id:` it saw
+  and echoes it back as the `Last-Event-ID` header on reconnect; the gateway
+  maps that to `resume_resource_version` so you only replay what you missed.
+- `data:` is the proto3-JSON `Config` (or `SecretResponse`, whose `data_json`
+  stays base64 — same policy as `GetSecret`).
+- A `: keep-alive` comment is sent every 15 s so idle connections survive proxy
+  timeouts (the `EventSource` parser ignores comment lines).
+
+### Terminal frames
+
+Once bytes are flowing the HTTP status is locked at `200`, so a mid-stream fault
+is surfaced as a final frame and then the stream ends:
+
+- **Lag** (`event: RELOAD`) — the subscriber fell behind the broadcast ring
+  (`RESOURCE_EXHAUSTED`). The client must **re-fetch** a fresh snapshot (e.g.
+  reconnect, which replays a `SNAPSHOT`).
+- **Error** (`event: error`) — any other gRPC error, carrying
+  `{"code":"...","message":"..."}`.
+
+On graceful drain (SIGTERM) the underlying subscriber closes cleanly
+(end-of-stream, no terminal frame), so `EventSource` simply reconnects to a
+healthy pod.
+
+### Examples
+
+```sh
+# Watch one config (Ctrl-C to stop)
+curl -N http://konfig:8080/v1/configs/default/app-config/watch \
+  -H "Authorization: Bearer $TOKEN"
+
+# Resume after a disconnect from the last resource_version you saw
+curl -N http://konfig:8080/v1/configs/default/app-config/watch \
+  -H "Authorization: Bearer $TOKEN" -H 'Last-Event-ID: 12346'
+
+# Watch one secret (values stay base64)
+curl -N http://konfig:8080/v1/secrets/konfig-system/db-creds/watch \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Known limitation: browser `EventSource` + auth
+
+The browser `EventSource` API **cannot set an `Authorization` header**, so a
+secured stream (the default) is not directly reachable from page JS. Options:
+
+- Run the gateway **cluster-internal** with `--http-insecure` behind a trusted
+  proxy that injects the token (recommended), or
+- Front it with a server-side reverse proxy that adds the bearer header, or use
+  a `fetch`-based SSE polyfill that can set headers.
+
+A query-parameter token (`?access_token=…`) is a possible later follow-up but is
+intentionally not implemented here (tokens in URLs leak into logs).
+
 ## CORS
 
 When `--http-cors-allow-origin` is set, the gateway:
@@ -170,7 +250,7 @@ When `--http-cors-allow-origin` is set, the gateway:
   `Vary: Origin`, so a shared cache never replays one origin's response to
   another), and
 - answers `OPTIONS` preflights with `204` plus
-  `Access-Control-Allow-Methods: POST, OPTIONS` and
+  `Access-Control-Allow-Methods: GET, POST, OPTIONS` and
   `Access-Control-Allow-Headers: content-type, authorization`.
 
 With the flag unset, no CORS headers are emitted — same-origin browser requests
@@ -204,6 +284,6 @@ draining.
 
 ## Out of scope
 
-`Subscribe` / `SubscribeSecrets` streaming (separate SSE subtask); same-port
-multiplexing with gRPC; strict `pbjson` proto3-JSON; prod manifest wiring
-(Phase 6).
+REST `GET` aliases for `Get`/`GetAll` and a `/healthz` readiness probe (planned
+PR2 under the same ticket); same-port multiplexing with gRPC; strict `pbjson`
+proto3-JSON; prod manifest wiring (Phase 6).

@@ -34,19 +34,21 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::any;
+use axum::routing::{any, get};
 use futures_util::StreamExt;
-use tonic::{Code, Request};
+use tonic::{Code, Request, Status};
 use tracing::{error, info};
 
 use crate::grpc::KonfigServer;
 use crate::proto::konfig_service_server::KonfigService;
+use crate::proto::{ConfigEvent, SecretEvent, SubscribeRequest, SubscribeSecretsRequest};
 
 /// Max accepted JSON request body. Mirrors tonic's default 4 MiB
 /// `max_decoding_message_size` so a payload that the gRPC server would accept
@@ -104,6 +106,17 @@ pub async fn serve_gateway(
     // oversized payload with `413` before it is buffered into memory.
     let app = Router::new()
         .route("/konfig.v1.KonfigService/{rpc}", any(dispatch))
+        // SSE watch endpoints (text/event-stream). One config/secret per path;
+        // GET-only because EventSource only speaks GET. Each re-frames the same
+        // in-process Subscribe/SubscribeSecrets fan-out the gRPC clients use.
+        .route(
+            "/v1/configs/{namespace}/{name}/watch",
+            get(sse_config_watch),
+        )
+        .route(
+            "/v1/secrets/{namespace}/{name}/watch",
+            get(sse_secret_watch),
+        )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state);
 
@@ -228,7 +241,7 @@ fn json_response(cfg: &HttpGatewayConfig, status: StatusCode, body: Vec<u8>) -> 
 /// Answer a CORS preflight (`OPTIONS`) with `204` + the allow-* headers.
 fn cors_preflight(cfg: &HttpGatewayConfig) -> Response {
     let builder = with_cors(Response::builder().status(StatusCode::NO_CONTENT), cfg)
-        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS")
+        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
         .header(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
             "content-type, authorization",
@@ -493,6 +506,275 @@ async fn dispatch(
     match outcome {
         Ok(json) => json_response(cfg, StatusCode::OK, json),
         Err((status, code, message)) => json_response(cfg, status, error_body(code, &message)),
+    }
+}
+
+// ── SSE (Server-Sent Events) watch endpoints ────────────────────────────────
+//
+// `GET /v1/{configs,secrets}/{ns}/{name}/watch` re-frames the SAME in-process
+// `Subscribe`/`SubscribeSecrets` stream the gRPC clients use as a long-lived
+// `text/event-stream`. No new watch logic, channels, or replay buffer — this is
+// a thin presentation layer that turns each proto event into one SSE frame.
+
+/// Heartbeat cadence. Browsers/proxies drop idle connections; an SSE comment
+/// (`: keep-alive`) every 15 s keeps the pipe warm without disturbing the
+/// client (comment lines are ignored by the EventSource parser).
+const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// Proto `EventType` (same numbering for config & secret events) → the SSE
+/// `event:` name clients switch on. Unknown values fall back to `MODIFIED` (a
+/// re-fetch is always safe), never panicking on a future enum addition.
+fn event_type_name(event_type: i32) -> &'static str {
+    match event_type {
+        0 => "ADDED",
+        1 => "MODIFIED",
+        2 => "DELETED",
+        3 => "SNAPSHOT",
+        _ => "MODIFIED",
+    }
+}
+
+/// Build ONE SSE frame: `event:` line, an optional `id:` line (the
+/// resource_version — this is what the browser echoes back as `Last-Event-ID`
+/// to resume), then the `data:` payload and the blank-line terminator. `data`
+/// is single-line JSON (serde never emits raw newlines), so one `data:` line is
+/// always valid.
+fn sse_frame(event: &str, id: &str, data: &str) -> Vec<u8> {
+    let mut buf = String::with_capacity(data.len() + event.len() + id.len() + 24);
+    buf.push_str("event: ");
+    buf.push_str(event);
+    buf.push('\n');
+    if !id.is_empty() {
+        buf.push_str("id: ");
+        buf.push_str(id);
+        buf.push('\n');
+    }
+    buf.push_str("data: ");
+    buf.push_str(data);
+    buf.push_str("\n\n");
+    buf.into_bytes()
+}
+
+/// One `ConfigEvent` → its SSE frame. `id` = resource_version (resume cursor),
+/// `data` = the proto3-JSON `Config` (same `content_json` shape as `Get`).
+fn frame_config_event(event: &ConfigEvent) -> Vec<u8> {
+    let name = event_type_name(event.event_type);
+    match &event.config {
+        Some(config) => {
+            let data = serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string());
+            sse_frame(name, &config.resource_version, &data)
+        }
+        None => sse_frame(name, "", "{}"),
+    }
+}
+
+/// One `SecretEvent` → its SSE frame. Payload is the proto3-JSON
+/// `SecretResponse` with `data_json` left base64-encoded — identical to the
+/// gRPC `GetSecret` policy (values are never decoded server-side).
+fn frame_secret_event(event: &SecretEvent) -> Vec<u8> {
+    let name = event_type_name(event.event_type);
+    match &event.secret {
+        Some(secret) => {
+            let data = serde_json::to_string(secret).unwrap_or_else(|_| "{}".to_string());
+            sse_frame(name, &secret.resource_version, &data)
+        }
+        None => sse_frame(name, "", "{}"),
+    }
+}
+
+/// A mid-stream gRPC error → a TERMINAL SSE frame (the stream ends right after).
+/// Lag (`RESOURCE_EXHAUSTED`, the subscriber fell behind the broadcast) becomes
+/// a `RELOAD` signal — the client must re-fetch a fresh snapshot. Any other
+/// error becomes an `error` frame carrying the `{code,message}`. The HTTP status
+/// is already `200` once streaming, so this is the only way to surface a fault.
+fn terminal_frame(status: &Status) -> Vec<u8> {
+    if status.code() == Code::ResourceExhausted {
+        let data = serde_json::json!({ "reason": "lagged", "message": status.message() });
+        sse_frame("RELOAD", "", &data.to_string())
+    } else {
+        let data =
+            serde_json::json!({ "code": code_name(status.code()), "message": status.message() });
+        sse_frame("error", "", &data.to_string())
+    }
+}
+
+/// The testable core: adapt a `Subscribe`-style stream into a stream of SSE
+/// wire-bytes. `to_frame` renders each successful event; an `Err(Status)` is
+/// rendered by [`terminal_frame`] and ends the stream; clean upstream end ends
+/// the stream. Between events a keep-alive comment is emitted every
+/// [`SSE_KEEPALIVE`] so idle connections survive proxy timeouts.
+fn sse_event_stream<Item, S, F>(
+    stream: S,
+    to_frame: F,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, std::convert::Infallible>> + Send + 'static
+where
+    Item: Send + 'static,
+    S: futures_util::Stream<Item = Result<Item, Status>> + Send + Unpin + 'static,
+    F: Fn(&Item) -> Vec<u8> + Send + 'static,
+{
+    // First tick fires after one full period, not immediately, so a chatty
+    // stream never has a stray leading keep-alive comment.
+    let keepalive =
+        tokio::time::interval_at(tokio::time::Instant::now() + SSE_KEEPALIVE, SSE_KEEPALIVE);
+    futures_util::stream::unfold(
+        (stream, to_frame, keepalive, false),
+        |(mut stream, to_frame, mut keepalive, finished)| async move {
+            if finished {
+                return None;
+            }
+            tokio::select! {
+                item = stream.next() => match item {
+                    Some(Ok(event)) => {
+                        let frame = to_frame(&event);
+                        Some((Ok(frame), (stream, to_frame, keepalive, false)))
+                    }
+                    // Terminal: emit the RELOAD/error frame, then stop.
+                    Some(Err(status)) => {
+                        let frame = terminal_frame(&status);
+                        Some((Ok(frame), (stream, to_frame, keepalive, true)))
+                    }
+                    // Upstream closed (drain, server stop) → end the SSE cleanly.
+                    None => None,
+                },
+                _ = keepalive.tick() => {
+                    Some((Ok(b": keep-alive\n\n".to_vec()), (stream, to_frame, keepalive, false)))
+                }
+            }
+        },
+    )
+}
+
+/// `200 text/event-stream` response carrying the SSE byte stream, the usual CORS
+/// headers, `no-cache`, and `X-Accel-Buffering: no` so nginx-style proxies flush
+/// each frame instead of buffering the whole (never-ending) response.
+fn sse_response(
+    cfg: &HttpGatewayConfig,
+    bytes: impl futures_util::Stream<Item = Result<Vec<u8>, std::convert::Infallible>> + Send + 'static,
+) -> Response {
+    let builder = with_cors(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header("x-accel-buffering", "no"),
+        cfg,
+    );
+    builder
+        .body(Body::from_stream(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// `503 Retry-After: 1` JSON response for the cold-start window before the
+/// watcher's first list has warmed the cache (same readiness gate the gRPC
+/// health check uses). The client should retry shortly.
+fn cache_not_ready(cfg: &HttpGatewayConfig) -> Response {
+    let builder = with_cors(
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(header::RETRY_AFTER, "1")
+            .header(header::CONTENT_TYPE, "application/json"),
+        cfg,
+    );
+    builder
+        .body(Body::from(error_body(
+            "unavailable",
+            "cache not ready; retry shortly",
+        )))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// The `Last-Event-ID` header (the resource_version of the last frame the client
+/// saw) → `resume_resource_version`, so a reconnect replays only what was
+/// missed. Absent/garbage header → empty string (cold subscribe from snapshot).
+fn last_event_id(headers: &HeaderMap) -> String {
+    headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Build the in-process `SubscribeRequest` for a single-config SSE watch.
+/// `Last-Event-ID` → `resume_resource_version` (the resume cursor).
+fn config_subscribe_request(
+    namespace: String,
+    name: String,
+    headers: &HeaderMap,
+) -> SubscribeRequest {
+    SubscribeRequest {
+        namespace,
+        names: vec![name],
+        resume_resource_version: last_event_id(headers),
+        label_selector: String::new(),
+    }
+}
+
+/// Build the in-process `SubscribeSecretsRequest` for a single-secret SSE watch.
+fn secret_subscribe_request(
+    namespace: String,
+    name: String,
+    headers: &HeaderMap,
+) -> SubscribeSecretsRequest {
+    SubscribeSecretsRequest {
+        namespace,
+        names: vec![name],
+        resume_resource_version: last_event_id(headers),
+    }
+}
+
+/// `GET /v1/configs/{namespace}/{name}/watch` — stream one config as SSE.
+async fn sse_config_watch(
+    State(state): State<Arc<GatewayState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let cfg = &state.cfg;
+    if let Some(deny) = check_auth(cfg, &headers) {
+        return deny;
+    }
+    if !state.server.cache.is_populated() {
+        return cache_not_ready(cfg);
+    }
+    let req = config_subscribe_request(namespace, name, &headers);
+    match state.server.subscribe(Request::new(req)).await {
+        // Box::pin so the concrete SubscribeStream is `Unpin` for `.next()`. The
+        // underlying bridge ends this stream on drain (shared `drain_notify`),
+        // so an idle SSE connection never blocks graceful shutdown.
+        Ok(resp) => sse_response(
+            cfg,
+            sse_event_stream(Box::pin(resp.into_inner()), frame_config_event),
+        ),
+        Err(status) => {
+            let (status, code, message) = status_to_error(status);
+            json_response(cfg, status, error_body(code, &message))
+        }
+    }
+}
+
+/// `GET /v1/secrets/{namespace}/{name}/watch` — stream one secret as SSE. Same
+/// auth/resume/RELOAD semantics; payload keeps `data_json` base64.
+async fn sse_secret_watch(
+    State(state): State<Arc<GatewayState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let cfg = &state.cfg;
+    if let Some(deny) = check_auth(cfg, &headers) {
+        return deny;
+    }
+    if !state.server.secret_cache.is_populated() {
+        return cache_not_ready(cfg);
+    }
+    let req = secret_subscribe_request(namespace, name, &headers);
+    match state.server.subscribe_secrets(Request::new(req)).await {
+        Ok(resp) => sse_response(
+            cfg,
+            sse_event_stream(Box::pin(resp.into_inner()), frame_secret_event),
+        ),
+        Err(status) => {
+            let (status, code, message) = status_to_error(status);
+            json_response(cfg, status, error_body(code, &message))
+        }
     }
 }
 
@@ -854,5 +1136,190 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    // ── SSE ─────────────────────────────────────────────────────────────────
+
+    fn config_event(event_type: i32, rv: &str) -> ConfigEvent {
+        ConfigEvent {
+            event_type,
+            config: Some(crate::proto::Config {
+                namespace: "default".into(),
+                name: "app".into(),
+                schema_version: 1,
+                content_json: "{\"k\":1}".into(),
+                resource_version: rv.into(),
+                age_ms: 0,
+                stale_since_ms: -1,
+            }),
+        }
+    }
+
+    /// Proto `EventType` numbers map to the SSE `event:` names clients switch
+    /// on; an unknown number degrades to `MODIFIED` (a re-fetch is always safe).
+    #[test]
+    fn event_type_name_maps_known_and_unknown() {
+        assert_eq!(event_type_name(0), "ADDED");
+        assert_eq!(event_type_name(1), "MODIFIED");
+        assert_eq!(event_type_name(2), "DELETED");
+        assert_eq!(event_type_name(3), "SNAPSHOT");
+        assert_eq!(event_type_name(99), "MODIFIED");
+    }
+
+    /// A frame is `event:`/optional `id:`/`data:` then a blank line; the `id:`
+    /// line is omitted when empty (terminal frames carry no resume cursor).
+    #[test]
+    fn sse_frame_shape_omits_empty_id() {
+        assert_eq!(
+            String::from_utf8(sse_frame("RELOAD", "", "{}")).unwrap(),
+            "event: RELOAD\ndata: {}\n\n"
+        );
+        assert_eq!(
+            String::from_utf8(sse_frame("ADDED", "rv-1", "{\"a\":1}")).unwrap(),
+            "event: ADDED\nid: rv-1\ndata: {\"a\":1}\n\n"
+        );
+    }
+
+    /// A `ConfigEvent` frames as `event` = type name, `id` = resource_version,
+    /// `data` = the proto3-JSON Config (snake_case `content_json`).
+    #[test]
+    fn frame_config_event_uses_resource_version_as_id() {
+        let frame = String::from_utf8(frame_config_event(&config_event(3, "rv-7"))).unwrap();
+        assert!(frame.starts_with("event: SNAPSHOT\nid: rv-7\ndata: "));
+        assert!(frame.contains("\"content_json\":\"{\\\"k\\\":1}\""));
+        assert!(frame.ends_with("\n\n"));
+    }
+
+    /// Secret frames keep `data_json` base64 verbatim — the gateway never
+    /// decodes secret values (same policy as gRPC `GetSecret`).
+    #[test]
+    fn frame_secret_event_preserves_base64_data_json() {
+        let ev = SecretEvent {
+            event_type: 1,
+            secret: Some(crate::proto::SecretResponse {
+                namespace: "default".into(),
+                name: "db".into(),
+                schema_version: 2,
+                data_json: "{\"password\":\"c2VjcmV0\"}".into(),
+                resource_version: "rv-9".into(),
+                age_ms: 0,
+                stale_since_ms: -1,
+            }),
+        };
+        let frame = String::from_utf8(frame_secret_event(&ev)).unwrap();
+        assert!(frame.starts_with("event: MODIFIED\nid: rv-9\ndata: "));
+        assert!(
+            frame.contains("c2VjcmV0"),
+            "base64 value must be preserved verbatim"
+        );
+    }
+
+    /// Lag (`RESOURCE_EXHAUSTED`) → terminal `RELOAD`; any other error →
+    /// terminal `error` frame carrying the snake_case code + message.
+    #[test]
+    fn terminal_frame_maps_lag_and_errors() {
+        let lag = String::from_utf8(terminal_frame(&Status::resource_exhausted("lag"))).unwrap();
+        assert!(lag.starts_with("event: RELOAD\n"));
+        assert!(lag.contains("\"reason\":\"lagged\""));
+
+        let err = String::from_utf8(terminal_frame(&Status::internal("boom"))).unwrap();
+        assert!(err.starts_with("event: error\n"));
+        assert!(err.contains("\"code\":\"internal\""));
+        assert!(err.contains("\"message\":\"boom\""));
+    }
+
+    /// `Last-Event-ID` plumbs into `resume_resource_version`; absent → empty
+    /// (cold subscribe from snapshot). `names` is the single requested key.
+    #[test]
+    fn last_event_id_maps_to_resume_resource_version() {
+        let empty = config_subscribe_request("default".into(), "app".into(), &HeaderMap::new());
+        assert_eq!(empty.resume_resource_version, "");
+        assert_eq!(empty.names, vec!["app".to_string()]);
+
+        let mut h = HeaderMap::new();
+        h.insert("last-event-id", "rv-77".parse().unwrap());
+        let resumed = config_subscribe_request("default".into(), "app".into(), &h);
+        assert_eq!(resumed.resume_resource_version, "rv-77");
+        let secret = secret_subscribe_request("default".into(), "db".into(), &h);
+        assert_eq!(secret.resume_resource_version, "rv-77");
+    }
+
+    /// The adapter frames each event in order and, on lag, emits a single
+    /// terminal `RELOAD` then ends — nothing follows it.
+    #[tokio::test]
+    async fn sse_event_stream_ends_with_reload_on_lag() {
+        let items = vec![
+            Ok(config_event(3, "rv-1")),
+            Ok(config_event(1, "rv-2")),
+            Err(Status::resource_exhausted("subscriber lagged")),
+        ];
+        let mut stream = std::pin::pin!(sse_event_stream(
+            futures_util::stream::iter(items),
+            frame_config_event
+        ));
+        let mut out = Vec::new();
+        while let Some(Ok(chunk)) = stream.next().await {
+            out.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("event: SNAPSHOT\nid: rv-1\ndata: "));
+        assert!(text.contains("event: MODIFIED\nid: rv-2\ndata: "));
+        let reload_at = text.find("event: RELOAD").expect("RELOAD frame present");
+        assert_eq!(
+            text[reload_at..].matches("event:").count(),
+            1,
+            "RELOAD is terminal — no frames after it"
+        );
+    }
+
+    /// A clean upstream end (drain: bridge drops its sender → `None`) ends the
+    /// SSE with no terminal frame, so graceful shutdown is not blocked.
+    #[tokio::test]
+    async fn sse_event_stream_ends_cleanly_when_upstream_closes() {
+        let items: Vec<Result<ConfigEvent, Status>> = vec![Ok(config_event(3, "rv-1"))];
+        let mut stream = std::pin::pin!(sse_event_stream(
+            futures_util::stream::iter(items),
+            frame_config_event
+        ));
+        let mut out = Vec::new();
+        while let Some(Ok(chunk)) = stream.next().await {
+            out.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("event: SNAPSHOT\n"));
+        assert!(!text.contains("event: RELOAD"));
+        assert!(!text.contains("event: error"));
+    }
+
+    /// Config SSE during cold start (cache not yet warm) returns `503` +
+    /// `Retry-After: 1` after auth passes — never reaching `subscribe`.
+    #[tokio::test]
+    async fn sse_config_watch_cache_not_ready_is_503() {
+        let resp = sse_config_watch(
+            test_state(),
+            Path(("default".to_string(), "app".to_string())),
+            bearer("s3cret"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// Secret SSE is gated by the same uniform bearer check: no token → `401`
+    /// before the cache/readiness/subscribe path runs.
+    #[tokio::test]
+    async fn sse_secret_watch_without_token_is_401() {
+        let resp = sse_secret_watch(
+            test_state(),
+            Path(("default".to_string(), "db".to_string())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
