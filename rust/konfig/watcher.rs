@@ -11,7 +11,7 @@ use kube::core::DynamicObject;
 use kube::runtime::watcher::{self as kube_watcher, Event, watcher as kube_watch_stream};
 use kube::{Api, Client};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::cache::{ConfigCache, ConfigMutation};
 use crate::metrics::LastEventAt;
@@ -47,6 +47,38 @@ pub fn backoff_delay(attempt: usize) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Milliseconds the reconnect loop slept *before* this connection attempt.
+/// `attempt 0` is the first connect (no prior wait → `0`); attempt `N` follows
+/// the `backoff_delay(N - 1)` sleep. Pulled out as a pure fn so the
+/// `konfig.watch_connect` span's `backoff_ms` field is unit-testable without
+/// having to introspect a live span.
+fn preceding_backoff_ms(attempt: usize) -> u64 {
+    if attempt == 0 {
+        0
+    } else {
+        backoff_delay(attempt - 1).as_millis() as u64
+    }
+}
+
+/// Build the per-connection `konfig.watch_connect` OTEL span.
+///
+/// One span is created per watch connection attempt, so a Jaeger trace shows
+/// every (re)connect: `attempt = 0` is the first connect, `attempt > 0` is a
+/// reconnect after the API-server watch stream dropped. `backoff_ms` is how
+/// long the loop waited before this attempt, which makes the exponential
+/// backoff schedule visible in the trace timeline. `info` level (not `debug`)
+/// so reconnects still show when OTEL export filters at info — reconnects are
+/// rare, so the extra span costs nothing on the hot path.
+fn watch_connect_span(label: &str, namespace: &str, attempt: usize) -> tracing::Span {
+    tracing::info_span!(
+        "konfig.watch_connect",
+        label = label,
+        namespace = namespace,
+        attempt = attempt,
+        backoff_ms = preceding_backoff_ms(attempt),
+    )
+}
+
 /// Run `f` in an infinite reconnect loop. Each invocation runs to completion;
 /// any return (Ok = clean stream end, Err = stream error) is logged with the
 /// supplied `label` + `namespace` and followed by a `backoff_delay(attempt)`
@@ -71,7 +103,8 @@ where
 {
     let mut attempt: usize = 0;
     loop {
-        match f(attempt).await {
+        let connect_span = watch_connect_span(label, &namespace, attempt);
+        match f(attempt).instrument(connect_span).await {
             Ok(()) => warn!(
                 label,
                 namespace = %namespace,
@@ -155,7 +188,11 @@ impl Watcher {
                 "Config watcher started"
             );
 
-            match pump_config_events(stream, &cache, &last_event_at, attempt > 0).await {
+            let connect_span = watch_connect_span("config", &namespace, attempt);
+            match pump_config_events(stream, &cache, &last_event_at, attempt > 0)
+                .instrument(connect_span)
+                .await
+            {
                 PumpOutcome::StreamEnded => {
                     info!("Config watcher stream ended cleanly");
                     return Ok(());
@@ -476,6 +513,28 @@ mod tests {
                 got,
                 std::time::Duration::from_secs(want_secs),
                 "attempt {attempt}: expected {want_secs}s got {got:?}"
+            );
+        }
+    }
+
+    /// The `backoff_ms` field on the `konfig.watch_connect` span is the wait
+    /// that PRECEDED an attempt: 0 for the first connect, then the prior
+    /// `backoff_delay` step. Off-by-one here would mislabel every reconnect
+    /// span, so pin the mapping (in ms, mirroring the 1/2/4/8/16/30s schedule).
+    #[test]
+    fn preceding_backoff_ms_is_prior_step() {
+        assert_eq!(
+            preceding_backoff_ms(0),
+            0,
+            "first connect has no prior wait"
+        );
+        let expected_ms = &[1000u64, 2000, 4000, 8000, 16000, 30000, 30000];
+        for (i, &want) in expected_ms.iter().enumerate() {
+            let attempt = i + 1;
+            assert_eq!(
+                preceding_backoff_ms(attempt),
+                want,
+                "attempt {attempt} should be preceded by {want}ms (backoff_delay({i}))"
             );
         }
     }
