@@ -114,6 +114,7 @@ and traces correlate.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `""` | OTLP/gRPC collector endpoint (e.g. `http://otel-collector.observability:4317`). Empty/unset = export off. |
 | `OTEL_TRACES_SAMPLER` | `parentbased_traceidratio` | Head sampler. Also: `always_on`/`always_off`, `traceidratio`, `parentbased_always_on`/`parentbased_always_off`. |
 | `OTEL_TRACES_SAMPLER_ARG` | `0.01` | Ratio for the `*traceidratio` samplers — 1% prod-safe default. |
+| `OTEL_TRACES_LEVEL` | `konfig=debug` | Filter for the OTEL layer **only** (a `tracing-subscriber` `EnvFilter` directive), independent of `RUST_LOG`. Default captures konfig's DEBUG child spans (`cache_*`, `watch_event`, `broadcast_dispatch`, `apply_attempt`) so they export without raising log verbosity. Spans are still only *created* when export is on. |
 | `OTEL_SERVICE_NAME` | `konfig` | `service.name` resource attribute reported to the collector. |
 
 **To enable distributed tracing**, an operator flips two values together

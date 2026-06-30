@@ -89,11 +89,11 @@ Enable tracing first (see [Configuration](configuration.md#telemetry)).
 
 For captured reference traces (Apply write path, watch→cache update, broadcast
 fan-out to 100 subscribers, Subscribe stream) and a local Jaeger reproduce-flow,
-see [`docs/observability/`](observability/README.md). Note the gotcha documented
-there: the rich child spans (`cache_*`, `watch_event`, `broadcast_dispatch`,
-`apply_attempt`) are DEBUG-level and gated by the same `EnvFilter` as logs — at
-the default `konfig=info` only the bare RPC root spans export. Raise specific
-submodules (e.g. `RUST_LOG=konfig::grpc::subscribe=debug`) to surface them.
+see [`docs/observability/`](observability/README.md). The rich child spans
+(`cache_*`, `watch_event`, `broadcast_dispatch`, `apply_attempt`) are
+DEBUG-level but the OTEL layer has its **own** filter (`konfig=debug` default,
+`OTEL_TRACES_LEVEL` override) decoupled from `RUST_LOG`, so they export to the
+collector whenever tracing is enabled — no debug-logging required (CU-86aj9pvff).
 
 ## Latency investigation
 
@@ -126,8 +126,9 @@ span-level breakdown instead of guessing from metrics alone.
    `OTEL_EXPORTER_OTLP_ENDPOINT` is set and `OTEL_SDK_DISABLED` is not `true`
    (see [Configuration](configuration.md#telemetry)). The child spans
    (`konfig.cache_get`, `konfig.watch_event`, `konfig.apply_attempt`,
-   `konfig.broadcast_dispatch`) are `debug`-level — set the sampler / log level
-   accordingly to capture them.
+   `konfig.broadcast_dispatch`) are `debug`-level but the OTEL layer captures
+   them on its own (`OTEL_TRACES_LEVEL`, default `konfig=debug`) regardless of
+   `RUST_LOG`, so enabling export is enough — no log-level change needed.
 
 ## TLS / cert rotation
 

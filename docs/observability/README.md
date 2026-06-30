@@ -44,26 +44,28 @@ connected trace would require context propagation across the etcd/watch boundary
 (Apply→watch) and across the broadcast channel (broadcast→subscriber) — tracked
 as a follow-up (see "Gaps" below).
 
-## IMPORTANT: child spans are DEBUG-level and gated by the log filter
+## Child spans (DEBUG) export independently of the log level (CU-86aj9pvff)
 
-`rust/konfig/main.rs` builds one global `EnvFilter`
-(`EnvFilter::from_default_env().add_directive("konfig=info")`) and applies it to
-the **whole registry — fmt layer *and* the OTEL layer**. The rich child spans
-(`cache_*`, `watch_event`, `broadcast_dispatch`, `apply_attempt`) are emitted at
-`level = "debug"`. Consequences:
+The OTEL layer carries its **own** filter, decoupled from `RUST_LOG` (which now
+gates only the log fmt layer). See `rust/konfig/main.rs` `init_tracing` +
+`telemetry::otel_trace_filter_spec`:
 
-- At the default `konfig=info`, **only the bare RPC root spans are exported** —
-  the cache/watch/broadcast/apply_attempt spans never reach Jaeger/Tempo.
-- To surface them you must raise specific submodules to debug (these directives
-  are *more specific* than the hard-coded `konfig=info` pin, so they win):
+- The fmt (log) layer keeps `konfig=info` default / `RUST_LOG` override.
+- The OTEL layer filters at **`konfig=debug` by default** (overridable via
+  `OTEL_TRACES_LEVEL`), so the rich child spans (`cache_*`, `watch_event`,
+  `broadcast_dispatch`, `apply_attempt`) become OTEL spans **without** raising
+  log verbosity. No more `RUST_LOG=konfig::cache=debug,…` hack, no debug log
+  flood.
+- When OTEL export is **off** (no `OTEL_EXPORTER_OTLP_ENDPOINT`) the OTEL layer
+  is absent, so no layer is interested in those debug spans and they are *never
+  created* — zero added cost. When export is on they are created at 100% and
+  the configured `OTEL_TRACES_SAMPLER` decides how many traces are exported
+  (so the per-`Get` `cache_get` span only materialises under active tracing).
 
-  ```
-  RUST_LOG=konfig::cache=debug,konfig::grpc::subscribe=debug,konfig::grpc::apply=debug,konfig::watcher=debug
-  ```
-
-  …which, with the shared filter, also floods stdout logs at debug for those
-  modules. Decoupling the OTEL layer's level from the log level (so the rich
-  Phase 7 spans export in prod without debug-logging) is a follow-up.
+> The four traces in `traces/` were captured *before* this change, using the
+> old shared-filter `RUST_LOG` workaround documented below in the reproduce
+> step's commit history; they remain valid evidence of the span model. To
+> reproduce now, just enable export — the `RUST_LOG` line is no longer needed.
 
 ## Reproduce locally
 
@@ -94,14 +96,15 @@ kubectl apply -f infra/konfig-loadtest/seed-config.yaml
 kubectl apply -f infra/profiling/jaeger-dev.yaml
 kubectl rollout status -n konfig-system deploy/jaeger --timeout=120s
 
-# 4. konfig with OTEL export ON + child spans at debug (TLS off for the harness)
+# 4. konfig with OTEL export ON (TLS off for the harness). The OTEL layer now
+#    captures konfig child spans at debug on its own (OTEL_TRACES_LEVEL default
+#    konfig=debug) — no RUST_LOG hack needed. always_on so every trace exports.
 yq '
   (.spec.template.spec.containers[]|select(.name=="konfig")).imagePullPolicy="IfNotPresent"
   | (.spec.template.spec.containers[]|select(.name=="konfig")).args |= ([.[]|select(test("^--tls")|not)]+["--tls=false"])
   | (.spec.template.spec.containers[]|select(.name=="konfig").env[]|select(.name=="OTEL_SDK_DISABLED")).value="false"
   | (.spec.template.spec.containers[]|select(.name=="konfig").env[]|select(.name=="OTEL_EXPORTER_OTLP_ENDPOINT")).value="http://jaeger.konfig-system:4317"
   | (.spec.template.spec.containers[]|select(.name=="konfig").env[]|select(.name=="OTEL_TRACES_SAMPLER")).value="always_on"
-  | (.spec.template.spec.containers[]|select(.name=="konfig")).env += [{"name":"RUST_LOG","value":"konfig::cache=debug,konfig::grpc::subscribe=debug,konfig::grpc::apply=debug,konfig::watcher=debug"}]
   | del(.spec.template.spec.containers[]|select(.name=="konfig").volumeMounts[]|select(.name=="konfig-tls"))
   | del(.spec.template.spec.volumes[]|select(.name=="konfig-tls"))
 ' infra/konfig/deployment.yaml | kubectl apply -f -
@@ -122,8 +125,10 @@ curl -s "localhost:16686/api/traces/<traceID>" | jq . > traces/<name>.json
   OTEL context propagation through the resource annotation and broadcast channel.
 - **Per-subscriber receipt spans** are not emitted (the parent's "if refuted"
   note) — `send_to_all` is synchronous into channels and not individually spanned.
-- **OTEL export is dark at INFO**: child spans require per-module debug directives
-  that also flood logs. Give the OTEL layer its own level filter.
+- ~~**OTEL export is dark at INFO**: child spans require per-module debug
+  directives that also flood logs.~~ **RESOLVED (CU-86aj9pvff)** — the OTEL
+  layer now has its own filter (`konfig=debug` default, `OTEL_TRACES_LEVEL`
+  override), independent of `RUST_LOG`. See the section above.
 - **Watcher reconnect/backoff trace** not captured here (requires disrupting
   API-server access; the loadtest S3 is *client* reconnect, not the konfig
   watcher reconnecting to the apiserver).

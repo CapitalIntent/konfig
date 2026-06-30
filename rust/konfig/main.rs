@@ -38,6 +38,7 @@ use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::{Layer, Registry};
 
 // Holds the `tracing_appender::non_blocking` worker guard for the lifetime
 // of the process. Dropping the guard flushes any pending log lines and
@@ -91,15 +92,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Install the tracing subscriber and, when enabled, the OTLP trace exporter.
 ///
-/// Layer stack (built on `tracing_subscriber::Registry`):
-///   1. env-filter (`konfig=info` default, overridable via `RUST_LOG`)
-///   2. fmt layer → non-blocking stdout writer (always present). Encoder is
-///      JSON when `RUST_LOG_FORMAT=json` (machine-parseable, for log
-///      aggregation), human-readable otherwise (default / `pretty` / unset).
-///   3. `tracing-opentelemetry` OTLP layer — **only** when
-///      `OTEL_EXPORTER_OTLP_ENDPOINT` is set (see [`telemetry`]). The OTLP
-///      layer is added *on top of* the fmt layer, never replacing it: with no
-///      collector configured konfig logs exactly as before.
+/// Layer stack (built on `tracing_subscriber::Registry`), each layer carrying
+/// its **own** filter (no shared global env-filter) so log verbosity and trace
+/// span-capture are decoupled (CU-86aj9pvff):
+///   1. fmt layer → non-blocking stdout writer (always present), filtered by
+///      `konfig=info` default / overridable via `RUST_LOG`. Encoder is JSON
+///      when `RUST_LOG_FORMAT=json` (machine-parseable, for log aggregation),
+///      human-readable otherwise (default / `pretty` / unset).
+///   2. `tracing-opentelemetry` OTLP layer — **only** when
+///      `OTEL_EXPORTER_OTLP_ENDPOINT` is set (see [`telemetry`]). It carries a
+///      *separate* filter (`konfig=debug` default, overridable via
+///      `OTEL_TRACES_LEVEL`) so the DEBUG-level child spans (`cache_*`,
+///      `watch_event`, `broadcast_dispatch`, `apply_attempt`) become OTEL spans
+///      without the log fmt layer having to run at debug. Added *on top of* the
+///      fmt layer, never replacing it: with no collector configured konfig logs
+///      exactly as before, and those child spans are not even created (no
+///      layer is interested in them), so there is zero added cost when export
+///      is off. When export is on the spans are created at 100% and the
+///      configured `OTEL_TRACES_SAMPLER` decides how many traces are exported.
 ///
 /// Returns the [`SdkTracerProvider`] (`Some` iff the OTLP layer was installed)
 /// so `main` can `shutdown()` it on exit to flush buffered spans.
@@ -151,7 +161,10 @@ fn init_tracing() -> Result<Option<SdkTracerProvider>, Box<dyn std::error::Error
         BoxMakeWriter::new(writer)
     };
 
-    let env_filter =
+    // Log-verbosity filter for the fmt layer ONLY (`konfig=info` default,
+    // overridable via `RUST_LOG`). The OTEL layer below gets its own filter so
+    // raising trace detail never floods logs, and vice-versa (CU-86aj9pvff).
+    let log_filter =
         tracing_subscriber::EnvFilter::from_default_env().add_directive("konfig=info".parse()?);
 
     // `RUST_LOG_FORMAT=json` selects the machine-parseable JSON encoder
@@ -160,14 +173,13 @@ fn init_tracing() -> Result<Option<SdkTracerProvider>, Box<dyn std::error::Error
     // local dev + `kubectl logs`. The two encoders are distinct concrete
     // `Layer` types, so `.boxed()` erases them to a single `Box<dyn Layer>`
     // — without that the `if`/`else` arms would not unify. Both arms share the
-    // same `make_writer` (sync vs non-blocking, gated by `KONFIG_LOG_SYNC`)
-    // and compose identically with the optional OTEL layer below.
+    // same `make_writer` (sync vs non-blocking, gated by `KONFIG_LOG_SYNC`).
     let json_logs = telemetry::log_format_is_json(
         std::env::var(telemetry::RUST_LOG_FORMAT_ENV)
             .ok()
             .as_deref(),
     );
-    let fmt_layer = if json_logs {
+    let fmt_layer: Box<dyn Layer<Registry> + Send + Sync> = if json_logs {
         tracing_subscriber::fmt::layer()
             .json()
             .with_writer(make_writer)
@@ -178,16 +190,31 @@ fn init_tracing() -> Result<Option<SdkTracerProvider>, Box<dyn std::error::Error
             .boxed()
     };
 
+    // Each layer carries its own per-layer filter and is erased to
+    // `Box<dyn Layer<Registry>>`; a `Vec` of these composes them all at the
+    // same registry level (the robust pattern for heterogeneous per-layer
+    // filters — chaining `.with(...).with(...)` would re-parameterise the
+    // subscriber type and break filter composition).
+    let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> =
+        vec![fmt_layer.with_filter(log_filter).boxed()];
+
     // Build the OTLP provider up front so the layer (which borrows a tracer
     // from it) and the returned provider (for shutdown) share one instance.
     let tracer_provider = telemetry::build_tracer_provider()?;
-    let otel_layer = tracer_provider.as_ref().map(telemetry::otel_layer);
+    if let Some(otel_layer) = tracer_provider.as_ref().map(telemetry::otel_layer) {
+        // Trace span-capture filter, independent of `RUST_LOG`: `konfig=debug`
+        // default (so the rich child spans export), overridable via
+        // `OTEL_TRACES_LEVEL`.
+        let trace_filter =
+            tracing_subscriber::EnvFilter::try_new(telemetry::otel_trace_filter_spec(
+                std::env::var(telemetry::OTEL_TRACES_LEVEL_ENV)
+                    .ok()
+                    .as_deref(),
+            ))?;
+        layers.push(otel_layer.with_filter(trace_filter).boxed());
+    }
 
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt_layer)
-        .with(otel_layer)
-        .init();
+    tracing_subscriber::registry().with(layers).init();
 
     if tracer_provider.is_some() {
         info!("OTLP trace export enabled (OTEL_EXPORTER_OTLP_ENDPOINT set)");
