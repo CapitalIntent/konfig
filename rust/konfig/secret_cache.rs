@@ -64,6 +64,14 @@ impl SecretCache {
         self.inner.all_in_namespace(namespace)
     }
 
+    /// Return `true` when the cache holds at least one secret. Mirrors
+    /// [`ConfigCache::is_populated`](crate::cache::ConfigCache::is_populated) —
+    /// used as the SSE readiness gate (serve `503 Retry-After` until the secret
+    /// watcher's first list has warmed the cache). Zero locking.
+    pub fn is_populated(&self) -> bool {
+        self.inner.is_populated()
+    }
+
     /// Mark all cached snapshots as stale (secret watcher lost K8s connection).
     ///
     /// Called from the watcher's `on_disconnect` hook.  Each snapshot gets
