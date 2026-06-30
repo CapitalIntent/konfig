@@ -13,10 +13,11 @@
 //!
 //! Full **unary** parity: `Get`, `GetAll`, `Apply`, `BatchApply`,
 //! `DryRunApply`, `Revert`, `GetSecret`, `GetAllSecrets`, `ApplySecret`. The two
-//! finite server-streams (`GetAll` / `GetAllSecrets`) are drained into a JSON
-//! array. The infinite streams (`Subscribe` / `SubscribeSecrets`) return `501`
-//! pointing at the SSE endpoint (separate task) — they are not transcodable to
-//! a single JSON response.
+//! finite server-streams (`GetAll` / `GetAllSecrets`) are written out as a JSON
+//! array one element at a time, so the whole namespace is never buffered in
+//! memory at once (see [`stream_json_array`]). The infinite streams
+//! (`Subscribe` / `SubscribeSecrets`) return `501` pointing at the SSE endpoint
+//! (separate task) — they are not transcodable to a single JSON response.
 //!
 //! # Security (read before enabling)
 //!
@@ -68,9 +69,16 @@ struct GatewayState {
 }
 
 /// Run the HTTP/JSON gateway until the process exits. Spawned as a detached
-/// background task by [`crate::grpc::serve`] (mirrors the `/metrics` server);
-/// bind failures are logged and end the task without crashing the gRPC server.
-pub async fn serve_gateway(server: KonfigServer, cfg: HttpGatewayConfig) {
+/// background task by [`crate::grpc::serve`] (mirrors the `/metrics` server).
+/// The `listener` is bound by `serve` on the startup path, so a port clash
+/// fails startup loudly there rather than silently killing this detached task.
+/// Errors from the serve loop itself are logged and end the task without
+/// crashing the gRPC server.
+pub async fn serve_gateway(
+    server: KonfigServer,
+    cfg: HttpGatewayConfig,
+    listener: tokio::net::TcpListener,
+) {
     let addr = cfg.addr;
     let state = Arc::new(GatewayState { server, cfg });
     // Single dispatch handler keyed by the `{rpc}` path segment. `any` so the
@@ -80,13 +88,6 @@ pub async fn serve_gateway(server: KonfigServer, cfg: HttpGatewayConfig) {
         .route("/konfig.v1.KonfigService/{rpc}", any(dispatch))
         .with_state(state);
 
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(%addr, "HTTP/JSON gateway: bind failed: {e}");
-            return;
-        }
-    };
     info!(%addr, "HTTP/JSON gateway starting");
     if let Err(e) = axum::serve(listener, app).await {
         error!("HTTP/JSON gateway server error: {e}");
@@ -278,27 +279,110 @@ where
     encode_response(resp.get_ref())
 }
 
-/// Run a finite server-streaming RPC: decode JSON → call the handler → drain the
-/// stream into a JSON array.
+/// Run a finite server-streaming RPC and write the result as a JSON array
+/// **streamed one element at a time** — the whole namespace is never collected
+/// into memory at once (see [`stream_json_array`]).
+///
+/// The two "early" failures still map to a proper HTTP status, because they
+/// happen before any byte ships: a bad JSON body → `400`, and an error
+/// `Status` from the handler call itself (drain `Unavailable`, authz denial,
+/// …) → its mapped status. Once the first array byte is on the wire the HTTP
+/// status is locked at `200`, so an error that surfaces mid-stream can only
+/// close the array — it cannot downgrade the status.
 async fn run_server_streaming<Req, Item, S, Fut>(
+    cfg: &HttpGatewayConfig,
     body: &Bytes,
     call: impl FnOnce(Request<Req>) -> Fut,
-) -> Result<Vec<u8>, GatewayError>
+) -> Response
 where
     Req: serde::de::DeserializeOwned + Default,
-    Item: serde::Serialize,
-    S: futures_util::Stream<Item = Result<Item, tonic::Status>>,
+    Item: serde::Serialize + Send + 'static,
+    S: futures_util::Stream<Item = Result<Item, tonic::Status>> + Send + Unpin + 'static,
     Fut: std::future::Future<Output = Result<tonic::Response<S>, tonic::Status>>,
 {
-    let req = decode_request::<Req>(body)?;
-    let resp = call(Request::new(req)).await.map_err(status_to_error)?;
-    let stream = resp.into_inner();
-    let mut stream = std::pin::pin!(stream);
-    let mut items: Vec<Item> = Vec::new();
-    while let Some(item) = stream.next().await {
-        items.push(item.map_err(status_to_error)?);
+    let req = match decode_request::<Req>(body) {
+        Ok(req) => req,
+        Err((status, code, message)) => {
+            return json_response(cfg, status, error_body(code, &message));
+        }
+    };
+    let stream = match call(Request::new(req)).await {
+        Ok(resp) => resp.into_inner(),
+        Err(status) => {
+            let (status, code, message) = status_to_error(status);
+            return json_response(cfg, status, error_body(code, &message));
+        }
+    };
+    json_streaming_response(cfg, stream_json_array(stream))
+}
+
+/// Serialise a finite server-stream into a JSON array incrementally: emit `[`,
+/// then each item separated by `,`, then `]`. Only ONE item is ever held in
+/// memory at a time — there is no `Vec` collecting the whole namespace.
+///
+/// The HTTP status is already `200` once the first byte ships (see
+/// [`run_server_streaming`]), so a mid-stream gRPC error can no longer change
+/// it. We close the array and stop so the body stays valid JSON.
+fn stream_json_array<Item, S>(
+    stream: S,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, std::convert::Infallible>> + Send + 'static
+where
+    Item: serde::Serialize + Send + 'static,
+    S: futures_util::Stream<Item = Result<Item, tonic::Status>> + Send + Unpin + 'static,
+{
+    // State threaded through the fold: (the upstream stream, items emitted so
+    // far, whether we already wrote the closing `]`).
+    futures_util::stream::unfold(
+        (stream, 0usize, false),
+        |(mut stream, count, finished)| async move {
+            if finished {
+                return None;
+            }
+            match stream.next().await {
+                Some(Ok(item)) => {
+                    let mut buf = Vec::with_capacity(64);
+                    buf.push(if count == 0 { b'[' } else { b',' });
+                    if serde_json::to_writer(&mut buf, &item).is_err() {
+                        // A prost message failing to serialise is not expected;
+                        // if it ever does, close the array so the body stays
+                        // valid JSON instead of trailing off mid-element.
+                        return Some((Ok(close_array(count)), (stream, count, true)));
+                    }
+                    Some((Ok(buf), (stream, count + 1, false)))
+                }
+                // Status already on the wire as 200 — cannot downgrade. Close.
+                Some(Err(_)) => Some((Ok(close_array(count)), (stream, count, true))),
+                None => Some((Ok(close_array(count)), (stream, count, true))),
+            }
+        },
+    )
+}
+
+/// Closing bytes for the streamed JSON array: `]` after ≥1 item, `[]` when the
+/// stream was empty (so an empty namespace returns a valid empty array).
+fn close_array(count: usize) -> Vec<u8> {
+    if count == 0 {
+        vec![b'[', b']']
+    } else {
+        vec![b']']
     }
-    encode_response(&items)
+}
+
+/// `200` response whose body is the streamed JSON array from
+/// [`stream_json_array`], carrying the usual content-type + CORS headers.
+fn json_streaming_response(
+    cfg: &HttpGatewayConfig,
+    bytes: impl futures_util::Stream<Item = Result<Vec<u8>, std::convert::Infallible>> + Send + 'static,
+) -> Response {
+    let builder = with_cors(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json"),
+        cfg,
+    );
+    builder
+        .body(Body::from_stream(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// Single dispatch entry point for every `/konfig.v1.KonfigService/<rpc>` call.
@@ -326,16 +410,21 @@ async fn dispatch(
         return resp;
     }
 
-    let server = state.server.clone();
+    // Borrow the shared server — every handler takes `&self` and its future is
+    // awaited inline below, so there's no need to clone the (~20-`Arc`)
+    // `KonfigServer` per request.
+    let server = &state.server;
     let outcome = match rpc.as_str() {
         "Get" => run_unary(&body, |r| server.get(r)).await,
-        "GetAll" => run_server_streaming(&body, |r| server.get_all(r)).await,
+        "GetAll" => return run_server_streaming(cfg, &body, |r| server.get_all(r)).await,
         "Apply" => run_unary(&body, |r| server.apply(r)).await,
         "BatchApply" => run_unary(&body, |r| server.batch_apply(r)).await,
         "DryRunApply" => run_unary(&body, |r| server.dry_run_apply(r)).await,
         "Revert" => run_unary(&body, |r| server.revert(r)).await,
         "GetSecret" => run_unary(&body, |r| server.get_secret(r)).await,
-        "GetAllSecrets" => run_server_streaming(&body, |r| server.get_all_secrets(r)).await,
+        "GetAllSecrets" => {
+            return run_server_streaming(cfg, &body, |r| server.get_all_secrets(r)).await;
+        }
         "ApplySecret" => run_unary(&body, |r| server.apply_secret(r)).await,
         "Subscribe" | "SubscribeSecrets" => {
             return json_response(
@@ -554,6 +643,28 @@ mod tests {
             resp.headers()
                 .contains_key(header::ACCESS_CONTROL_ALLOW_METHODS)
         );
+    }
+
+    /// `GetAll` against the empty default cache streams a valid empty JSON
+    /// array (`[]`) with status 200 — exercising the incremental
+    /// [`stream_json_array`] path end-to-end (decode → handler → streamed body)
+    /// and proving the empty-stream case closes the array correctly.
+    #[tokio::test]
+    async fn get_all_empty_namespace_streams_empty_array() {
+        let resp = dispatch(
+            test_state(),
+            Method::POST,
+            bearer("s3cret"),
+            Path("GetAll".to_string()),
+            Bytes::from_static(br#"{"namespace":"default"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+        assert_eq!(&body[..], b"[]", "empty namespace must stream a valid []");
+        // And it must parse back as an empty JSON array.
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json array");
+        assert_eq!(v, serde_json::json!([]));
     }
 
     /// Streaming RPCs are not transcodable to a single JSON response — the
