@@ -58,6 +58,19 @@ const OTEL_SAMPLER_ENV: &str = "OTEL_TRACES_SAMPLER";
 /// Env var carrying the sampler argument (e.g. the ratio for `traceidratio`).
 const OTEL_SAMPLER_ARG_ENV: &str = "OTEL_TRACES_SAMPLER_ARG";
 
+/// Env var overriding the OTEL layer's own span-capture filter (CU-86aj9pvff).
+/// The OTEL layer carries a filter **independent of `RUST_LOG`** (which gates
+/// only the log fmt layer), so the DEBUG-level child spans (`cache_*`,
+/// `watch_event`, `broadcast_dispatch`, `apply_attempt`) reach the tracer
+/// without flooding stdout logs at debug. Syntax is the standard
+/// `tracing_subscriber::EnvFilter` directive string.
+pub const OTEL_TRACES_LEVEL_ENV: &str = "OTEL_TRACES_LEVEL";
+
+/// Default OTEL-layer filter: capture every `konfig` span down to DEBUG so the
+/// rich child spans become OTEL spans. Non-`konfig` targets are excluded — no
+/// dependency-span noise in traces. Overridable via [`OTEL_TRACES_LEVEL_ENV`].
+pub const DEFAULT_OTEL_TRACES_LEVEL: &str = "konfig=debug";
+
 /// Resolve the head [`Sampler`] from `OTEL_TRACES_SAMPLER` /
 /// `OTEL_TRACES_SAMPLER_ARG`, defaulting to `parentbased_always_on` (the OTEL
 /// spec default) when unset or unrecognised.
@@ -121,6 +134,18 @@ pub fn log_format_is_json(raw: Option<&str>) -> bool {
 pub fn sdk_disabled(raw: Option<&str>) -> bool {
     raw.map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+/// Resolve the OTEL-layer filter directive string from `OTEL_TRACES_LEVEL`,
+/// defaulting to [`DEFAULT_OTEL_TRACES_LEVEL`] when unset or blank. Pure
+/// function of its input so the default/override logic is unit-testable without
+/// touching process env. `main.rs` turns the returned spec into the
+/// `EnvFilter` it attaches to the OTLP layer (CU-86aj9pvff).
+pub fn otel_trace_filter_spec(raw: Option<&str>) -> String {
+    match raw.map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => DEFAULT_OTEL_TRACES_LEVEL.to_string(),
+    }
 }
 
 /// Resolve the reported `service.name` from `OTEL_SERVICE_NAME`, defaulting to
@@ -369,6 +394,30 @@ mod tests {
         assert_eq!(service_name(Some("konfig-canary")), "konfig-canary");
         // Surrounding whitespace is trimmed.
         assert_eq!(service_name(Some("  svc-x  ")), "svc-x");
+    }
+
+    #[test]
+    fn otel_trace_filter_defaults_to_konfig_debug() {
+        assert_eq!(otel_trace_filter_spec(None), "konfig=debug");
+        assert_eq!(otel_trace_filter_spec(Some("   ")), "konfig=debug");
+        assert_eq!(otel_trace_filter_spec(Some("")), "konfig=debug");
+    }
+
+    #[test]
+    fn otel_trace_filter_honours_override() {
+        assert_eq!(
+            otel_trace_filter_spec(Some("konfig=trace,h2=info")),
+            "konfig=trace,h2=info"
+        );
+        assert_eq!(otel_trace_filter_spec(Some("  info  ")), "info");
+    }
+
+    /// The default spec must parse into a valid `EnvFilter` (a typo'd default
+    /// would otherwise blow up `main.rs`'s `EnvFilter::try_new(spec)?` at boot).
+    #[test]
+    fn otel_trace_filter_default_parses() {
+        tracing_subscriber::EnvFilter::try_new(otel_trace_filter_spec(None))
+            .expect("default OTEL trace filter spec must be a valid EnvFilter directive");
     }
 
     /// `OTEL_SDK_DISABLED=true` must yield `Ok(None)` even when an endpoint is
