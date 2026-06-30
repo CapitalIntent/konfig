@@ -157,7 +157,17 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         cache_ledger: cfg.cache_ledger,
         default_cache_budget_bytes: cfg.default_cache_budget_bytes,
     };
-    let svc = KonfigServiceServer::new(server);
+    let svc = KonfigServiceServer::new(server.clone());
+
+    // Spawn the sibling HTTP/JSON gateway (CU-86ahrwd70) when configured. Like
+    // the metric sampler above it is a detached background task: it shares this
+    // `KonfigServer` instance (cheap `Arc` clone), so every gate — drain,
+    // per-tenant authz, quota, audit, metrics — still applies to JSON callers.
+    // It binds its own `--http-addr` and dies with the process on shutdown.
+    if let Some(gateway) = cfg.http_gateway {
+        info!(addr = %gateway.addr, "HTTP/JSON gateway enabled");
+        tokio::spawn(super::http_gateway::serve_gateway(server, gateway));
+    }
 
     let mut builder = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
