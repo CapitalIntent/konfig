@@ -21,8 +21,9 @@
 //!
 //! # Security (read before enabling)
 //!
-//! This port is **plaintext** and carries no mTLS client certificate, so calls
-//! reach konfig as the `anonymous` identity. Two consequences:
+//! This port is **plaintext** and carries no mTLS client certificate. With no
+//! certificate konfig cannot tell *who* is calling, so it treats every gateway
+//! caller as the built-in `anonymous` tenant. Two consequences:
 //!   - With `KONFIG_AUTHZ_MODE=disabled` (the default) every method works; under
 //!     `enforce`, anonymous is denied (run the gateway behind a trusted caller,
 //!     or grant an ACL identity in a follow-up).
@@ -36,7 +37,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
@@ -46,6 +47,13 @@ use tracing::{error, info};
 
 use crate::grpc::KonfigServer;
 use crate::proto::konfig_service_server::KonfigService;
+
+/// Max accepted JSON request body. Mirrors tonic's default 4 MiB
+/// `max_decoding_message_size` so a payload that the gRPC server would accept
+/// is not rejected with a `413` just because it arrived over the gateway.
+/// A larger body short-circuits with `413 Payload Too Large` before it is read
+/// into memory (axum's `DefaultBodyLimit`), so it also caps per-request RAM.
+const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// Resolved gateway auth + CORS configuration (built in [`crate::startup`]).
 #[derive(Clone, Debug)]
@@ -68,30 +76,46 @@ struct GatewayState {
     cfg: HttpGatewayConfig,
 }
 
-/// Run the HTTP/JSON gateway until the process exits. Spawned as a detached
+/// Run the HTTP/JSON gateway until the process drains. Spawned as a detached
 /// background task by [`crate::grpc::serve`] (mirrors the `/metrics` server).
 /// The `listener` is bound by `serve` on the startup path, so a port clash
 /// fails startup loudly there rather than silently killing this detached task.
 /// Errors from the serve loop itself are logged and end the task without
 /// crashing the gRPC server.
+///
+/// On drain (SIGTERM) the gateway stops accepting NEW connections and lets
+/// in-flight requests finish, instead of being cut mid-response when the
+/// process exits. It shares the gRPC server's drain signal, so requests that
+/// are still in flight during the drain window keep returning the same
+/// `UNAVAILABLE` (`503`) the handlers already emit while draining.
 pub async fn serve_gateway(
     server: KonfigServer,
     cfg: HttpGatewayConfig,
     listener: tokio::net::TcpListener,
 ) {
     let addr = cfg.addr;
+    // Grab the shared drain notifier before `server` is moved into the state.
+    // It is woken once, when the gRPC server begins draining (see `serve`).
+    let drain_notify = server.drain_notify();
     let state = Arc::new(GatewayState { server, cfg });
     // Single dispatch handler keyed by the `{rpc}` path segment. `any` so the
     // CORS preflight `OPTIONS` reaches us too (method-specific routers would
-    // 405 it before we can answer the preflight).
+    // 405 it before we can answer the preflight). The body limit rejects an
+    // oversized payload with `413` before it is buffered into memory.
     let app = Router::new()
         .route("/konfig.v1.KonfigService/{rpc}", any(dispatch))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state);
 
     info!(%addr, "HTTP/JSON gateway starting");
-    if let Err(e) = axum::serve(listener, app).await {
+    let shutdown = async move { drain_notify.notified().await };
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
         error!("HTTP/JSON gateway server error: {e}");
     }
+    info!(%addr, "HTTP/JSON gateway stopped");
 }
 
 /// Map a gRPC [`Code`] to the closest HTTP status. Pure — unit-tested.
@@ -155,8 +179,11 @@ fn error_body(code: &str, message: &str) -> Vec<u8> {
         .unwrap_or_else(|_| b"{\"code\":\"internal\",\"message\":\"error encode failed\"}".to_vec())
 }
 
-/// Constant-time token comparison (length is allowed to leak). Avoids a
-/// byte-wise early-return timing side channel on the bearer token.
+/// Compare two tokens in constant time — i.e. always look at every byte
+/// instead of stopping at the first mismatch. A normal `==` returns faster
+/// when the first byte differs, and an attacker can measure that timing to
+/// guess the token one byte at a time; this loop removes that signal. The
+/// length is still allowed to leak (we bail early on a length mismatch).
 fn tokens_match(provided: &str, expected: &str) -> bool {
     let (a, b) = (provided.as_bytes(), expected.as_bytes());
     if a.len() != b.len() {
@@ -176,9 +203,11 @@ fn with_cors(
     cfg: &HttpGatewayConfig,
 ) -> axum::http::response::Builder {
     match cfg.cors_allow_origin.as_deref() {
-        Some(origin) if !origin.is_empty() => {
-            builder.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin)
-        }
+        Some(origin) if !origin.is_empty() => builder
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin)
+            // Tell shared caches the response varies by request `Origin`, so a
+            // cached reply for one origin is never replayed to another.
+            .header(header::VARY, header::ORIGIN.as_str()),
         _ => builder,
     }
 }
@@ -210,6 +239,16 @@ fn cors_preflight(cfg: &HttpGatewayConfig) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Pull the token out of an `Authorization` header value, accepting the scheme
+/// name in any case (`Bearer` / `bearer` / `BEARER`). RFC 6750 says the scheme
+/// is case-insensitive, and some clients send it lowercase. Returns the token
+/// part (caller trims surrounding spaces), or `None` when the value is not a
+/// `Bearer` credential.
+fn strip_bearer_prefix(value: &str) -> Option<&str> {
+    let (scheme, token) = value.trim_start().split_once(' ')?;
+    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
+}
+
 /// Bearer-token gate. Returns `None` when authorized (or when `--http-insecure`
 /// is set); `Some(response)` carries the ready-to-return `401` otherwise.
 fn check_auth(cfg: &HttpGatewayConfig, headers: &HeaderMap) -> Option<Response> {
@@ -222,7 +261,7 @@ fn check_auth(cfg: &HttpGatewayConfig, headers: &HeaderMap) -> Option<Response> 
     let provided = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(strip_bearer_prefix)
         .map(str::trim)
         .unwrap_or("");
     if !expected.is_empty() && tokens_match(provided, expected) {
@@ -236,8 +275,10 @@ fn check_auth(cfg: &HttpGatewayConfig, headers: &HeaderMap) -> Option<Response> 
     }
 }
 
-/// Deserialise a JSON body into the proto request `Req`. Empty body ⇒ the proto
-/// default (proto3-JSON: all fields optional).
+/// Turn a JSON request body into the proto request type `Req`. An empty body
+/// becomes the default message (every field at its zero value). This is
+/// "proto3-JSON leniency": a field the client leaves out is filled with its
+/// default rather than rejected, so `{}` and an empty body are both valid.
 fn decode_request<Req>(body: &Bytes) -> Result<Req, GatewayError>
 where
     Req: serde::de::DeserializeOwned + Default,
@@ -403,7 +444,7 @@ async fn dispatch(
         return json_response(
             cfg,
             StatusCode::METHOD_NOT_ALLOWED,
-            error_body("unimplemented", "only POST and OPTIONS are supported"),
+            error_body("method_not_allowed", "only POST and OPTIONS are supported"),
         );
     }
     if let Some(resp) = check_auth(cfg, &headers) {
@@ -426,6 +467,8 @@ async fn dispatch(
             return run_server_streaming(cfg, &body, |r| server.get_all_secrets(r)).await;
         }
         "ApplySecret" => run_unary(&body, |r| server.apply_secret(r)).await,
+        // These RPCs exist but are infinite streams — not transcodable to one
+        // JSON body. `501` says "the method is real, just not served here".
         "Subscribe" | "SubscribeSecrets" => {
             return json_response(
                 cfg,
@@ -436,11 +479,13 @@ async fn dispatch(
                 ),
             );
         }
+        // No such method on the service (typo / wrong path) → `404`, distinct
+        // from the `501` above which means "real method, not over JSON".
         other => {
             return json_response(
                 cfg,
-                StatusCode::NOT_IMPLEMENTED,
-                error_body("unimplemented", &format!("unknown method '{other}'")),
+                StatusCode::NOT_FOUND,
+                error_body("not_found", &format!("unknown method '{other}'")),
             );
         }
     };
@@ -519,6 +564,23 @@ mod tests {
         assert!(tokens_match("", ""));
     }
 
+    /// The `Bearer` scheme name is case-insensitive (RFC 6750) and surrounding
+    /// whitespace is tolerated; a non-Bearer or scheme-less value yields `None`.
+    #[test]
+    fn strip_bearer_prefix_is_case_insensitive() {
+        assert_eq!(strip_bearer_prefix("Bearer tok"), Some("tok"));
+        assert_eq!(strip_bearer_prefix("bearer tok"), Some("tok"));
+        assert_eq!(strip_bearer_prefix("BEARER tok"), Some("tok"));
+        // Caller trims the token; extra inner spaces survive until then.
+        assert_eq!(
+            strip_bearer_prefix("Bearer   tok").map(str::trim),
+            Some("tok")
+        );
+        assert_eq!(strip_bearer_prefix("Basic abc"), None);
+        assert_eq!(strip_bearer_prefix("Bearer"), None);
+        assert_eq!(strip_bearer_prefix(""), None);
+    }
+
     /// `GetRequest` round-trips through the proto3-JSON shape the gateway
     /// promises (`{"namespace":...,"name":...}`, snake_case).
     #[test]
@@ -577,6 +639,30 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         h
+    }
+
+    /// Handler state whose Config cache already holds one entry, so a `Get`
+    /// resolves to a real `200` body (the drain-plumbing `test_server` ships an
+    /// empty cache, which only exercises the `NotFound` path).
+    fn state_with_config(
+        namespace: &str,
+        name: &str,
+        schema_version: u32,
+    ) -> State<Arc<GatewayState>> {
+        let snap = crate::types::ConfigSnapshot {
+            namespace: namespace.into(),
+            name: name.into(),
+            schema_version,
+            content: serde_json::json!({"key": "val"}),
+            resource_version: format!("rv-{schema_version}"),
+            ..Default::default()
+        };
+        let mut server = crate::grpc::test_server();
+        server.cache = Arc::new(crate::cache::ConfigCache::new(snap));
+        State(Arc::new(GatewayState {
+            server,
+            cfg: cfg_secure(),
+        }))
     }
 
     /// A POST without a bearer token is rejected with 401 before the handler
@@ -665,6 +751,94 @@ mod tests {
         // And it must parse back as an empty JSON array.
         let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json array");
         assert_eq!(v, serde_json::json!([]));
+    }
+
+    /// An authenticated `Get` against a populated cache returns `200` with the
+    /// proto3-JSON body (snake_case fields), `content-type: application/json`,
+    /// and the CORS allow-origin + `Vary: Origin` headers — the happy-path
+    /// unary pipeline end-to-end.
+    #[tokio::test]
+    async fn authenticated_get_returns_200_with_config() {
+        let resp = dispatch(
+            state_with_config("default", "app-config", 3),
+            Method::POST,
+            bearer("s3cret"),
+            Path("Get".to_string()),
+            Bytes::from_static(br#"{"namespace":"default","name":"app-config"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("origin")
+        );
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["namespace"], "default");
+        assert_eq!(v["name"], "app-config");
+        assert_eq!(v["schema_version"], 3);
+    }
+
+    /// A malformed JSON body is rejected with `400 invalid_argument` — the
+    /// decode-error path through `dispatch`.
+    #[tokio::test]
+    async fn invalid_json_body_is_400() {
+        let resp = dispatch(
+            test_state(),
+            Method::POST,
+            bearer("s3cret"),
+            Path("Get".to_string()),
+            Bytes::from_static(b"this is not json"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["code"], "invalid_argument");
+    }
+
+    /// A non-POST, non-OPTIONS verb is rejected with `405 method_not_allowed`
+    /// before the handler runs.
+    #[tokio::test]
+    async fn non_post_method_is_405() {
+        let resp = dispatch(
+            test_state(),
+            Method::GET,
+            bearer("s3cret"),
+            Path("Get".to_string()),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["code"], "method_not_allowed");
+    }
+
+    /// An unknown method name (typo / not on the service) returns `404
+    /// not_found`, distinct from the `501` for the real-but-streaming RPCs.
+    #[tokio::test]
+    async fn unknown_method_is_404() {
+        let resp = dispatch(
+            test_state(),
+            Method::POST,
+            bearer("s3cret"),
+            Path("Frobnicate".to_string()),
+            Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["code"], "not_found");
     }
 
     /// Streaming RPCs are not transcodable to a single JSON response — the

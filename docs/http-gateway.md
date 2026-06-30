@@ -34,8 +34,10 @@ the `--tls` fail-safe).
 - **Path**: `/konfig.v1.KonfigService/<RpcName>` (e.g. `/konfig.v1.KonfigService/Get`)
 - **Body**: proto3-JSON of the request message, using the proto's snake_case
   field names. An omitted field defaults to the proto zero value; an empty body
-  is treated as `{}`.
-- **Auth**: `Authorization: Bearer <token>` (unless `--http-insecure`).
+  is treated as `{}`. The body is capped at **4 MiB** (matching the gRPC
+  server's default decode limit); a larger body is rejected with `413`.
+- **Auth**: `Authorization: Bearer <token>` (unless `--http-insecure`). The
+  `Bearer` scheme name is case-insensitive.
 - **Response**: proto3-JSON of the response message on success; on error,
   `{"code": "<grpc_code>", "message": "<detail>"}` with a mapped HTTP status.
 
@@ -55,6 +57,12 @@ the `--tls` fail-safe).
 | `Unavailable` | 503 |
 | `Unimplemented` | 501 |
 | everything else (`Internal`, `Unknown`, …) | 500 |
+
+The gateway itself also returns a few statuses before a handler runs: `401`
+(missing/invalid bearer token), `404 not_found` (unknown method name), `405
+method_not_allowed` (a verb other than `POST`/`OPTIONS`), and `413` (body over
+4 MiB). The real-but-non-transcodable streaming RPCs return `501` (see below) —
+distinct from the `404` for a method that does not exist at all.
 
 ## Methods
 
@@ -158,7 +166,9 @@ The server base64-encodes the YAML map values before patching.
 
 When `--http-cors-allow-origin` is set, the gateway:
 
-- echoes it in `Access-Control-Allow-Origin` on every response, and
+- echoes it in `Access-Control-Allow-Origin` on every response (plus
+  `Vary: Origin`, so a shared cache never replays one origin's response to
+  another), and
 - answers `OPTIONS` preflights with `204` plus
   `Access-Control-Allow-Methods: POST, OPTIONS` and
   `Access-Control-Allow-Headers: content-type, authorization`.
@@ -183,6 +193,14 @@ Read this before exposing the port.
   is explicitly passed. The token is compared in constant time.
 - **Not in prod manifests.** The gateway is not wired into `infra/konfig`; it
   stays opt-in until Phase 6 deployment work exposes the port when needed.
+
+## Draining (SIGTERM)
+
+The gateway shares the gRPC server's drain signal. On SIGTERM it stops
+accepting new connections and lets in-flight requests finish (instead of being
+cut mid-response on process exit); requests still in flight during the drain
+window get the same `UNAVAILABLE` → `503` the handlers already return while
+draining.
 
 ## Out of scope
 
