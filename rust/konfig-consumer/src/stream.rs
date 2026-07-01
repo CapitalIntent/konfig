@@ -122,6 +122,66 @@ impl StreamDriver {
     }
 }
 
+/// A raw, auto-reconnecting `Subscribe` event stream (SDK surface,
+/// CU-86ahzwjdv).
+///
+/// Yields raw [`ConfigEvent`]s. On any stream error or clean close it backs off
+/// (1→30s, [`backoff_delay`]) and reconnects, resuming from the last observed
+/// `resource_version` so no events are missed across reconnects. Errors are
+/// handled internally (logged + reconnect), so callers get a plain
+/// `Stream<Item = ConfigEvent>`. The stream never ends on its own — drop it to
+/// stop. This is the low-level counterpart to the snapshot-materialising
+/// [`crate::KonfigClient::watch`].
+pub(crate) fn reconnecting_event_stream(
+    mut client: KonfigServiceClient<Channel>,
+    namespace: String,
+    names: Vec<String>,
+) -> impl futures_util::Stream<Item = ConfigEvent> {
+    async_stream::stream! {
+        let mut attempt: usize = 0;
+        // Empty = start from current state; advanced to the last observed
+        // resource_version so a reconnect replays only genuinely-missed events.
+        let mut resume_rv = String::new();
+        loop {
+            let req = SubscribeRequest {
+                namespace: namespace.clone(),
+                names: names.clone(),
+                resume_resource_version: resume_rv.clone(),
+                label_selector: String::new(),
+            };
+            match client.subscribe(req).await {
+                Ok(resp) => {
+                    attempt = 0;
+                    let mut stream = resp.into_inner();
+                    loop {
+                        match stream.message().await {
+                            Ok(Some(event)) => {
+                                if let Some(cfg) = &event.config
+                                    && !cfg.resource_version.is_empty()
+                                {
+                                    resume_rv.clone_from(&cfg.resource_version);
+                                }
+                                yield event;
+                            }
+                            // Clean close: reconnect immediately (attempt=0 → 1s).
+                            Ok(None) => break,
+                            Err(status) => {
+                                warn!("konfig-consumer: subscribe stream recv error: {status}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(status) => {
+                    warn!(attempt, "konfig-consumer: Subscribe RPC failed: {status}");
+                }
+            }
+            tokio::time::sleep(backoff_delay(attempt)).await;
+            attempt = attempt.saturating_add(1);
+        }
+    }
+}
+
 /// Demux one event to its per-name store and update `resume_rv`.
 ///
 /// Free function (no client needed) so the demux logic is unit-testable

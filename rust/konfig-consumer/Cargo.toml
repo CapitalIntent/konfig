@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 arc-swap = {workspace = true}
+async-stream = "0.3"
 futures-util = "0.3"
 prometheus = {version = "0.14", default-features = false}
 prost = {workspace = true}
