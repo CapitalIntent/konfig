@@ -6,6 +6,7 @@ Rust config-management service. Bazel-built monorepo; snmalloc allocator; deploy
 
 - Tests: `bazel test //rust/konfig:test` — never `cargo test` directly (see `feedback_bazel_only_tests.md` in user memory; disk + cache reasons).
 - Pre-PR: `cargo fmt`, `cargo clippy`, `cargo-crap` (see `feedback_pre_pr_checks.md`, `feedback_cargo_crap_before_pr.md`).
+- Pre-PR code eval: evaluate the branch diff for smells, correctness, performance, ergonomics, maintainability, readability, and memory-usage (minimal when possible); diffs must be surgical; docstrings beginner-worded in caveman mode (`feedback_pre_pr_code_eval.md`).
 - Loadtest: scale Deployment to 1 replica first for accurate per-pod profiling (`feedback_loadtest_replicas.md`).
 
 ## Conventions
