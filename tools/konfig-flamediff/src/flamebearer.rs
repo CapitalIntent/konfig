@@ -45,7 +45,7 @@ pub fn load(path: &Path) -> Result<Flamebearer, String> {
         .and_then(Value::as_array)
         .ok_or_else(|| format!("{}: missing flamebearer.names array", path.display()))?
         .iter()
-        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .map(|v| demangle(v.as_str().unwrap_or_default()))
         .collect();
 
     let levels = fb
@@ -255,6 +255,14 @@ fn round4(x: f64) -> f64 {
     (x * 10_000.0).round() / 10_000.0
 }
 
+/// Turn a mangled Rust symbol into a readable path, dropping the trailing hash
+/// (`_ZN4ring...aes_gcm_open17h01..E` -> `ring::aead::algorithm::aes_gcm_open`).
+/// The `{:#}` alternate form omits the hash; non-mangled names pass through
+/// unchanged, so C frames / `[unknown]` are left as-is.
+fn demangle(name: &str) -> String {
+    format!("{:#}", rustc_demangle::demangle(name))
+}
+
 /// Append-only string table for pprof (index 0 is always the empty string).
 struct Interner {
     strings: Vec<String>,
@@ -379,5 +387,16 @@ mod tests {
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["frames"][0]["name"], "a");
         assert_eq!(v["frames"][0]["self_pct"], 12.0);
+    }
+
+    #[test]
+    fn demangle_strips_hash_and_passes_plain_names() {
+        assert_eq!(
+            demangle("_ZN4ring4aead9algorithm12aes_gcm_open17h0113692f7c88a77dE"),
+            "ring::aead::algorithm::aes_gcm_open"
+        );
+        // Non-mangled frames (C funcs, [unknown]) pass through untouched.
+        assert_eq!(demangle("epoll_wait"), "epoll_wait");
+        assert_eq!(demangle("[unknown]"), "[unknown]");
     }
 }

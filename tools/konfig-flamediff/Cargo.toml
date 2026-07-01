@@ -12,4 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = {version = "4", features = ["derive"]}
+# Turn eBPF/pyroscope's mangled Rust symbols (_ZN4ring...) into readable
+# `ring::aead::...` names so the baseline + gate summary are human-friendly.
+rustc-demangle = "0.1"
 serde_json = {workspace = true, features = ["std"]}
