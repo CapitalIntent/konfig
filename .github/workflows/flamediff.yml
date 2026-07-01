@@ -188,9 +188,10 @@ jobs:
             | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).resources.requests.cpu = "250m"
             | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).resources.limits.cpu = "1"
             | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).env = [
-                {"name": "S1_SUBSCRIBERS", "value": "500"},
+                {"name": "S1_SUBSCRIBERS", "value": "100"},
                 {"name": "S1_APPLIES", "value": "6000"},
                 {"name": "S1_INTERVAL_MS", "value": "10"},
+                {"name": "S1_PAYLOAD_BYTES", "value": "65536"},
                 {"name": "S1_P99_LIMIT_MS", "value": "600000"}
               ]
           ' infra/konfig-loadtest/job-saturate.yaml | kubectl apply -f -
