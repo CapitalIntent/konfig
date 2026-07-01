@@ -69,13 +69,15 @@ use tokio::task::JoinHandle;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 pub use crate::metrics::{LastEventAt, MetricsError, register_stale_seconds, spawn_stale_sampler};
+pub use crate::proto::{Config, ConfigEvent};
 pub use crate::snapshot::{ConfigSnapshot, ConfigSpec, ParseError, snapshot_from_proto};
 pub use crate::stream::{BACKOFF_STEPS_SECS, backoff_delay};
 
 use crate::proto::konfig_service_client::KonfigServiceClient;
+use crate::proto::{ApplyRequest, GetRequest};
 use crate::stream::{Store, StreamDriver};
 
-/// Errors surfaced by [`KonfigClient`] construction.
+/// Errors surfaced by [`KonfigClient`] construction + unary RPCs.
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("invalid endpoint: {0}")]
@@ -84,6 +86,9 @@ pub enum ClientError {
     Transport(#[from] tonic::transport::Error),
     #[error("watch called with no config names")]
     NoNames,
+    /// A unary RPC (`get` / `apply`) returned a gRPC error status.
+    #[error("rpc error: {0}")]
+    Rpc(#[from] tonic::Status),
 }
 
 /// A multiplexed, async gRPC client for the konfig service.
@@ -190,6 +195,66 @@ impl KonfigClient {
         let mut handles = self.watch(namespace, &[name]).await?;
         Ok(handles.remove(0))
     }
+
+    /// Fetch one config once (unary `Get`). Returns the raw proto [`Config`];
+    /// parse it with [`snapshot_from_proto`] for the higher-level snapshot.
+    pub async fn get(&self, namespace: &str, name: &str) -> Result<Config, ClientError> {
+        let resp = self
+            .client
+            .clone()
+            .get(GetRequest {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+            })
+            .await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Create or update a config (unary `Apply`). `schema_version` must be
+    /// strictly greater than the stored one (the server enforces monotonicity).
+    /// JSON is valid YAML, so the request's `yaml_content` is built from
+    /// `{schema_version, content}` — no YAML dependency needed.
+    pub async fn apply(
+        &self,
+        namespace: &str,
+        name: &str,
+        content: serde_json::Value,
+        schema_version: i64,
+    ) -> Result<(), ClientError> {
+        self.client
+            .clone()
+            .apply(ApplyRequest {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                yaml_content: apply_yaml(schema_version, &content),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Subscribe to `names` in `namespace` as a raw, auto-reconnecting stream of
+    /// [`ConfigEvent`]s. Reconnects with backoff and resumes from the last
+    /// `resource_version` on any disconnect, so no events are missed. The stream
+    /// runs until dropped. For a lock-free materialised snapshot view instead,
+    /// use [`KonfigClient::watch`].
+    pub fn subscribe(
+        &self,
+        namespace: &str,
+        names: &[&str],
+    ) -> impl futures_util::Stream<Item = ConfigEvent> {
+        crate::stream::reconnecting_event_stream(
+            self.client.clone(),
+            namespace.to_string(),
+            names.iter().map(|s| (*s).to_string()).collect(),
+        )
+    }
+}
+
+/// Build the `Apply` request's `yaml_content` from a schema version + content.
+/// JSON is a strict subset of YAML, so a compact JSON object with the required
+/// top-level `schema_version` key is a valid YAML document the server accepts.
+fn apply_yaml(schema_version: i64, content: &serde_json::Value) -> String {
+    serde_json::json!({ "schema_version": schema_version, "content": content }).to_string()
 }
 
 /// Owns the spawned driver `JoinHandle`; aborts it on drop. Shared (`Arc`)
@@ -301,6 +366,59 @@ mod tests {
         let client = KonfigClient::new(channel);
         let handle = client.watch_one("ns", "c").await.expect("spawns");
         assert!(handle.get().content.is_null());
+    }
+
+    #[test]
+    fn apply_yaml_builds_valid_schema_version_doc() {
+        let yaml = apply_yaml(7, &serde_json::json!({"rate_limit": 100, "on": true}));
+        // JSON is valid YAML; parse it back and assert the required shape.
+        let v: serde_json::Value = serde_json::from_str(&yaml).unwrap();
+        assert_eq!(v["schema_version"], 7);
+        assert_eq!(v["content"]["rate_limit"], 100);
+        assert_eq!(v["content"]["on"], true);
+    }
+
+    #[tokio::test]
+    async fn get_against_unreachable_is_rpc_error() {
+        let client = KonfigClient::connect("http://127.0.0.1:1")
+            .await
+            .expect("builds");
+        let err = client
+            .get("ns", "c")
+            .await
+            .err()
+            .expect("unreachable → error");
+        assert!(matches!(err, ClientError::Rpc(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn apply_against_unreachable_is_rpc_error() {
+        let client = KonfigClient::connect("http://127.0.0.1:1")
+            .await
+            .expect("builds");
+        let err = client
+            .apply("ns", "c", serde_json::json!({"x": 1}), 2)
+            .await
+            .err()
+            .expect("unreachable → error");
+        assert!(matches!(err, ClientError::Rpc(_)), "got {err:?}");
+    }
+
+    /// `subscribe` returns a `Stream` built on the caller runtime that yields
+    /// nothing (and does not panic) while the server is unreachable — it is
+    /// silently reconnecting in the background.
+    #[tokio::test]
+    async fn subscribe_returns_reconnecting_stream() {
+        use futures_util::StreamExt as _;
+        let client = KonfigClient::connect("http://127.0.0.1:1")
+            .await
+            .expect("builds");
+        let stream = client.subscribe("ns", &["a", "b"]);
+        let mut stream = std::pin::pin!(stream);
+        // No server → the first Subscribe fails and the stream backs off; it must
+        // stay pending (no event, no panic) within a short window.
+        let got = tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await;
+        assert!(got.is_err(), "expected pending (reconnecting), got {got:?}");
     }
 
     /// Dropping the last handle aborts the driver task.

@@ -40,7 +40,7 @@ jobs:
         run: bazel build //rust/konfig:konfig_bin //tools/konfig-cli:konfig_cli //tools/konfig-flamediff:konfig_flamediff //tools/konfig-loadtest:gate
 
       - name: Test
-        run: bazel test //rust/konfig:test //tools/konfig-cli/... //tools/konfig-flamediff:test //tools/konfig-loadtest:gate_test --test_output=errors
+        run: bazel test //rust/konfig:test //rust/konfig-consumer:test //tools/konfig-cli/... //tools/konfig-flamediff:test //tools/konfig-loadtest:gate_test --test_output=errors
 
       - name: Format
         run: |

@@ -1608,6 +1608,7 @@ name = "konfig-consumer"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-stream",
  "futures-util",
  "prometheus",
  "prost 0.14.4",

@@ -25,6 +25,7 @@ rust_library(
     deps = [
         ":konfig_consumer_bs",
         "@konfig_crates//:arc-swap",
+        "@konfig_crates//:async-stream",
         "@konfig_crates//:futures-util",
         "@konfig_crates//:prometheus",
         "@konfig_crates//:prost",
