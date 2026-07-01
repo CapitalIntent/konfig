@@ -242,6 +242,39 @@ secured stream (the default) is not directly reachable from page JS. Options:
 A query-parameter token (`?access_token=…`) is a possible later follow-up but is
 intentionally not implemented here (tokens in URLs leak into logs).
 
+## REST GET (one-shot) + readiness
+
+For clients that prefer polling over streaming, the gateway serves plain `GET`
+aliases for the read RPCs (**configs only** — secret reads stay on the
+audit-logged `POST` path):
+
+- `GET /v1/configs/{namespace}/{name}` → unary `Get`; returns the JSON `Config`
+  (`404` if absent). Same bearer gate as the rest of the gateway.
+- `GET /v1/configs/{namespace}` → server-streaming `GetAll`; returns a JSON
+  array **streamed one element at a time** (the whole namespace is never
+  buffered in memory). Same bearer gate.
+- Both answer a CORS preflight (`OPTIONS`) so a cross-origin browser `fetch`
+  with an `Authorization` header works when `--http-cors-allow-origin` is set.
+
+```sh
+curl http://konfig:8080/v1/configs/default/app-config -H "Authorization: Bearer $TOKEN"
+curl http://konfig:8080/v1/configs/default            -H "Authorization: Bearer $TOKEN"
+```
+
+### `/healthz` readiness
+
+`GET /healthz` is the **unauthenticated** readiness probe for Kubernetes
+(liveness/readiness probes carry no bearer token):
+
+- `200 {"status":"ok","cache_ready":true}` once the config cache has completed
+  its first list (the same gate the gRPC health check + SSE streams use).
+- `503 {"status":"warming","cache_ready":false}` + `Retry-After: 1` while the
+  cache is still warming.
+
+```sh
+curl http://konfig:8080/healthz    # no token needed
+```
+
 ## CORS
 
 When `--http-cors-allow-origin` is set, the gateway:
@@ -284,6 +317,6 @@ draining.
 
 ## Out of scope
 
-REST `GET` aliases for `Get`/`GetAll` and a `/healthz` readiness probe (planned
-PR2 under the same ticket); same-port multiplexing with gRPC; strict `pbjson`
-proto3-JSON; prod manifest wiring (Phase 6).
+REST `GET` for **secrets** (kept on the audit-logged `POST`/gRPC path); same-port
+multiplexing with gRPC; strict `pbjson` proto3-JSON; prod manifest wiring
+(Phase 6).
