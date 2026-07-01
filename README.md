@@ -121,7 +121,13 @@ sudo mv konfig-cli /usr/local/bin/
 # Linux x86_64
 curl -sSL https://github.com/jayakasadev/konfig/releases/latest/download/konfig-cli-linux-amd64.tar.gz | tar -xz
 sudo mv konfig-cli /usr/local/bin/
+
+# Linux ARM64
+curl -sSL https://github.com/jayakasadev/konfig/releases/latest/download/konfig-cli-linux-arm64.tar.gz | tar -xz
+sudo mv konfig-cli /usr/local/bin/
 ```
+
+Verify downloads with the release `SHA256SUMS` + `cosign verify-blob` — see [docs/cli.md](docs/cli.md#verify-the-download-checksum--cosign-keyless).
 
 `konfig-cli` talks directly to the Kubernetes API — it works even when the
 konfig server is down.
