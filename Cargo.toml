@@ -4,6 +4,7 @@ members = [
     "rust/konfig",
     "rust/konfig-consumer",
     "tools/konfig-cli",
+    "tools/konfig-flamediff",
     "tools/konfig-loadtest",
 ]
 
