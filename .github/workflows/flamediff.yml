@@ -147,6 +147,10 @@ jobs:
           kubectl apply -f infra/profiling/alloy-config.yaml
           kubectl apply -f infra/profiling/alloy-daemonset.yaml
           kubectl rollout status -n profiling daemonset/alloy --timeout=180s
+          # Show eBPF init + target discovery so a zero-sample capture is debuggable.
+          sleep 5
+          echo "=== alloy logs (eBPF attach + discovered targets) ==="
+          kubectl logs -n profiling -l app=alloy --tail=120 --prefix || true
 
       - name: Deploy konfig (plain image, 1 replica, --tls=false, reliable startup)
         # Reuses the loadtest-gate's battle-tested startup tweaks (IfNotPresent,
@@ -191,20 +195,39 @@ jobs:
             curl -fsS -o /dev/null --max-time 2 http://localhost:4040/ready && break
             sleep 1
           done
-          # eBPF profile type (validated query, Pyroscope 1.9.0, CU-86ahtj1a8 standup).
-          QUERY='process_cpu:samples:count:cpu:nanoseconds{service_name="konfig"}'
-          curl -fsS -G http://localhost:4040/pyroscope/render \
-            --data-urlencode "query=${QUERY}" \
-            --data-urlencode "from=now-${WINDOW}" \
-            --data-urlencode "format=json" \
-            -o flamediff-out/cpu.flamebearer.json \
-            && echo "flamebearer: $(stat -c '%s' flamediff-out/cpu.flamebearer.json) bytes" \
-            || echo "::warning::flamebearer render failed"
-          if [ ! -s flamediff-out/cpu.flamebearer.json ]; then
-            echo "::warning::empty flamebearer — no CPU samples ingested"
+
+          # What did alloy actually ingest? (label API is best-effort.)
+          echo "=== pyroscope service_name values ==="
+          curl -fsS -G http://localhost:4040/pyroscope/label-values --data-urlencode 'label=service_name' 2>/dev/null | tee flamediff-out/svc.json | head -c 800; echo
+          echo "=== pyroscope profile types (__name__) ==="
+          curl -fsS -G http://localhost:4040/pyroscope/label-values --data-urlencode 'label=__name__' 2>/dev/null | tee flamediff-out/types.json | head -c 1500; echo
+          echo "=== alloy logs (post-loadtest: eBPF attach + targets) ==="
+          kubectl logs -n profiling -l app=alloy --tail=80 --prefix 2>/dev/null | tee flamediff-out/alloy.log | tail -40 || true
+
+          # alloy's eBPF CPU profile type name varies by version — try the known
+          # candidates and keep the first that yields a non-empty flamebearer.
+          render() {
+            curl -fsS -G http://localhost:4040/pyroscope/render \
+              --data-urlencode "query=$1" --data-urlencode "from=now-${WINDOW}" \
+              --data-urlencode "format=json" -o flamediff-out/cpu.flamebearer.json 2>/dev/null
+          }
+          GOT=0
+          for q in \
+            'process_cpu:cpu:nanoseconds:cpu:nanoseconds{service_name="konfig"}' \
+            'process_cpu:samples:count:cpu:nanoseconds{service_name="konfig"}' \
+            'process_cpu:samples:count::{service_name="konfig"}'; do
+            echo "--- render try: $q"
+            render "$q" && [ -s flamediff-out/cpu.flamebearer.json ] || { echo "  render failed"; continue; }
+            "$FLAMEDIFF" top-frames flamediff-out/cpu.flamebearer.json --top 5 -o flamediff-out/current.json 2>/dev/null || continue
+            if grep -q '"name"' flamediff-out/current.json; then
+              echo "  -> non-empty, using this query"; GOT=1; break
+            fi
+            echo "  -> empty (numTicks 0)"
+          done
+          if [ "$GOT" != "1" ]; then
+            echo "::warning::no non-empty flamebearer from any candidate query — no CPU samples ingested"
             echo "EMPTY_CAPTURE=1" >> "$GITHUB_ENV"; exit 0
           fi
-          "$FLAMEDIFF" top-frames flamediff-out/cpu.flamebearer.json --top 5 -o flamediff-out/current.json
           echo "=== current.json (top-5 self%) ==="; cat flamediff-out/current.json
 
       - name: Flamediff gate (compare vs .profiling-baseline.json)
