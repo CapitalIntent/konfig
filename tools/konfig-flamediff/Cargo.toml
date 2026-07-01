@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 clap = {version = "4", features = ["derive"]}
+# `--exclude` regex drops noise frames (kernel/linker C symbols) before the
+# top-N pick, so the gate tracks konfig+deps userspace, not whole-stack noise.
+regex = {version = "1", default-features = false, features = ["std"]}
 # Turn eBPF/pyroscope's mangled Rust symbols (_ZN4ring...) into readable
 # `ring::aead::...` names so the baseline + gate summary are human-friendly.
 rustc-demangle = "0.1"

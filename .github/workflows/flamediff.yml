@@ -237,7 +237,8 @@ jobs:
             'process_cpu:samples:count::{service_name="konfig"}'; do
             echo "--- render try: $q"
             render "$q" && [ -s flamediff-out/cpu.flamebearer.json ] || { echo "  render failed"; continue; }
-            "$FLAMEDIFF" top-frames flamediff-out/cpu.flamebearer.json --top 5 -o flamediff-out/current.json 2>/dev/null || continue
+            "$FLAMEDIFF" top-frames flamediff-out/cpu.flamebearer.json --top 5 \
+              --exclude '^[^:]*$' -o flamediff-out/current.json 2>/dev/null || continue
             if grep -q '"name"' flamediff-out/current.json; then
               echo "  -> non-empty, using this query"; GOT=1; break
             fi

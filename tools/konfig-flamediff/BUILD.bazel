@@ -15,6 +15,7 @@ rust_binary(
     visibility = ["//visibility:public"],
     deps = [
         "@konfig_crates//:clap",
+        "@konfig_crates//:regex",
         "@konfig_crates//:rustc-demangle",
         "@konfig_crates//:serde_json",
     ],

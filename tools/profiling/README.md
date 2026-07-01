@@ -131,8 +131,9 @@ flaky gate would risk breaking every PR.
 The single `capture-gate` job is **opt-in** (push to `main`, manual
 `workflow_dispatch`, or a PR labeled `profiling`) so an unverified capture never
 blocks an unrelated PR. It stands up kind + pyroscope + the alloy eBPF DaemonSet
-+ a plain konfig pod (`--config=x86-baseline`, symbolized), runs the saturate
-loadtest, then renders → top-5 → diffs vs `.profiling-baseline.json`. When no
++ a plain konfig pod (`--config=x86-baseline`, symbolized), drives a sustained
+config-apply load (large payloads so konfig's own CPU dominates), then renders →
+filtered top-5 → diffs vs the checked-in `.profiling-baseline.json`. When no
 baseline is checked in it runs in *seed mode*: uploads `current.json` as the
 `profiling-baseline-seed` artifact and never fails.
 
@@ -140,39 +141,42 @@ baseline is checked in it runs in *seed mode*: uploads `current.json` as the
 # The capture chain the heavy job runs (eBPF profile type, Pyroscope 1.9.0):
 FLAMEDIFF=$(bazel cquery --output=files //tools/konfig-flamediff:konfig_flamediff)
 curl -fsS -G http://localhost:4040/pyroscope/render \
-  --data-urlencode 'query=process_cpu:samples:count:cpu:nanoseconds{service_name="konfig"}' \
+  --data-urlencode 'query=process_cpu:cpu:nanoseconds:cpu:nanoseconds{service_name="konfig"}' \
   --data-urlencode 'from=now-10m' --data-urlencode 'format=json' -o cpu.flamebearer.json
-"$FLAMEDIFF" top-frames cpu.flamebearer.json --top 5 -o current.json
+# `--exclude '^[^:]*$'` drops bare C kernel/linker frames (no `::`), leaving
+# konfig+deps userspace so the gate tracks konfig, not whole-stack noise.
+"$FLAMEDIFF" top-frames cpu.flamebearer.json --top 5 --exclude '^[^:]*$' -o current.json
 "$FLAMEDIFF" gate current.json .profiling-baseline.json --output "$GITHUB_STEP_SUMMARY"
 ```
 
-### Arming the gate (needs one Linux CI run — cannot be done on macOS)
+### Baseline (armed)
 
-1. **Seed the baseline from `main`.** Run the workflow on `main`
-   (`gh workflow run flamediff.yml`), download the `profiling-baseline-seed`
-   artifact, and commit its `profiling-baseline-seed.json` as
-   `.profiling-baseline.json` at the repo root. This is the remaining blocker —
-   see the ingestion finding below.
-2. **Verify the gate fires.** Open a throwaway PR labeled `profiling` with an
-   intentional hot-path regression (e.g. a `sleep` in the apply path) and confirm
-   the `capture-gate` job fails; revert.
-3. **Promote to required** (optional) once the capture is proven green on Linux.
+`.profiling-baseline.json` is committed at the repo root — captured on a Linux
+CI run (eBPF), demangled, kernel/linker-filtered, top-5. The gate is live: a
+`capture-gate` run whose filtered top-5 shows a frame >20% (relative) hotter
+than the baseline fails. Re-seed after an intentional perf change by running the
+workflow on `main` and committing the fresh `current.json` over the baseline.
 
-### Findings from the local standup (why the baseline needs Linux CI)
+### Findings (why the capture is shaped the way it is)
 
-- **Ingestion path is alloy eBPF, not the in-process agent.** The
-  `konfig-profiling` image's in-process `pyroscope-rs` agent
-  (`PYROSCOPE_SERVER_ADDRESS`) does **not** ingest into Grafana Pyroscope 1.9.0
-  (legacy `/ingest` format) — a local standup left `service_name=konfig` with
-  zero series. The supported path is the **alloy `pyroscope.ebpf`** DaemonSet
-  (`infra/profiling/alloy-*.yaml`) scraping konfig pods → pyroscope with
-  `service_name=konfig`. eBPF needs host-kernel perf access, which is unavailable
-  in kind-on-Apple-Silicon — hence the baseline must come from a Linux CI runner.
-- **The in-process agent needs a relaxed seccomp profile.** If you do use it,
-  `pprof-rs` fails at startup with `Error: AdHoc("create profiler error")` under
-  the default restricted seccomp. The konfig container must run with
-  `securityContext: { seccompProfile: { type: Unconfined }, capabilities: { add: ["SYS_PTRACE"] } }`
-  for the signal/timer-based sampler to initialize.
+- **konfig is I/O-bound.** Under load its CPU is dominated by kernel networking
+  + h2 transport; its own logic (config parse/encode/broadcast) is a few % at
+  most. So the capture drives **large config payloads** (`S1_PAYLOAD_BYTES`) to
+  make konfig's serde_yaml/serde_json/encode frames dominate, caps the
+  loadtest's CPU so konfig gets scheduler time on the 2-vCPU runner, and applies
+  `--exclude '^[^:]*$'` to drop bare kernel/linker symbols. Without these the
+  top-5 is kernel noise (`_raw_spin_unlock_irqrestore`, `__nf_conntrack_find_get`)
+  and a single artifact frame (`_dl_mcount_wrapper`).
+- **eBPF, not the in-process agent.** The `konfig-profiling` image's in-process
+  `pyroscope-rs` agent (`PYROSCOPE_SERVER_ADDRESS`) crashes under kind's default
+  seccomp (`Error: AdHoc("create profiler error")`) and does not ingest into
+  Grafana Pyroscope 1.9.0 (legacy `/ingest`). The supported path is the alloy
+  `pyroscope.ebpf` DaemonSet (`infra/profiling/alloy-*.yaml`) scraping the plain
+  konfig pod. eBPF needs host-kernel perf access (unavailable in
+  kind-on-Apple-Silicon) — hence the capture only runs on the Linux CI runner.
+- **A `sleep` won't trip the gate** — it's a CPU profile, and sleeping is
+  off-CPU. Verify with a real CPU regression (extra work on the hot path), or
+  deterministically: `flamediff gate <+30%-current> .profiling-baseline.json`.
 
 ## flamebearer -> pprof (interactive drill-down)
 

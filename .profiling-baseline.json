@@ -1,0 +1,24 @@
+{
+  "frames": [
+    {
+      "name": "unsafe_libyaml::reader::yaml_parser_update_buffer",
+      "self_pct": 4.0992
+    },
+    {
+      "name": "unsafe_libyaml::scanner::READ",
+      "self_pct": 3.1643
+    },
+    {
+      "name": "unsafe_libyaml::scanner::yaml_parser_fetch_flow_scalar",
+      "self_pct": 1.69
+    },
+    {
+      "name": "serde_json::ser::format_escaped_str",
+      "self_pct": 1.1147
+    },
+    {
+      "name": "<tracing::instrument::Instrumented<T> as core::future::future::Future>::poll",
+      "self_pct": 0.6113
+    }
+  ]
+}
