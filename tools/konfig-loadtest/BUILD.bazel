@@ -1,8 +1,11 @@
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy", "rustfmt_test")
 
+load("@rules_rust//rust:defs.bzl", "rust_test")
+
 rust_binary(
     name = "konfig_loadtest",
-    srcs = glob(["src/**/*.rs"]),
+    # Exclude src/bin/ — that's the separate `gate` binary (own main).
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
     tags = ["konfig", "loadtest", "rust"],
     visibility = ["//visibility:public"],
     deps = [
@@ -16,11 +19,33 @@ rust_binary(
     ],
 )
 
+# Perf-regression gate (CU-86aj08v98) — p99 vs newest committed baseline.
+rust_binary(
+    name = "gate",
+    srcs = ["src/bin/gate.rs"],
+    tags = ["konfig", "loadtest", "rust"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@konfig_crates//:clap",
+        "@konfig_crates//:serde_json",
+    ],
+)
+
+rust_test(
+    name = "gate_test",
+    size = "small",
+    crate = ":gate",
+    tags = ["konfig", "loadtest", "rust", "unit"],
+)
+
 rustfmt_test(
     name = "fmt_test",
     size = "small",
     tags = ["konfig", "loadtest", "rust", "unit"],
-    targets = [":konfig_loadtest"],
+    targets = [
+        ":gate",
+        ":konfig_loadtest",
+    ],
 )
 
 rust_clippy(
@@ -28,4 +53,11 @@ rust_clippy(
     testonly = True,
     tags = ["konfig", "loadtest", "rust", "unit"],
     deps = [":konfig_loadtest"],
+)
+
+rust_clippy(
+    name = "gate_clippy_test",
+    testonly = True,
+    tags = ["konfig", "loadtest", "rust", "unit"],
+    deps = [":gate"],
 )

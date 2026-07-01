@@ -10,10 +10,17 @@ repository.workspace = true
 name = "konfig-loadtest"
 path = "src/main.rs"
 
+# Perf-regression gate (CU-86aj08v98): compares a fresh results.json p99 vs the
+# newest committed baseline. Separate bin so it stays a tiny, testable tool.
+[[bin]]
+name = "konfig-loadtest-gate"
+path = "src/bin/gate.rs"
+
 [dependencies]
 clap = {version = "4", features = ["derive"]}
 futures-util = "0.3"
 konfig = {path = "../../rust/konfig"}
+serde_json = {workspace = true, features = ["std"]}
 tokio = {workspace = true, features = ["full"]}
 tonic = {workspace = true}
 tracing = {workspace = true}

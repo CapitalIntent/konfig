@@ -46,6 +46,10 @@ on:
         description: S1_P99_LIMIT_MS — scenario-1 p99 gate (1000 per CU-86ahzwhat)
         type: string
         default: "1000"
+      baseline_bump_tag:
+        description: "PERF_BASELINE_BUMP — if set (e.g. v0.1.0), write this run's p99 as infra/konfig-loadtest/baselines/<tag>.json instead of gating (CU-86aj08v98)"
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}
@@ -302,6 +306,35 @@ jobs:
         with:
           name: loadtest-acceptance-results
           path: acceptance.json
+          if-no-files-found: warn
+
+      - name: Perf gate — p99 vs committed baseline (CU-86aj08v98, non-blocking)
+        # Latency sibling of the flamediff CPU gate. NON-blocking (continue-on-
+        # error) here: p99 on a shared kind runner is noisy and this acceptance
+        # job is not the release gate — it reports the diff to the step summary.
+        # The future release workflow (86ahzwjpr) calls //tools/konfig-loadtest:gate
+        # as a hard gate. With `baseline_bump_tag` set it instead writes the
+        # baseline (the PERF_BASELINE_BUMP path) for committing via the artifact.
+        if: always()
+        continue-on-error: true
+        run: |
+          [ -s acceptance.json ] || { echo "no acceptance.json — skipping perf gate"; exit 0; }
+          bazel build //tools/konfig-loadtest:gate
+          GATE="$PWD/$(bazel cquery --output=files //tools/konfig-loadtest:gate 2>/dev/null)"
+          BUMP='${{ inputs.baseline_bump_tag }}'
+          if [ -n "$BUMP" ]; then
+            "$GATE" --current acceptance.json --update "$BUMP"
+            echo "Wrote infra/konfig-loadtest/baselines/$BUMP.json — download the perf-baseline artifact and commit it."
+          else
+            "$GATE" --current acceptance.json --output "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload seeded/bumped baseline (when baseline_bump_tag set)
+        if: always() && inputs.baseline_bump_tag != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-baseline-${{ inputs.baseline_bump_tag }}
+          path: infra/konfig-loadtest/baselines/${{ inputs.baseline_bump_tag }}.json
           if-no-files-found: warn
 
       - name: Diagnostics on failure

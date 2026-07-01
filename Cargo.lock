@@ -1638,6 +1638,7 @@ dependencies = [
  "clap",
  "futures-util",
  "konfig",
+ "serde_json",
  "tokio",
  "tonic 0.14.6",
  "tracing",
