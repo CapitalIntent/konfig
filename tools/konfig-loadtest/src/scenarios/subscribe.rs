@@ -27,6 +27,17 @@ use crate::metrics::Stats;
 const S1_DRAIN_SECS: u64 = 30;
 const S1_P99_LIMIT_MS: u128 = 500;
 
+/// Build a YAML fragment padding the Config with `bytes` of blob content, or an
+/// empty string when `bytes == 0`. Used to make konfig's own encode/serialize
+/// CPU dominate a profile (CU-86ahtj1a8 flamediff baseline).
+fn payload_blob(bytes: usize) -> String {
+    if bytes == 0 {
+        String::new()
+    } else {
+        format!("  blob: \"{}\"\n", "a".repeat(bytes))
+    }
+}
+
 pub(crate) async fn scenario_subscribe_flood(
     addr: &str,
     namespace: &str,
@@ -41,6 +52,10 @@ pub(crate) async fn scenario_subscribe_flood(
     // p99 gate is env-tunable so the acceptance run (CU-86ahzwhat) can set the
     // 1000 ms budget without a recompile. Default preserves the 500 ms bar.
     let s1_p99_limit_ms: u128 = env_u128("S1_P99_LIMIT_MS", S1_P99_LIMIT_MS);
+    // Optional payload padding (CU-86ahtj1a8): pad each applied Config with a
+    // blob of N bytes so konfig's own CPU (yaml parse + prost encode + broadcast
+    // serialize) dominates a CPU profile instead of raw transport. 0 = off.
+    let s1_payload_bytes: usize = env_usize("S1_PAYLOAD_BYTES", 0);
 
     if let Some(secs) = duration_secs {
         return scenario_subscribe_flood_sustained(
@@ -122,9 +137,12 @@ pub(crate) async fn scenario_subscribe_flood(
     };
     let mut driver = KonfigServiceClient::new(ch);
 
+    // Build the payload blob once (same bytes each apply — konfig still fully
+    // parses + encodes it every time, which is the CPU we want to profile).
+    let blob = payload_blob(s1_payload_bytes);
     for seq in start_seq..=end_seq {
         let yaml = format!(
-            "schema_version: {seq}\ncontent:\n  iteration: {seq}\n  scenario: subscribe_flood\n"
+            "schema_version: {seq}\ncontent:\n  iteration: {seq}\n  scenario: subscribe_flood\n{blob}"
         );
         match driver
             .apply(tonic::Request::new(ApplyRequest {
@@ -301,6 +319,7 @@ async fn scenario_subscribe_flood_sustained(
     let mut driver = KonfigServiceClient::new(ch);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(duration_secs);
+    let blob = payload_blob(env_usize("S1_PAYLOAD_BYTES", 0));
     let mut seq = start_seq;
     let mut n_ok: u64 = 0;
     let mut n_err: u64 = 0;
@@ -309,7 +328,7 @@ async fn scenario_subscribe_flood_sustained(
             break;
         }
         let yaml = format!(
-            "schema_version: {seq}\ncontent:\n  iteration: {seq}\n  scenario: subscribe_flood_sustained\n"
+            "schema_version: {seq}\ncontent:\n  iteration: {seq}\n  scenario: subscribe_flood_sustained\n{blob}"
         );
         match driver
             .apply(tonic::Request::new(ApplyRequest {

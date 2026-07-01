@@ -45,7 +45,7 @@ pub fn load(path: &Path) -> Result<Flamebearer, String> {
         .and_then(Value::as_array)
         .ok_or_else(|| format!("{}: missing flamebearer.names array", path.display()))?
         .iter()
-        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .map(|v| demangle(v.as_str().unwrap_or_default()))
         .collect();
 
     let levels = fb
@@ -124,7 +124,12 @@ impl Flamebearer {
 
     /// The N hottest frames by self-%, highest first, dropping zero-self frames.
     /// `self_pct` is rounded to 4 decimals (matches the old python tool).
-    pub fn top_frames(&self, n: usize) -> Vec<(String, f64)> {
+    ///
+    /// `exclude` drops frames whose (demangled) name matches, BEFORE the top-N
+    /// pick — so `--exclude '^[^:]*$'` (frames without `::`) strips bare C
+    /// kernel/linker symbols and leaves konfig+deps userspace frames. `total`
+    /// stays the full profile total, so kept frames keep their true self-%.
+    pub fn top_frames(&self, n: usize, exclude: Option<&regex::Regex>) -> Vec<(String, f64)> {
         let per_depth = self.decode_levels();
         let mut by_name: HashMap<&str, i64> = HashMap::new();
         for depth in &per_depth {
@@ -140,7 +145,10 @@ impl Flamebearer {
             let sum: i64 = by_name.values().sum();
             if sum > 0 { sum } else { 1 }
         };
-        let mut rows: Vec<(&str, i64)> = by_name.into_iter().collect();
+        let mut rows: Vec<(&str, i64)> = by_name
+            .into_iter()
+            .filter(|(name, _)| exclude.is_none_or(|re| !re.is_match(name)))
+            .collect();
         // Deterministic: hottest first, ties broken by name so output is stable.
         rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         rows.into_iter()
@@ -255,6 +263,14 @@ fn round4(x: f64) -> f64 {
     (x * 10_000.0).round() / 10_000.0
 }
 
+/// Turn a mangled Rust symbol into a readable path, dropping the trailing hash
+/// (`_ZN4ring...aes_gcm_open17h01..E` -> `ring::aead::algorithm::aes_gcm_open`).
+/// The `{:#}` alternate form omits the hash; non-mangled names pass through
+/// unchanged, so C frames / `[unknown]` are left as-is.
+fn demangle(name: &str) -> String {
+    format!("{:#}", rustc_demangle::demangle(name))
+}
+
 /// Append-only string table for pprof (index 0 is always the empty string).
 struct Interner {
     strings: Vec<String>,
@@ -352,7 +368,7 @@ mod tests {
     #[test]
     fn top_frames_hottest_first_and_drops_zero() {
         let fb = sample_fb();
-        let tf = fb.top_frames(5);
+        let tf = fb.top_frames(5, None);
         assert_eq!(tf[0], ("compute".to_string(), 60.0));
         let names: Vec<&str> = tf.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["compute", "render"]); // main/total have self 0
@@ -361,9 +377,28 @@ mod tests {
     #[test]
     fn top_frames_uses_num_ticks_as_total() {
         let fb = sample_fb();
-        let tf = fb.top_frames(5);
+        let tf = fb.top_frames(5, None);
         // render self 40 / 100 ticks = 40.0%
         assert_eq!(tf[1], ("render".to_string(), 40.0));
+    }
+
+    #[test]
+    fn top_frames_exclude_drops_matching_but_keeps_self_pct() {
+        // Frames without `::` (compute/render) are dropped; only a namespaced
+        // frame survives, still measured against the full 100-tick total.
+        let fb = Flamebearer {
+            names: ["total", "a::b::work", "render"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            levels: vec![vec![0, 100, 0, 0], vec![0, 60, 60, 1, 0, 40, 40, 2]],
+            num_ticks: 100,
+            sample_rate: 100,
+            units: "samples".into(),
+        };
+        let re = regex::Regex::new("^[^:]*$").unwrap();
+        let tf = fb.top_frames(5, Some(&re));
+        assert_eq!(tf, vec![("a::b::work".to_string(), 60.0)]);
     }
 
     #[test]
@@ -379,5 +414,16 @@ mod tests {
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["frames"][0]["name"], "a");
         assert_eq!(v["frames"][0]["self_pct"], 12.0);
+    }
+
+    #[test]
+    fn demangle_strips_hash_and_passes_plain_names() {
+        assert_eq!(
+            demangle("_ZN4ring4aead9algorithm12aes_gcm_open17h0113692f7c88a77dE"),
+            "ring::aead::algorithm::aes_gcm_open"
+        );
+        // Non-mangled frames (C funcs, [unknown]) pass through untouched.
+        assert_eq!(demangle("epoll_wait"), "epoll_wait");
+        assert_eq!(demangle("[unknown]"), "[unknown]");
     }
 }

@@ -172,10 +172,29 @@ jobs:
           kubectl rollout status -n konfig-system deploy/konfig --timeout=180s
           kubectl wait --for=condition=Ready -n konfig-system pod -l app=konfig --timeout=180s
 
-      - name: Run saturate loadtest (CU-LOAD-1) and let alloy scrape
+      - name: Run sustained loadtest (~60s) so konfig CPU dominates the window
+        # saturate's default is 1000 applies x 5ms ~= 5s of work — shorter than
+        # alloy's 10s scrape cycle, which yields a thin 1-frame profile. Override
+        # to ~60s of sustained apply -> encode -> broadcast fan-out so the konfig
+        # hot path is captured across several alloy cycles. p99 gate lifted (we
+        # profile CPU here, we don't gate latency).
         run: |
-          sed 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/' \
-            infra/konfig-loadtest/job-saturate.yaml | kubectl apply -f -
+          # Cap the loadtest's CPU so it can't starve konfig on the 2-vCPU
+          # runner — konfig is the profile target and must get scheduler time
+          # (the default saturate job requests cpu:"2", eating the whole node
+          # and leaving konfig ~10ms of CPU = a single eBPF sample).
+          yq '
+            (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).imagePullPolicy = "IfNotPresent"
+            | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).resources.requests.cpu = "250m"
+            | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).resources.limits.cpu = "1"
+            | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).env = [
+                {"name": "S1_SUBSCRIBERS", "value": "100"},
+                {"name": "S1_APPLIES", "value": "6000"},
+                {"name": "S1_INTERVAL_MS", "value": "10"},
+                {"name": "S1_PAYLOAD_BYTES", "value": "65536"},
+                {"name": "S1_P99_LIMIT_MS", "value": "600000"}
+              ]
+          ' infra/konfig-loadtest/job-saturate.yaml | kubectl apply -f -
           for _ in $(seq 1 60); do
             ph=$(kubectl get pods -n konfig-system -l job-name=konfig-loadtest-saturate \
                    -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
@@ -183,8 +202,8 @@ jobs:
             sleep 2
           done
           kubectl logs -n konfig-system -f job/konfig-loadtest-saturate --all-containers=true || true
-          # alloy collect_interval is 10s; give it a few cycles to ship to pyroscope.
-          sleep 30
+          # alloy collect_interval is 10s; give it a couple more cycles to ship.
+          sleep 25
 
       - name: Capture top-5 CPU frames (pyroscope render -> current.json)
         run: |
@@ -218,7 +237,8 @@ jobs:
             'process_cpu:samples:count::{service_name="konfig"}'; do
             echo "--- render try: $q"
             render "$q" && [ -s flamediff-out/cpu.flamebearer.json ] || { echo "  render failed"; continue; }
-            "$FLAMEDIFF" top-frames flamediff-out/cpu.flamebearer.json --top 5 -o flamediff-out/current.json 2>/dev/null || continue
+            "$FLAMEDIFF" top-frames flamediff-out/cpu.flamebearer.json --top 5 \
+              --exclude '^[^:]*$' -o flamediff-out/current.json 2>/dev/null || continue
             if grep -q '"name"' flamediff-out/current.json; then
               echo "  -> non-empty, using this query"; GOT=1; break
             fi

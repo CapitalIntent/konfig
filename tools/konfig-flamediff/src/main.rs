@@ -54,6 +54,10 @@ enum Cmd {
         /// How many hot frames to keep.
         #[arg(long, default_value_t = 5)]
         top: usize,
+        /// Drop frames whose name matches this regex before the top-N pick.
+        /// E.g. `^[^:]*$` keeps only namespaced Rust frames (drops kernel/libc).
+        #[arg(long)]
+        exclude: Option<String>,
         /// Write here instead of stdout.
         #[arg(long, short)]
         output: Option<PathBuf>,
@@ -104,7 +108,12 @@ fn main() -> ExitCode {
 /// stays simple + unit-testable (the CLI glue is not where bugs hide).
 fn run(cli: Cli) -> Result<u8, String> {
     match cli.cmd {
-        Cmd::TopFrames { input, top, output } => cmd_top_frames(&input, top, output.as_deref()),
+        Cmd::TopFrames {
+            input,
+            top,
+            exclude,
+            output,
+        } => cmd_top_frames(&input, top, exclude.as_deref(), output.as_deref()),
         Cmd::ToPprof { input, output } => cmd_to_pprof(&input, &output),
         Cmd::Gate {
             current,
@@ -126,9 +135,18 @@ fn run(cli: Cli) -> Result<u8, String> {
     }
 }
 
-fn cmd_top_frames(input: &Path, top: usize, output: Option<&Path>) -> Result<u8, String> {
+fn cmd_top_frames(
+    input: &Path,
+    top: usize,
+    exclude: Option<&str>,
+    output: Option<&Path>,
+) -> Result<u8, String> {
+    let re = match exclude {
+        Some(pat) => Some(regex::Regex::new(pat).map_err(|e| format!("bad --exclude regex: {e}"))?),
+        None => None,
+    };
     let fb = flamebearer::load(input)?;
-    let json = flamebearer::frames_to_json(&fb.top_frames(top));
+    let json = flamebearer::frames_to_json(&fb.top_frames(top, re.as_ref()));
     write_or_print(output, &json)?;
     Ok(EXIT_OK)
 }
@@ -205,8 +223,10 @@ mod tests {
 
         // top-frames to a file and to stdout (both write_or_print arms).
         let cur = dir.join("cur.json");
-        assert_eq!(cmd_top_frames(&fb, 5, Some(&cur)).unwrap(), EXIT_OK);
-        assert_eq!(cmd_top_frames(&fb, 3, None).unwrap(), EXIT_OK);
+        assert_eq!(cmd_top_frames(&fb, 5, None, Some(&cur)).unwrap(), EXIT_OK);
+        assert_eq!(cmd_top_frames(&fb, 3, None, None).unwrap(), EXIT_OK);
+        // a bad --exclude regex is a usage error (surfaced as exit 2).
+        assert!(cmd_top_frames(&fb, 5, Some("("), None).is_err());
 
         // to-pprof writes non-empty bytes.
         let pprof = dir.join("cpu.pprof");
