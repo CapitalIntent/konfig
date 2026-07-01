@@ -2,6 +2,9 @@ name: Flamediff CPU Regression Gate (CU-86ahtj1a8)
 on:
   pull_request:
     branches: [main]
+    # `labeled` so adding the `profiling` label to an open PR triggers the
+    # opt-in capture-gate (the default types don't fire on label changes).
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
   workflow_dispatch:
