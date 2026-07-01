@@ -179,8 +179,14 @@ jobs:
         # hot path is captured across several alloy cycles. p99 gate lifted (we
         # profile CPU here, we don't gate latency).
         run: |
+          # Cap the loadtest's CPU so it can't starve konfig on the 2-vCPU
+          # runner — konfig is the profile target and must get scheduler time
+          # (the default saturate job requests cpu:"2", eating the whole node
+          # and leaving konfig ~10ms of CPU = a single eBPF sample).
           yq '
             (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).imagePullPolicy = "IfNotPresent"
+            | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).resources.requests.cpu = "250m"
+            | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).resources.limits.cpu = "1"
             | (.spec.template.spec.containers[] | select(.name == "konfig-loadtest")).env = [
                 {"name": "S1_SUBSCRIBERS", "value": "500"},
                 {"name": "S1_APPLIES", "value": "6000"},
