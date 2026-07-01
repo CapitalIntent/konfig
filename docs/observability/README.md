@@ -139,3 +139,8 @@ curl -s "localhost:16686/api/traces/<traceID>" | jq . > traces/<name>.json
   code** — `run_with_reconnect` and the Config watcher emit `konfig.watch_connect`
   spans carrying `attempt` + `backoff_ms`. Capturing the trace under a real
   API-server disruption is per `docs/cluster-eval-runbook.md` (Session B).
+- ~~**No CPU-regression gate** on the hot path.~~ **Gate wired (CU-86ahtj1a8)** —
+  `.github/workflows/flamediff.yml` diffs the top-5 self-% frames of a captured
+  profile vs `.profiling-baseline.json` and fails on a >20% relative regression.
+  Remaining: seed the baseline from one Linux CI run + demonstrate the gate fires
+  (see `tools/profiling/README.md`).

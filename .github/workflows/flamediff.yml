@@ -1,0 +1,246 @@
+name: Flamediff CPU Regression Gate (CU-86ahtj1a8)
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      capture_window:
+        description: "Pyroscope render window (e.g. 10m) for the flamediff capture"
+        required: false
+        default: "10m"
+      seed_baseline:
+        description: "true = ignore any checked-in baseline and emit current.json as a fresh seed"
+        required: false
+        default: "false"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# LOAD-3 (CU-86ahtj1a8): top-5 CPU frame regression gate.
+#
+# Two jobs:
+#   1. logic-gate  — cheap, deterministic, ALWAYS runs. Executes the embedded
+#      `--self-test` of both profiling scripts so the gate LOGIC (threshold,
+#      new-frame floor, noise floor, malformed-input handling) is CI-enforced on
+#      every PR without needing a cluster. This is the part that can break a PR.
+#   2. capture-gate — heavy (kind + pyroscope + saturate loadtest). Captures a
+#      real CPU profile, reduces it to top-5 self-% frames (current.json) and
+#      diffs it against the checked-in `.profiling-baseline.json`. Fails on a
+#      >20% relative self-% regression. Opt-in only (see the `if:` below) so an
+#      unverified pyroscope capture never blocks an unrelated PR — the README
+#      guidance. When no baseline exists yet it runs in *seed mode*: it uploads
+#      current.json as `profiling-baseline-seed` for a human to commit as
+#      `.profiling-baseline.json`, and never fails.
+#
+# Design deviation from the ticket sketch (which said "add to
+# loadtest-integration.yml"), documented + intentional: that gate is a REQUIRED
+# check running the plain konfig image with no pyroscope agent. Capturing a
+# profile there needs the konfig-profiling image + an in-cluster pyroscope, and
+# bolting that onto a required, historically-flaky gate risks breaking every PR.
+# This mirrors `profile-release.yml` (same capture stack) as its own workflow;
+# promote to a required check only after a baseline is committed and the capture
+# is proven green on Linux CI.
+#
+# Tracker: CU-86ahtj1a8 (Phase 7). Reuses tools/profiling/ci_release_capture.sh
+# (CU-86ahtj1v9) + flamebearer_to_pprof.py (CU-86aj7kawc) + flamediff.py.
+jobs:
+  logic-gate:
+    name: flamediff logic self-test (no cluster)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: flamediff.py --self-test
+        run: python3 tools/profiling/flamediff.py --self-test
+      - name: flamebearer_to_pprof.py --self-test
+        run: python3 tools/profiling/flamebearer_to_pprof.py --self-test
+
+  capture-gate:
+    name: capture CPU profile + gate vs baseline (kind + pyroscope)
+    needs: logic-gate
+    # Opt-in only: push to main (refresh + post-merge detection), manual dispatch
+    # (seeding / on-demand), or a PR explicitly labeled `profiling` (to prove the
+    # gate fires). Normal PRs skip this heavy job entirely — it is NON-BLOCKING.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.labels.*.name, 'profiling')
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+      WINDOW: ${{ inputs.capture_window || '10m' }}
+      SEED: ${{ inputs.seed_baseline || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazelbuild/setup-bazelisk@v3
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler
+
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
+
+      - name: CPU capability probe (cx16 — snmalloc SIGILL guard)
+        run: |
+          if grep -qm1 cx16 /proc/cpuinfo; then echo "host: cx16 PRESENT"; else echo "host: cx16 MISSING"; fi
+
+      - name: Build konfig-profiling + konfig-loadtest OCI images (linux/amd64)
+        run: |
+          bazel run --config=x86-baseline //docker/konfig-profiling:load_amd64
+          bazel run --config=x86-baseline //docker/konfig-loadtest:load_amd64
+
+      - name: Create kind cluster (1 node)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: konfig-flamediff
+          wait: 120s
+
+      - name: Load images into kind (poll containerd image store)
+        run: |
+          kind load docker-image kasa288/konfig-profiling:latest --name konfig-flamediff
+          kind load docker-image kasa288/konfig-loadtest:latest --name konfig-flamediff
+          for img in kasa288/konfig-profiling:latest kasa288/konfig-loadtest:latest; do
+            repo="${img%:*}"; tag="${img##*:}"; ok=0
+            for i in $(seq 1 60); do
+              if docker exec konfig-flamediff-control-plane crictl images 2>/dev/null \
+                   | awk -v r="docker.io/$repo" -v t="$tag" '$1==r && $2==t {f=1} END{exit !f}'; then
+                echo "  -> $img visible after ${i}s"; ok=1; break
+              fi
+              sleep 1
+            done
+            [ "$ok" -eq 1 ] || { echo "::error::timeout for $img"; exit 1; }
+          done
+
+      - name: Apply CRDs + RBAC + Service + ConfigMap + seed Config
+        run: |
+          kubectl apply -f infra/konfig/crd.yaml
+          kubectl wait --for=condition=Established crd/configs.konfig.io --timeout=60s
+          kubectl apply -f infra/konfig/namespace.yaml
+          kubectl apply -f infra/konfig/serviceaccount.yaml
+          kubectl apply -f infra/konfig/clusterrole.yaml
+          kubectl apply -f infra/konfig/clusterrole-configmap.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding.yaml
+          kubectl apply -f infra/konfig/clusterrolebinding-configmap.yaml
+          kubectl apply -f infra/konfig/role-secret.yaml
+          kubectl apply -f infra/konfig/service.yaml
+          kubectl create configmap konfig-config \
+            --namespace=konfig-system \
+            --from-literal=namespace=konfig-system \
+            --from-literal=name=konfig-loadtest \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f infra/konfig-loadtest/seed-config.yaml
+
+      - name: Deploy pyroscope (infra/profiling)
+        run: |
+          kubectl apply -f infra/profiling/namespace.yaml
+          kubectl apply -f infra/profiling/pyroscope-configmap.yaml
+          kubectl apply -f infra/profiling/pyroscope-deployment.yaml
+          kubectl apply -f infra/profiling/pyroscope-service.yaml
+          kubectl rollout status -n profiling deploy/pyroscope --timeout=180s
+
+      - name: Deploy konfig-profiling (pyroscope agent on, 1 replica, --tls=false)
+        run: |
+          yq '
+            .spec.replicas = 1
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).image = "kasa288/konfig-profiling:latest"
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).imagePullPolicy = "IfNotPresent"
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).args |=
+                ([.[] | select(test("^--tls") | not)] + ["--tls=false"])
+            | (.spec.template.spec.containers[] | select(.name == "konfig")).env +=
+                [{"name":"PYROSCOPE_SERVER_ADDRESS","value":"http://pyroscope.profiling.svc.cluster.local:4040"},
+                 {"name":"PYROSCOPE_APPLICATION_NAME","value":"konfig"}]
+            | del(.spec.template.spec.containers[] | select(.name == "konfig").volumeMounts[] | select(.name == "konfig-tls"))
+            | del(.spec.template.spec.volumes[] | select(.name == "konfig-tls"))
+          ' infra/konfig/deployment.yaml | kubectl apply -f -
+          kubectl rollout status -n konfig-system deploy/konfig --timeout=180s
+          kubectl wait --for=condition=Ready -n konfig-system pod -l app=konfig --timeout=180s
+
+      - name: Run saturate loadtest (CU-LOAD-1) and wait
+        run: |
+          sed 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/' \
+            infra/konfig-loadtest/job-saturate.yaml | kubectl apply -f -
+          for _ in $(seq 1 60); do
+            ph=$(kubectl get pods -n konfig-system -l job-name=konfig-loadtest-saturate \
+                   -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+            [ "$ph" = "Running" ] || [ "$ph" = "Succeeded" ] || [ "$ph" = "Failed" ] && break
+            sleep 2
+          done
+          kubectl logs -n konfig-system -f job/konfig-loadtest-saturate --all-containers=true || true
+          # Let pyroscope ingest the tail of the run before we render.
+          sleep 20
+
+      - name: Capture top-5 CPU frames (pyroscope render -> current.json)
+        run: |
+          bash tools/profiling/ci_release_capture.sh "$PWD/flamediff-out" "$WINDOW" konfig
+          FB="$PWD/flamediff-out/cpu.flamebearer.json"
+          if [ ! -s "$FB" ]; then
+            echo "::warning::empty flamebearer — pyroscope ingested no CPU samples; cannot produce current.json"
+            echo "EMPTY_CAPTURE=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          python3 tools/profiling/flamebearer_to_pprof.py "$FB" --top-frames 5 \
+            -o "$PWD/flamediff-out/current.json"
+          echo "=== current.json (top-5 self%) ==="
+          cat "$PWD/flamediff-out/current.json"
+
+      - name: Flamediff gate (compare vs .profiling-baseline.json)
+        run: |
+          if [ "${EMPTY_CAPTURE:-0}" = "1" ]; then
+            { echo "## Flamediff — no CPU samples captured";
+              echo "Pyroscope ingested no samples for \`service_name=konfig\` in the render window.";
+              echo "Nothing to gate; treating as a pass (never a false regression on empty data)."; } \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          CUR="$PWD/flamediff-out/current.json"
+          if [ -f .profiling-baseline.json ] && [ "$SEED" != "true" ]; then
+            echo "baseline present -> gating (exit 1 on >20% top-5 regression)"
+            python3 tools/profiling/flamediff.py "$CUR" .profiling-baseline.json \
+              --output="$GITHUB_STEP_SUMMARY"
+          else
+            echo "seed mode ($([ -f .profiling-baseline.json ] && echo 'seed_baseline=true' || echo 'no baseline checked in'))"
+            cp "$CUR" "$PWD/flamediff-out/profiling-baseline-seed.json"
+            { echo "## Flamediff — baseline seed (no gate this run)";
+              echo "";
+              echo "Download the **profiling-baseline-seed** artifact and commit its";
+              echo "\`profiling-baseline-seed.json\` as \`.profiling-baseline.json\` at the repo";
+              echo "root to arm the gate.";
+              echo "";
+              echo "\`\`\`json"; cat "$CUR"; echo "\`\`\`"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload flamediff artifacts (current.json / flamebearer / seed)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flamediff-${{ github.run_id }}
+          path: flamediff-out/
+          retention-days: 30
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A || true
+          kubectl logs -n konfig-system -l app=konfig --tail=200 || true
+          kubectl logs -n profiling -l app=pyroscope --tail=100 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
