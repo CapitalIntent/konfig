@@ -48,7 +48,9 @@ use tracing::{error, info};
 
 use crate::grpc::KonfigServer;
 use crate::proto::konfig_service_server::KonfigService;
-use crate::proto::{ConfigEvent, SecretEvent, SubscribeRequest, SubscribeSecretsRequest};
+use crate::proto::{
+    ConfigEvent, GetAllRequest, GetRequest, SecretEvent, SubscribeRequest, SubscribeSecretsRequest,
+};
 
 /// Max accepted JSON request body. Mirrors tonic's default 4 MiB
 /// `max_decoding_message_size` so a payload that the gRPC server would accept
@@ -117,6 +119,18 @@ pub async fn serve_gateway(
             "/v1/secrets/{namespace}/{name}/watch",
             get(sse_secret_watch),
         )
+        // REST GET aliases (one-shot JSON) for clients that prefer polling over
+        // streaming. Configs only — secret reads stay on the gRPC-style POST
+        // path (audit-logged). `/healthz` is the unauthenticated K8s probe.
+        .route(
+            "/v1/configs/{namespace}/{name}",
+            get(rest_get_config).options(cors_preflight_handler),
+        )
+        .route(
+            "/v1/configs/{namespace}",
+            get(rest_get_all_configs).options(cors_preflight_handler),
+        )
+        .route("/healthz", get(healthz))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state);
 
@@ -236,6 +250,13 @@ fn json_response(cfg: &HttpGatewayConfig, status: StatusCode, body: Vec<u8>) -> 
     builder
         .body(Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Route handler for the REST GET aliases' CORS preflight — a browser `fetch`
+/// with an `Authorization` header preflights, and a `get()`-only route would
+/// `405` it. Delegates to [`cors_preflight`] (unauthenticated, by spec).
+async fn cors_preflight_handler(State(state): State<Arc<GatewayState>>) -> Response {
+    cors_preflight(&state.cfg)
 }
 
 /// Answer a CORS preflight (`OPTIONS`) with `204` + the allow-* headers.
@@ -507,6 +528,96 @@ async fn dispatch(
         Ok(json) => json_response(cfg, StatusCode::OK, json),
         Err((status, code, message)) => json_response(cfg, status, error_body(code, &message)),
     }
+}
+
+// ── REST GET aliases (one-shot JSON) + readiness ────────────────────────────
+//
+// `GET /v1/configs/{ns}/{name}` and `GET /v1/configs/{ns}` are polling-friendly
+// aliases for the unary `Get` / server-streaming `GetAll` RPCs — same auth gate
+// and same in-process handlers as the POST dispatch path. Configs only: secret
+// reads stay on the audit-logged POST path.
+
+/// `GET /v1/configs/{namespace}/{name}` — one-shot JSON fetch (unary `Get`).
+async fn rest_get_config(
+    State(state): State<Arc<GatewayState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let cfg = &state.cfg;
+    if let Some(deny) = check_auth(cfg, &headers) {
+        return deny;
+    }
+    match state
+        .server
+        .get(Request::new(GetRequest { namespace, name }))
+        .await
+    {
+        Ok(resp) => match encode_response(resp.get_ref()) {
+            Ok(json) => json_response(cfg, StatusCode::OK, json),
+            Err((status, code, message)) => json_response(cfg, status, error_body(code, &message)),
+        },
+        Err(status) => {
+            let (status, code, message) = status_to_error(status);
+            json_response(cfg, status, error_body(code, &message))
+        }
+    }
+}
+
+/// `GET /v1/configs/{namespace}` — list all configs in the namespace as a
+/// streamed JSON array (server-streaming `GetAll`; one element at a time, never
+/// the whole namespace buffered in memory).
+async fn rest_get_all_configs(
+    State(state): State<Arc<GatewayState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let cfg = &state.cfg;
+    if let Some(deny) = check_auth(cfg, &headers) {
+        return deny;
+    }
+    match state
+        .server
+        .get_all(Request::new(GetAllRequest { namespace }))
+        .await
+    {
+        Ok(resp) => json_streaming_response(cfg, stream_json_array(resp.into_inner())),
+        Err(status) => {
+            let (status, code, message) = status_to_error(status);
+            json_response(cfg, status, error_body(code, &message))
+        }
+    }
+}
+
+/// `GET /healthz` — readiness probe for K8s. **Unauthenticated** (liveness /
+/// readiness probes carry no bearer token). `200
+/// {"status":"ok","cache_ready":true}` once the config cache has completed its
+/// first list (the same gate the gRPC health check + SSE use); `503
+/// {"status":"warming","cache_ready":false}` (Retry-After: 1) while warming.
+async fn healthz(State(state): State<Arc<GatewayState>>) -> Response {
+    let cfg = &state.cfg;
+    let ready = state.server.cache.is_populated();
+    let (status, status_str) = if ready {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "warming")
+    };
+    let body = serde_json::to_vec(&serde_json::json!({
+        "status": status_str,
+        "cache_ready": ready,
+    }))
+    .unwrap_or_else(|_| b"{\"status\":\"error\",\"cache_ready\":false}".to_vec());
+    let mut builder = with_cors(
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json"),
+        cfg,
+    );
+    if !ready {
+        builder = builder.header(header::RETRY_AFTER, "1");
+    }
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 // ── SSE (Server-Sent Events) watch endpoints ────────────────────────────────
@@ -1011,6 +1122,90 @@ mod tests {
             resp.headers()
                 .contains_key(header::ACCESS_CONTROL_ALLOW_METHODS)
         );
+    }
+
+    // ── REST GET aliases + /healthz (CU-86ahqve4c PR2) ──────────────────────
+
+    #[tokio::test]
+    async fn rest_get_config_without_token_is_401() {
+        let resp = rest_get_config(
+            test_state(),
+            Path(("default".to_string(), "x".to_string())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rest_get_config_found_returns_200_json() {
+        let resp = rest_get_config(
+            state_with_config("default", "app", 3),
+            Path(("default".to_string(), "app".to_string())),
+            bearer("s3cret"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["namespace"], "default");
+        assert_eq!(v["name"], "app");
+        assert_eq!(v["schema_version"], 3);
+    }
+
+    #[tokio::test]
+    async fn rest_get_config_missing_is_404() {
+        let resp = rest_get_config(
+            test_state(),
+            Path(("default".to_string(), "nope".to_string())),
+            bearer("s3cret"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rest_get_all_configs_without_token_is_401() {
+        let resp =
+            rest_get_all_configs(test_state(), Path("default".to_string()), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rest_get_all_configs_empty_streams_array() {
+        let resp =
+            rest_get_all_configs(test_state(), Path("default".to_string()), bearer("s3cret")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+        assert_eq!(&body[..], b"[]", "empty namespace → valid empty JSON array");
+    }
+
+    /// `/healthz` is unauthenticated (K8s probes carry no token) and returns 503
+    /// while the cache is warming.
+    #[tokio::test]
+    async fn healthz_not_ready_is_503() {
+        let resp = healthz(test_state()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let body = to_bytes(resp.into_body(), 8 * 1024).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["status"], "warming");
+        assert_eq!(v["cache_ready"], false);
+    }
+
+    #[tokio::test]
+    async fn healthz_ready_is_200_no_token() {
+        let resp = healthz(state_with_config("default", "app", 1)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 8 * 1024).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["cache_ready"], true);
     }
 
     /// `GetAll` against the empty default cache streams a valid empty JSON
