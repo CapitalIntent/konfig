@@ -37,10 +37,10 @@ jobs:
           EOF
 
       - name: Build
-        run: bazel build //rust/konfig:konfig_bin //tools/konfig-cli:konfig_cli
+        run: bazel build //rust/konfig:konfig_bin //tools/konfig-cli:konfig_cli //tools/konfig-flamediff:konfig_flamediff
 
       - name: Test
-        run: bazel test //rust/konfig:test //tools/konfig-cli/... --test_output=errors
+        run: bazel test //rust/konfig:test //tools/konfig-cli/... //tools/konfig-flamediff:test --test_output=errors
 
       - name: Format
         run: |
@@ -48,6 +48,7 @@ jobs:
             //rust/konfig:fmt_test \
             //rust/konfig-consumer:fmt_test \
             //tools/konfig-cli:fmt_test \
+            //tools/konfig-flamediff:fmt_test \
             //tools/konfig-loadtest:fmt_test
 
       - name: Clippy
@@ -56,4 +57,5 @@ jobs:
             //rust/konfig:clippy_test \
             //rust/konfig-consumer:clippy_test \
             //tools/konfig-cli:clippy_test \
+            //tools/konfig-flamediff:clippy_test \
             //tools/konfig-loadtest:clippy_test

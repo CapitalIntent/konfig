@@ -77,67 +77,73 @@ Default mode:
 | `configmap/pyroscope-config` | `profiling` |
 | `namespace/profiling` | cluster-scoped |
 
-# flamediff.py — top-frame CPU regression gate (CU-86ahtj1a8)
+# konfig-flamediff — CPU regression gate + flamebearer tools (CU-86ahtj1a8)
 
-`flamediff.py` compares the top-N self-% frames of a freshly-captured CPU
-profile against a checked-in baseline and fails when any frame got measurably
-hotter (a perf regression). Pure stdlib; no deps.
+The Rust bin `//tools/konfig-flamediff` (Rust port of the old `flamediff.py` +
+`flamebearer_to_pprof.py`) does three jobs, picked by sub-command:
 
-## Profile JSON schema
+- `top-frames <fb.json> --top N -o current.json` — reduce a pyroscope
+  flamebearer to the N hottest self-% frames.
+- `to-pprof <fb.json> -o cpu.pprof` — rebuild the call tree as a pprof profile
+  (uncompressed protobuf; `go tool pprof` reads it, pipe through `gzip` if you
+  want a compressed `.pprof`).
+- `gate <current.json> <baseline.json> [--threshold 0.20 --top 5 ...] -o md` —
+  compare fresh top-frames vs a checked-in baseline; **exit 1** when a hot frame
+  regressed past the threshold.
 
-Both `current.json` and the baseline are the pyroscope top-frames export shape:
-
-```json
-{ "frames": [ { "name": "konfig::grpc::subscribe::bridge_broadcast", "self_pct": 12.4 }, ... ] }
-```
-
-`self_pct` is the self (exclusive) CPU percentage. Order is irrelevant — the
-script sorts and takes the top-N from each side.
-
-## Usage
+Build/run it with bazel (no python, no extra crates — only clap + serde_json):
 
 ```sh
-# Locally-runnable logic test (also a cheap CI step):
-python3 tools/profiling/flamediff.py --self-test
-
-# Gate a fresh capture against the baseline (exit 1 on regression):
-python3 tools/profiling/flamediff.py current.json .profiling-baseline.json \
-    --threshold=0.20 --top=5 --output=flamediff.md
+bazel build //tools/konfig-flamediff:konfig_flamediff
+FLAMEDIFF=$(bazel cquery --output=files //tools/konfig-flamediff:konfig_flamediff)
+"$FLAMEDIFF" gate current.json .profiling-baseline.json --threshold 0.20 --top 5
 ```
 
 Exit `0` = clean, `1` = a top-N frame's self-% rose > `--threshold` (relative)
 or a new frame entered the top-N above `--new-frame-floor-pct`, `2` = bad input.
 Sub-`--min-base-pct` frames are exempt from the relative gate (sampling noise).
 
+## Profile JSON schema
+
+Both `current.json` and the baseline are the top-frames export shape:
+
+```json
+{ "frames": [ { "name": "konfig::grpc::subscribe::bridge_broadcast", "self_pct": 12.4 } ] }
+```
+
+`self_pct` is the self (exclusive) CPU percentage. Order is irrelevant — the bin
+sorts and takes the top-N from each side.
+
+## Logic test
+
+The gate math (threshold / new-frame floor / noise floor / malformed input) is
+unit-tested by `bazel test //tools/konfig-flamediff:test`, wired into the CI
+"Build and test" job — so it runs on **every** PR with no cluster.
+
 ## CI gate: `.github/workflows/flamediff.yml`
 
-The gate is wired as its own workflow (CU-86ahtj1a8), NOT bolted onto the
-required `loadtest-integration.yml` — capturing a profile needs the
-`konfig-profiling` image + an in-cluster pyroscope, and adding that to a
-required, historically-flaky gate would risk breaking every PR. It reuses the
-same capture stack as `profile-release.yml`. Two jobs:
+The gate logic runs on every PR via `bazel test` (see "Logic test" above). The
+heavy **capture** lives in its own workflow, NOT bolted onto the required
+`loadtest-integration.yml` — capturing needs an in-cluster pyroscope + a
+privileged alloy eBPF DaemonSet, and adding that to a required, historically-
+flaky gate would risk breaking every PR.
 
-- **`logic-gate`** — cheap + deterministic, runs on **every** PR. Just the two
-  `--self-test`s below. This is the part that can break a PR; it needs no
-  cluster, so the gate *logic* (threshold, new-frame floor, noise floor,
-  malformed-input handling) is always enforced.
-- **`capture-gate`** — heavy (kind + pyroscope + saturate loadtest). Captures a
-  real CPU profile, reduces it to top-5 self-% frames, and diffs vs the
-  checked-in `.profiling-baseline.json`. **Opt-in only** (push to `main`,
-  manual `workflow_dispatch`, or a PR labeled `profiling`) so an unverified
-  pyroscope capture never blocks an unrelated PR. When no baseline is checked in
-  it runs in *seed mode*: uploads `current.json` as the `profiling-baseline-seed`
-  artifact and never fails.
+The single `capture-gate` job is **opt-in** (push to `main`, manual
+`workflow_dispatch`, or a PR labeled `profiling`) so an unverified capture never
+blocks an unrelated PR. It stands up kind + pyroscope + the alloy eBPF DaemonSet
++ a plain konfig pod (`--config=x86-baseline`, symbolized), runs the saturate
+loadtest, then renders → top-5 → diffs vs `.profiling-baseline.json`. When no
+baseline is checked in it runs in *seed mode*: uploads `current.json` as the
+`profiling-baseline-seed` artifact and never fails.
 
 ```sh
-# The two logic self-tests the gate runs on every PR:
-python3 tools/profiling/flamediff.py --self-test
-python3 tools/profiling/flamebearer_to_pprof.py --self-test
-
-# The capture chain the heavy job runs (validated render query, Pyroscope 1.9.0):
-bash tools/profiling/ci_release_capture.sh "$PWD/out" 10m konfig       # -> out/cpu.flamebearer.json
-python3 tools/profiling/flamebearer_to_pprof.py out/cpu.flamebearer.json --top-frames 5 -o current.json
-python3 tools/profiling/flamediff.py current.json .profiling-baseline.json --output="$GITHUB_STEP_SUMMARY"
+# The capture chain the heavy job runs (eBPF profile type, Pyroscope 1.9.0):
+FLAMEDIFF=$(bazel cquery --output=files //tools/konfig-flamediff:konfig_flamediff)
+curl -fsS -G http://localhost:4040/pyroscope/render \
+  --data-urlencode 'query=process_cpu:samples:count:cpu:nanoseconds{service_name="konfig"}' \
+  --data-urlencode 'from=now-10m' --data-urlencode 'format=json' -o cpu.flamebearer.json
+"$FLAMEDIFF" top-frames cpu.flamebearer.json --top 5 -o current.json
+"$FLAMEDIFF" gate current.json .profiling-baseline.json --output "$GITHUB_STEP_SUMMARY"
 ```
 
 ### Arming the gate (needs one Linux CI run — cannot be done on macOS)
@@ -168,58 +174,31 @@ python3 tools/profiling/flamediff.py current.json .profiling-baseline.json --out
   `securityContext: { seccompProfile: { type: Unconfined }, capabilities: { add: ["SYS_PTRACE"] } }`
   for the signal/timer-based sampler to initialize.
 
-# flamebearer_to_pprof.py — pprof + summary export (CU-86aj7kawc)
+## flamebearer -> pprof (interactive drill-down)
 
-The bench captures CPU profiles as Pyroscope **flamebearer JSON**
-(`cpu-profile.flamebearer.json`), which `go tool pprof` cannot parse — so ad-hoc
-CPU drill-down (`-top`, `-list`, `-http` flamegraph) was not possible.
-`flamebearer_to_pprof.py` reconstructs the call tree from the flamebearer and
-emits either a **pprof** profile or the **flamediff top-frames** summary. Pure
-stdlib (no protobuf dependency); pyroscope frames are already symbolized so no
-konfig binary is needed.
-
-## Capture a flamebearer
-
-Query Pyroscope's render API for the konfig CPU profile as flamebearer JSON
-(during/after a loadtest with `infra/profiling/` deployed). `format=json` yields
-flamebearer; adjust the query selector to your pyroscope app/profile type:
+Pyroscope captures CPU profiles as **flamebearer JSON**, which `go tool pprof`
+cannot parse. `konfig-flamediff to-pprof` reconstructs the call tree and emits a
+pprof profile so `-top`/`-list`/`-http` work. Frames come pre-symbolized from
+pyroscope, so no konfig binary is needed.
 
 ```sh
+# Capture a flamebearer (during/after a loadtest with infra/profiling/ deployed):
 kubectl -n profiling port-forward svc/pyroscope 4040:4040 &
-curl -fsS 'http://localhost:4040/pyroscope/render?query=process_cpu:cpu:nanoseconds:cpu:nanoseconds{service_name="konfig"}&from=now-10m&format=json' \
+curl -fsS 'http://localhost:4040/pyroscope/render?query=process_cpu:samples:count:cpu:nanoseconds{service_name="konfig"}&from=now-10m&format=json' \
   -o cpu-profile.flamebearer.json
-```
 
-## pprof export (interactive drill-down)
-
-```sh
-python3 tools/profiling/flamebearer_to_pprof.py cpu-profile.flamebearer.json \
-    --out cpu-profile.pprof
+# Convert + drill down (uncompressed pprof; go tool pprof reads it fine):
+FLAMEDIFF=$(bazel cquery --output=files //tools/konfig-flamediff:konfig_flamediff)
+"$FLAMEDIFF" to-pprof cpu-profile.flamebearer.json -o cpu-profile.pprof
 go tool pprof -top cpu-profile.pprof            # flat/cum self per frame
-go tool pprof -list 'konfig::.*' cpu-profile.pprof
 go tool pprof -http=:8080 cpu-profile.pprof     # interactive flamegraph
+
+# Or the top-frames summary that feeds the gate:
+"$FLAMEDIFF" top-frames cpu-profile.flamebearer.json --top 5 -o current.json
 ```
 
 Sample values use `cpu/nanoseconds` when the flamebearer carries a `sampleRate`
 (ticks x 1e9/rate); otherwise `samples/count`.
-
-## Top-frames summary (feeds flamediff)
-
-```sh
-python3 tools/profiling/flamebearer_to_pprof.py cpu-profile.flamebearer.json \
-    --top-frames 5 --out current.json
-python3 tools/profiling/flamediff.py current.json .profiling-baseline.json
-```
-
-This automates the previously-manual "extract top-N self-% frames" step, so one
-captured flamebearer drives both interactive pprof analysis and the flamediff
-regression gate.
-
-## Logic test
-
-```sh
-python3 tools/profiling/flamebearer_to_pprof.py --self-test
-```
 
 # import-images.sh — Docker Desktop k8s.io image import (CU-86aj7kawk)
 
@@ -247,7 +226,7 @@ See the konfig-loadtest bench runbook for the full local-bench flow.
 dispatch): it stands up kind + an in-cluster pyroscope + the `konfig-profiling`
 image (in-process pyroscope agent), drives the `saturate` loadtest profile
 (CU-LOAD-1), then captures the CPU profile via pyroscope's flamebearer render
-API, converts it to pprof (`flamebearer_to_pprof.py`), and reduces a
+API, converts it to pprof (`konfig-flamediff to-pprof`), and reduces a
 `samples.csv` (`tools/profiling/ci_release_capture.sh`).
 
 The bundle (`cpu.pprof`, `cpu.flamebearer.json`, `samples.csv`, `RELEASE.txt`,

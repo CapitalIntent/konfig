@@ -11,6 +11,14 @@ WINDOW="${2:-10m}"
 APP="${3:-konfig}"
 mkdir -p "$OUT"
 
+# Rust flamediff bin (CU-86ahtj1a8) replaced the old flamebearer_to_pprof.py.
+# Resolve it via bazel unless $FLAMEDIFF is preset by the caller.
+FLAMEDIFF="${FLAMEDIFF:-}"
+if [ -z "$FLAMEDIFF" ]; then
+  bazel build //tools/konfig-flamediff:konfig_flamediff >/dev/null 2>&1 || true
+  FLAMEDIFF="$PWD/$(bazel cquery --output=files //tools/konfig-flamediff:konfig_flamediff 2>/dev/null || true)"
+fi
+
 kubectl -n profiling port-forward svc/pyroscope 4040:4040 >"$OUT/pyro-portfwd.log" 2>&1 &
 PF=$!
 trap 'kill "$PF" 2>/dev/null || true' EXIT
@@ -29,9 +37,10 @@ curl -fsS -G http://localhost:4040/pyroscope/render \
   && echo "  flamebearer: $(stat -c '%s' "$OUT/cpu.flamebearer.json") bytes" \
   || echo "::warning::flamebearer render failed (no samples ingested yet?)"
 
-# Canonical pprof artifact (flamebearer -> pprof, CU-86aj7kawc converter).
-if [ -s "$OUT/cpu.flamebearer.json" ]; then
-  python3 tools/profiling/flamebearer_to_pprof.py "$OUT/cpu.flamebearer.json" -o "$OUT/cpu.pprof" \
+# Canonical pprof artifact (flamebearer -> pprof, Rust flamediff bin). The bin
+# emits UNCOMPRESSED pprof protobuf; `go tool pprof` reads it the same.
+if [ -s "$OUT/cpu.flamebearer.json" ] && [ -x "$FLAMEDIFF" ]; then
+  "$FLAMEDIFF" to-pprof "$OUT/cpu.flamebearer.json" -o "$OUT/cpu.pprof" \
     && echo "  cpu.pprof: $(stat -c '%s' "$OUT/cpu.pprof") bytes" \
     || echo "::warning::flamebearer->pprof conversion failed"
 fi

@@ -1,0 +1,15 @@
+[package]
+name = "konfig-flamediff"
+version.workspace = true
+edition.workspace = true
+publish = false
+homepage.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "konfig-flamediff"
+path = "src/main.rs"
+
+[dependencies]
+clap = {version = "4", features = ["derive"]}
+serde_json = {workspace = true, features = ["std"]}

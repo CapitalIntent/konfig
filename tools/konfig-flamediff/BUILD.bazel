@@ -1,0 +1,41 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy", "rust_test", "rustfmt_test")
+
+# CU-86ahtj1a8 — CPU-profile regression gate + pyroscope flamebearer tooling.
+# Rust port of the old tools/profiling/{flamediff,flamebearer_to_pprof}.py so
+# the gate logic is a real Bazel target with `bazel test` unit tests (not a
+# bespoke python --self-test). Deps kept to clap + serde_json only; pprof is
+# emitted as uncompressed protobuf so no flate2/prost is pulled into the CLI.
+#
+# Use @rules_rust//rust:defs.bzl directly (not //bazel/rust:defs.bzl) — the
+# custom macro adds //rust/util/malloc which isn't visible to //tools.
+rust_binary(
+    name = "konfig_flamediff",
+    srcs = glob(["src/**/*.rs"]),
+    tags = ["konfig", "profiling", "rust"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@konfig_crates//:clap",
+        "@konfig_crates//:serde_json",
+    ],
+)
+
+rust_test(
+    name = "test",
+    size = "small",
+    crate = ":konfig_flamediff",
+    tags = ["konfig", "profiling", "rust", "unit"],
+)
+
+rustfmt_test(
+    name = "fmt_test",
+    size = "small",
+    tags = ["konfig", "profiling", "rust", "unit"],
+    targets = [":konfig_flamediff"],
+)
+
+rust_clippy(
+    name = "clippy_test",
+    testonly = True,
+    tags = ["konfig", "profiling", "rust", "unit"],
+    deps = [":konfig_flamediff"],
+)
