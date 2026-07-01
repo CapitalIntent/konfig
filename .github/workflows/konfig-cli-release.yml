@@ -14,11 +14,25 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+# CU-86aj08vcu: cross-compiled konfig-cli tarballs for darwin-arm64, linux-amd64,
+# linux-arm64 — each built on its NATIVE runner (no --platforms cross wiring;
+# the old //bazel/platforms:* labels never existed and the build never ran). The
+# release job cuts one combined SHA256SUMS + cosign-signs each tarball keyless
+# (verify-blob works with no key) and attaches everything to the GitHub Release.
 jobs:
-  # ── Linux x86_64 ────────────────────────────────────────────────────────────
-  build-linux-amd64:
-    name: Build linux/amd64
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: blacksmith-2vcpu-ubuntu-2404
+          - name: linux-arm64
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
+          - name: darwin-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     steps:
@@ -26,8 +40,17 @@ jobs:
 
       - uses: bazelbuild/setup-bazelisk@v3
 
-      - name: Install protoc
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install Rust toolchain (macOS)
+        if: runner.os == 'macOS'
+        uses: dtolnay/rust-toolchain@stable
 
       - uses: actions/cache@v4
         with:
@@ -36,83 +59,32 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git
             ~/.cache/bazel-repo-cache
-          key: bazel-konfig-cli-linux-amd64-${{ hashFiles('Cargo.lock', 'MODULE.bazel.lock') }}
-          restore-keys: bazel-konfig-cli-linux-amd64-
+          key: bazel-konfig-cli-${{ matrix.name }}-${{ hashFiles('Cargo.lock', 'MODULE.bazel.lock') }}
+          restore-keys: bazel-konfig-cli-${{ matrix.name }}-
 
-      - name: Build
-        run: |
-          bazel build //tools/konfig-cli:konfig_cli \
-            --platforms=//bazel/platforms:x86_64_linux
+      - name: Build (native)
+        run: bazel build //tools/konfig-cli:konfig_cli
 
-      - name: Package
+      - name: Package konfig-cli-${{ matrix.name }}.tar.gz
         run: |
-          BIN=$(bazel cquery //tools/konfig-cli:konfig_cli \
-            --platforms=//bazel/platforms:x86_64_linux \
-            --output=files 2>/dev/null | head -1)
+          BIN=$(bazel cquery --output=files //tools/konfig-cli:konfig_cli 2>/dev/null | head -1)
           mkdir -p dist
           cp "$BIN" dist/konfig-cli
-          tar -C dist -czf dist/konfig-cli-linux-amd64.tar.gz konfig-cli
-          sha256sum dist/konfig-cli-linux-amd64.tar.gz > dist/konfig-cli-linux-amd64.tar.gz.sha256
+          tar -C dist -czf "dist/konfig-cli-${{ matrix.name }}.tar.gz" konfig-cli
 
       - uses: actions/upload-artifact@v4
         with:
-          name: konfig-cli-linux-amd64
-          path: dist/konfig-cli-linux-amd64.tar.gz*
+          name: konfig-cli-${{ matrix.name }}
+          path: dist/konfig-cli-${{ matrix.name }}.tar.gz
           retention-days: 1
 
-  # ── macOS ARM64 ─────────────────────────────────────────────────────────────
-  build-macos-arm64:
-    name: Build darwin/arm64
-    runs-on: macos-15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: bazelbuild/setup-bazelisk@v3
-
-      - name: Install protoc
-        run: brew install protobuf
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git
-          key: bazel-konfig-cli-macos-arm64-${{ hashFiles('Cargo.lock', 'MODULE.bazel.lock') }}
-          restore-keys: bazel-konfig-cli-macos-arm64-
-
-      - name: Build
-        run: |
-          bazel build //tools/konfig-cli:konfig_cli \
-            --platforms=//bazel/platforms:aarch64_macos
-
-      - name: Package
-        run: |
-          BIN=$(bazel cquery //tools/konfig-cli:konfig_cli \
-            --platforms=//bazel/platforms:aarch64_macos \
-            --output=files 2>/dev/null | head -1)
-          mkdir -p dist
-          cp "$BIN" dist/konfig-cli
-          tar -C dist -czf dist/konfig-cli-darwin-arm64.tar.gz konfig-cli
-          shasum -a 256 dist/konfig-cli-darwin-arm64.tar.gz > dist/konfig-cli-darwin-arm64.tar.gz.sha256
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: konfig-cli-darwin-arm64
-          path: dist/konfig-cli-darwin-arm64.tar.gz*
-          retention-days: 1
-
-  # ── GitHub Release ───────────────────────────────────────────────────────────
   release:
-    name: Publish release to jayakasadev/konfig
-    needs: [build-linux-amd64, build-macos-arm64]
+    name: Sign + publish release to jayakasadev/konfig
+    needs: build
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
+      id-token: write # cosign keyless sign-blob (OIDC → Fulcio); no key material
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -120,15 +92,34 @@ jobs:
           merge-multiple: true
           path: dist/
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Resolve version
         id: version
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           else
-            # Strip "konfig-cli/" prefix from the tag ref
             echo "tag=${GITHUB_REF_NAME#konfig-cli/}" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Checksums (single SHA256SUMS over all tarballs)
+        working-directory: dist
+        run: |
+          sha256sum konfig-cli-*.tar.gz > SHA256SUMS
+          echo "=== SHA256SUMS ==="; cat SHA256SUMS
+
+      - name: Cosign sign-blob each tarball (keyless, bundled)
+        working-directory: dist
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          for tgz in konfig-cli-*.tar.gz; do
+            cosign sign-blob --yes --bundle "${tgz}.cosign.bundle" "$tgz"
+            echo "signed $tgz -> ${tgz}.cosign.bundle"
+          done
 
       - name: Show artifacts
         run: ls -lh dist/
@@ -136,36 +127,45 @@ jobs:
       - name: Write release notes
         run: |
           TAG="${{ steps.version.outputs.tag }}"
+          ID_RE="https://github.com/${{ github.repository }}/.github/workflows/konfig-cli-release.yml@${{ github.ref }}"
           cat > release-notes.md << EOF
-          ## Installation
+          ## Install
 
           \`\`\`bash
-          # macOS ARM64
+          # pick your platform
           curl -sSL https://github.com/jayakasadev/konfig/releases/download/${TAG}/konfig-cli-darwin-arm64.tar.gz | tar -xz
-          sudo mv konfig-cli /usr/local/bin/
-
-          # Linux x86_64
           curl -sSL https://github.com/jayakasadev/konfig/releases/download/${TAG}/konfig-cli-linux-amd64.tar.gz | tar -xz
+          curl -sSL https://github.com/jayakasadev/konfig/releases/download/${TAG}/konfig-cli-linux-arm64.tar.gz | tar -xz
           sudo mv konfig-cli /usr/local/bin/
+          \`\`\`
+
+          ## Verify (checksum + cosign, keyless)
+
+          \`\`\`bash
+          curl -sSLO https://github.com/jayakasadev/konfig/releases/download/${TAG}/SHA256SUMS
+          sha256sum -c SHA256SUMS --ignore-missing
+
+          # cosign verify-blob (no key needed):
+          cosign verify-blob \\
+            --bundle konfig-cli-linux-amd64.tar.gz.cosign.bundle \\
+            --certificate-identity "${ID_RE}" \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
+            konfig-cli-linux-amd64.tar.gz
           \`\`\`
 
           Built from commit \`${{ github.sha }}\`.
           EOF
 
-      # Guarded by an env-var check (not a workflow-level `if:` on the
-      # secret) because GitHub Actions does not expose `secrets.*` to
-      # job/step `if:` expressions in older runner versions — the
-      # expression silently evaluates to an empty string and the step
-      # runs anyway. Propagating the secret via `env:` and gating on
-      # `env.GH_TOKEN` works on every runner version. On forks / PRs
-      # where the secret is not available, the step no-ops with a clear
-      # log line instead of failing the release job.
+      # Guarded on the token via env (secrets.* is not visible to step `if:` on
+      # every runner). No-ops on forks / when the token is unset, so a dispatch
+      # run still builds + signs + checksums for verification without cutting a
+      # release.
       - name: Create release in jayakasadev/konfig
         env:
           GH_TOKEN: ${{ secrets.KONFIG_RELEASE_TOKEN }}
         run: |
           if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "KONFIG_RELEASE_TOKEN is unset; skipping release publish." >&2
+            echo "KONFIG_RELEASE_TOKEN is unset; skipping release publish (artifacts + signatures still built)." >&2
             exit 0
           fi
           TAG="${{ steps.version.outputs.tag }}"
@@ -174,6 +174,9 @@ jobs:
             --title "konfig-cli $TAG" \
             --notes-file release-notes.md \
             dist/konfig-cli-linux-amd64.tar.gz \
-            dist/konfig-cli-linux-amd64.tar.gz.sha256 \
+            dist/konfig-cli-linux-arm64.tar.gz \
             dist/konfig-cli-darwin-arm64.tar.gz \
-            dist/konfig-cli-darwin-arm64.tar.gz.sha256
+            dist/SHA256SUMS \
+            dist/konfig-cli-linux-amd64.tar.gz.cosign.bundle \
+            dist/konfig-cli-linux-arm64.tar.gz.cosign.bundle \
+            dist/konfig-cli-darwin-arm64.tar.gz.cosign.bundle
