@@ -109,30 +109,48 @@ Exit `0` = clean, `1` = a top-N frame's self-% rose > `--threshold` (relative)
 or a new frame entered the top-N above `--new-frame-floor-pct`, `2` = bad input.
 Sub-`--min-base-pct` frames are exempt from the relative gate (sampling noise).
 
-## Remaining work to make this a live CI gate (needs a Linux cluster)
+## CI gate: `.github/workflows/flamediff.yml`
 
-The Python toolchain is **complete and validated end-to-end** — `flamediff.py`
-and `flamebearer_to_pprof.py --top-frames N` both pass `--self-test`, and the
-converter was confirmed against a *real* Grafana Pyroscope `render` flamebearer
-(CU-86ahtj1a8 standup, 2026-06-29):
+The gate is wired as its own workflow (CU-86ahtj1a8), NOT bolted onto the
+required `loadtest-integration.yml` — capturing a profile needs the
+`konfig-profiling` image + an in-cluster pyroscope, and adding that to a
+required, historically-flaky gate would risk breaking every PR. It reuses the
+same capture stack as `profile-release.yml`. Two jobs:
+
+- **`logic-gate`** — cheap + deterministic, runs on **every** PR. Just the two
+  `--self-test`s below. This is the part that can break a PR; it needs no
+  cluster, so the gate *logic* (threshold, new-frame floor, noise floor,
+  malformed-input handling) is always enforced.
+- **`capture-gate`** — heavy (kind + pyroscope + saturate loadtest). Captures a
+  real CPU profile, reduces it to top-5 self-% frames, and diffs vs the
+  checked-in `.profiling-baseline.json`. **Opt-in only** (push to `main`,
+  manual `workflow_dispatch`, or a PR labeled `profiling`) so an unverified
+  pyroscope capture never blocks an unrelated PR. When no baseline is checked in
+  it runs in *seed mode*: uploads `current.json` as the `profiling-baseline-seed`
+  artifact and never fails.
 
 ```sh
-# Validated working render query (Grafana Pyroscope 1.9.0):
-curl -s "$PYRO/pyroscope/render?query=process_cpu:samples:count:cpu:nanoseconds%7Bservice_name%3D%22konfig%22%7D&from=now-10m&until=now&format=json" \
-  | python3 tools/profiling/flamebearer_to_pprof.py --top-frames 5 > current.json
+# The two logic self-tests the gate runs on every PR:
+python3 tools/profiling/flamediff.py --self-test
+python3 tools/profiling/flamebearer_to_pprof.py --self-test
+
+# The capture chain the heavy job runs (validated render query, Pyroscope 1.9.0):
+bash tools/profiling/ci_release_capture.sh "$PWD/out" 10m konfig       # -> out/cpu.flamebearer.json
+python3 tools/profiling/flamebearer_to_pprof.py out/cpu.flamebearer.json --top-frames 5 -o current.json
 python3 tools/profiling/flamediff.py current.json .profiling-baseline.json --output="$GITHUB_STEP_SUMMARY"
 ```
 
-What still needs a **Linux** kind run (cannot be produced or verified on macOS):
+### Arming the gate (needs one Linux CI run — cannot be done on macOS)
 
-1. **Capture the baseline from `main`** and commit it as `.profiling-baseline.json`.
-   This is the blocker — see the ingestion finding below.
-2. **Add a post-loadtest step** to `loadtest-integration.yml` running the two
-   commands above; gate the job on flamediff's exit code. Keep it a *separate,
-   non-blocking* job until a baseline exists — an unverified pyroscope query must
-   never break every PR.
-3. **Verify the gate fires:** open a throwaway PR with an intentional hot-path
-   regression (e.g. a `sleep` in the apply path) and confirm CI fails; revert.
+1. **Seed the baseline from `main`.** Run the workflow on `main`
+   (`gh workflow run flamediff.yml`), download the `profiling-baseline-seed`
+   artifact, and commit its `profiling-baseline-seed.json` as
+   `.profiling-baseline.json` at the repo root. This is the remaining blocker —
+   see the ingestion finding below.
+2. **Verify the gate fires.** Open a throwaway PR labeled `profiling` with an
+   intentional hot-path regression (e.g. a `sleep` in the apply path) and confirm
+   the `capture-gate` job fails; revert.
+3. **Promote to required** (optional) once the capture is proven green on Linux.
 
 ### Findings from the local standup (why the baseline needs Linux CI)
 
